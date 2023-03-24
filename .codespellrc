@@ -1,0 +1,6 @@
+[codespell]
+skip = .git,*.pdf,*.svg
+# ignore some short names used as variables etc
+# TAHT, sPRED - names or %sPRED
+# PONT - place
+ignore-words-list = ect,fo,fro,ist,nam,nd,som,tha,wit,taht,spred,pont
