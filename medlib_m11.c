@@ -11285,7 +11285,7 @@ TERN_m11	sort_channels_by_acq_num_m11(SESSION_m11 *sess)
 }
 
 
-si1	*time_string_m11(si8 uutc, si1 *time_str, TERN_m11 fixed_width, TERN_m11 relative_days, si4 colored_text, ...)  // time_str buffer sould be of length TIME_STRING_BYTES_m11
+si1	*time_string_m11(si8 uutc, si1 *time_str, TERN_m11 fixed_width, TERN_m11 relative_days, si4 colored_text, ...)  // time_str buffer should be of length TIME_STRING_BYTES_m11
 {
 	si1			*standard_timezone_acronym, *standard_timezone_string, *date_color, *time_color, *color_reset, *meridian;
 	static si1      	private_time_str[TIME_STRING_BYTES_m11];
