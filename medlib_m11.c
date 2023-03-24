@@ -89,7 +89,7 @@
 
 // All library versions associated with a particular major format version are guaranteed to work on MED files of that major version.
 // Minor format versions may add fields to the format in protected regions, but no preexisting fields will be removed or moved.
-// Only library versions released on or afer a minor version will make use of new fields, and only if the minor version of the files contains them.
+// Only library versions released on or after a minor version will make use of new fields, and only if the minor version of the files contains them.
 // Backward compatibility will be maintained between major versions if practical.
 
 
@@ -3267,7 +3267,7 @@ si8	find_index_m11(SEGMENT_m11 *seg, si8 target, ui4 mode)  // returns index con
 				return(n_inds);
 			}
 			block_duration = (si8) (seg->metadata_fps->metadata->time_series_section_2.maximum_block_duration + (sf8) 0.5);
-			i = ((target - seg_start_time) / block_duration) + 1;  // more efficient to serch backward
+			i = ((target - seg_start_time) / block_duration) + 1;  // more efficient to search backward
 			if (i > n_inds)
 				i = n_inds;
 			if (tsi[i].start_time <= target) {  // forward linear search
@@ -3318,7 +3318,7 @@ si8	find_index_m11(SEGMENT_m11 *seg, si8 target, ui4 mode)  // returns index con
 			}
 
 			clip_duration = (si8) (seg->metadata_fps->metadata->video_section_2.maximum_clip_duration + (sf8) 0.5);
-			i = ((target - seg_start_time) / clip_duration) + 1;  // more efficient to serch backward
+			i = ((target - seg_start_time) / clip_duration) + 1;  // more efficient to search backward
 			if (i > n_inds)
 				i = n_inds;
 			if (vi[i].start_time <= target) {  // forward linear search
@@ -3341,7 +3341,7 @@ si8	find_index_m11(SEGMENT_m11 *seg, si8 target, ui4 mode)  // returns index con
 				return(n_inds);
 			}
 			clip_frames = (si8) seg->metadata_fps->metadata->video_section_2.maximum_clip_frames;
-			i = (target / clip_frames) + 1;  // more efficient to serch backward
+			i = (target / clip_frames) + 1;  // more efficient to search backward
 			if (i > n_inds)
 				i = n_inds;
 			target_frame_number = (ui4) target;
@@ -3988,16 +3988,16 @@ void    free_globals_m11(TERN_m11 cleanup_for_exit)
 		#ifdef AT_DEBUG_m11
 		AT_free_all_m11();  // display memory still allocated & free it
 		#endif
-		mxFree((void *) globals_m11->AT_nodes);  // AT nodes are not allocted with AT functions
+		mxFree((void *) globals_m11->AT_nodes);  // AT nodes are not allocated with AT functions
 	}
 	
-	// UTF8 tables are not allocted with AT functions
+	// UTF8 tables are not allocated with AT functions
 	if (globals_m11->UTF8_offsets_table != NULL)
 		mxFree((void *) globals_m11->UTF8_offsets_table);
 	if (globals_m11->UTF8_trailing_bytes_table != NULL)
 		mxFree((void *) globals_m11->UTF8_trailing_bytes_table);
 	
-	// destroy mutices
+	// destroy mutexes
 	pthread_mutex_destroy_m11(&globals_m11->TZ_mutex);
 	pthread_mutex_destroy_m11(&globals_m11->CRC_mutex);
 	pthread_mutex_destroy_m11(&globals_m11->AES_mutex);
@@ -4012,17 +4012,17 @@ void    free_globals_m11(TERN_m11 cleanup_for_exit)
 		#ifdef AT_DEBUG_m11
 		AT_free_all_m11();  // display memory still allocated & free it
 		#endif
-		free((void *) globals_m11->AT_nodes);  // AT nodes are not allocted with AT functions
+		free((void *) globals_m11->AT_nodes);  // AT nodes are not allocated with AT functions
 	}
 	pthread_mutex_destroy_m11(&globals_m11->AT_mutex);
 
-	// UTF8 tables are not allocted with AT functions
+	// UTF8 tables are not allocated with AT functions
 	if (globals_m11->UTF8_offsets_table != NULL)
 		free((void *) globals_m11->UTF8_offsets_table);
 	if (globals_m11->UTF8_trailing_bytes_table != NULL)
 		free((void *) globals_m11->UTF8_trailing_bytes_table);
 	
-	// destroy mutices
+	// destroy mutexes
 	pthread_mutex_destroy_m11(&globals_m11->TZ_mutex);
 	pthread_mutex_destroy_m11(&globals_m11->CRC_mutex);
 	pthread_mutex_destroy_m11(&globals_m11->AES_mutex);
@@ -5403,7 +5403,7 @@ TERN_m11	initialize_globals_m11(void)
 		}
 	}
 
-	// set global mutices
+	// set global mutexes
 	pthread_mutex_init_m11(&globals_m11->TZ_mutex, NULL);
 	pthread_mutex_init_m11(&globals_m11->CRC_mutex, NULL);
 	pthread_mutex_init_m11(&globals_m11->AES_mutex, NULL);
@@ -6137,7 +6137,7 @@ TERN_m11        merge_metadata_m11(FILE_PROCESSING_STRUCT_m11 *md_fps_1, FILE_PR
 		}
 		if (tmd2_1->sampling_frequency != tmd2_2->sampling_frequency) {
 			if (tmd2_1->sampling_frequency == FREQUENCY_NO_ENTRY_m11 || tmd2_2->sampling_frequency == FREQUENCY_NO_ENTRY_m11)
-				tmd2_m->sampling_frequency = FREQUENCY_NO_ENTRY_m11; // no entry supercedes variable frequency
+				tmd2_m->sampling_frequency = FREQUENCY_NO_ENTRY_m11; // no entry supersedes variable frequency
 			else
 				tmd2_m->sampling_frequency = FREQUENCY_VARIABLE_m11;
 			equal = FALSE_m11;
@@ -6964,7 +6964,7 @@ SESSION_m11	*open_session_m11(SESSION_m11 *sess, TIME_SLICE_m11 *slice, void *fi
 	message_m11("%s()\n", __FUNCTION__);
 #endif
 	
-	// if file_list is a pointer to single string, make list_len zero to indicate a one dimention char array
+	// if file_list is a pointer to single string, make list_len zero to indicate a one dimension char array
 	// if list_len > 0, assumed to be two dimensional array
 	
 	// allocate session
@@ -8248,7 +8248,7 @@ FILE_PROCESSING_STRUCT_m11	*read_file_m11(FILE_PROCESSING_STRUCT_m11 *fps, si1 *
 			get_session_directory_m11(NULL, NULL, fps);
 		if (number_of_items == FPS_UNIVERSAL_HEADER_ONLY_m11) {
 			if (fps->parameters.password_data->processed == 0)	// better if done with a metadata file read (for password hints) below
-				process_password_data_m11(fps, password);	// done here to satify rule that any read of any MED file will process password
+				process_password_data_m11(fps, password);	// done here to satisfy rule that any read of any MED file will process password
 			FPS_set_pointers_m11(fps, UNIVERSAL_HEADER_BYTES_m11);
 			fps->number_of_items = 0;
 			return(fps);
@@ -8382,7 +8382,7 @@ si8     read_record_data_m11(LEVEL_HEADER_m11 *level_header, TIME_SLICE_m11 *sli
 	message_m11("%s()\n", __FUNCTION__);
 #endif
 	
-	// seg_num only reqired for segmented session records levels
+	// seg_num only required for segmented session records levels
 	
 	switch (level_header->type_code) {
 		case LH_SESSION_m11:
@@ -11007,7 +11007,7 @@ void	show_universal_header_m11(FILE_PROCESSING_STRUCT_m11 *fps, UNIVERSAL_HEADER
 		printf_m11("Body CRC: %s\n", hex_str);
 	}
 	if (uh->segment_end_time == UUTC_NO_ENTRY_m11)
-		printf_m11("Segement End Time: no entry\n");
+		printf_m11("Segment End Time: no entry\n");
 	else {
 		time_string_m11(uh->segment_end_time, time_str, TRUE_m11, FALSE_m11, FALSE_m11);
 		printf_m11("Segment End Time: %ld (oUTC), %s\n", uh->segment_end_time, time_str);
@@ -12937,7 +12937,7 @@ TERN_m11	AT_remove_entry_m11(void *address, const si1 *function)
 #endif
 	
 	
-	// Note this function does not free the accociated memory, just removes it from AT list
+	// Note this function does not free the associated memory, just removes it from AT list
 	
 	if (address == NULL) {
 		#ifdef AT_DEBUG_m11
@@ -14375,7 +14375,7 @@ void    CMP_MBE_decode_m11(CMP_PROCESSING_STRUCT_m11 *cps)
 }
 
 
-// Mofified Akima cubic interpolation
+// Modified Akima cubic interpolation
 // Attribution: modifications based on Matlab's adjustments to weights of Akima function
 // Note: input x's are integers, output x's are floats
 sf8	*CMP_mak_interp_sf8_m11(CMP_BUFFERS_m11 *in_bufs, si8 in_len, CMP_BUFFERS_m11 *out_bufs, si8 out_len)
@@ -15863,7 +15863,7 @@ void    CMP_zero_buffers_m11(CMP_BUFFERS_m11 *buffers)
 //
 // "This library provides general CRC calculation & validation functions and an
 // operation to combine the CRCs of two sequences of bytes into a single CRC.
-// The routines in this libary only work with the particular CRC-32 polynomial
+// The routines in this library only work with the particular CRC-32 polynomial
 // provided here."
 //
 // Minor modifications for compatibility with the MED Library.

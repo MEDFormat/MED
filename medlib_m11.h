@@ -92,7 +92,7 @@
 
 // All library versions associated with a particular major format version are guaranteed to work on MED files of that major version.
 // Minor format versions may add fields to the format in protected regions, but no preexisting fields will be removed or moved.
-// Only library versions released on or afer a minor version will make use of new fields, and only if the minor version of the files contains them.
+// Only library versions released on or after a minor version will make use of new fields, and only if the minor version of the files contains them.
 // Backward compatibility will be maintained between major versions if practical.
 
 
@@ -1059,7 +1059,7 @@ typedef struct {
 
 
 //**********************************************************************************//
-//************************************  Mutices  ***********************************//
+//************************************  Mutexes  ***********************************//
 //**********************************************************************************//
 
 #if defined MACOS_m11 || defined LINUX_m11
@@ -1281,7 +1281,7 @@ typedef struct {
 	TERN_m11                        verbose;
 	ui4                             behavior_on_fail;
 	si1				temp_dir[FULL_FILE_NAME_BYTES_m11];  // system temp directory (periodically auto-cleared)
-	si1				temp_file[FULL_FILE_NAME_BYTES_m11];  // full path to temp file (i.e. incudes temp_dir)
+	si1				temp_file[FULL_FILE_NAME_BYTES_m11];  // full path to temp file (i.e. includes temp_dir)
 	ui4				*behavior_stack;
 	volatile ui4			behavior_stack_entries;
 	volatile ui4			behavior_stack_size;
@@ -2665,7 +2665,7 @@ void    	CMP_zero_buffers_m11(CMP_BUFFERS_m11 *buffers);
 //
 // "This library provides general CRC calculation & validation functions and an
 // operation to combine the CRCs of two sequences of bytes into a single CRC.
-// The routines in this libary only work with the particular CRC-32 polynomial
+// The routines in this library only work with the particular CRC-32 polynomial
 // provided here."
 //
 // Minor modifications for compatibility with the MED Library.
@@ -2944,7 +2944,7 @@ void		SHA_update_m11(SHA_CTX_m11 *ctx, const ui1 *data, si8 len);
 // Notes:
 //
 // Western Sahara:
-// DST is on most of the year and off during Ramadan, whose dates change annually in a way that is not accomodated by this schema.
+// DST is on most of the year and off during Ramadan, whose dates change annually in a way that is not accommodated by this schema.
 // As Ramadan only lasts a month, and can occur at virtually any time of year, this table treats it as if it's Daylight Time
 // is it's Standard Time, and it does not observe DST.
 //
@@ -3359,8 +3359,8 @@ void		SHA_update_m11(SHA_CTX_m11 *ctx, const ui1 *data, si8 len);
 
 #define TZ_COUNTRY_ALIASES_ENTRIES_m11      16
 #define TZ_COUNTRY_ALIASES_TABLE_m11 { \
-	{ "CHINA", "PEOPLE'S REPUBIC OF CHINA" }, \
-	{ "CHINA", "PEOPLES REPUBIC OF CHINA" }, \
+	{ "CHINA", "PEOPLE'S REPUBLIC OF CHINA" }, \
+	{ "CHINA", "PEOPLES REPUBLIC OF CHINA" }, \
 	{ "CZECH REPUBLIC", "CZECHIA" }, \
 	{ "RUSSIA", "RUSSIAN FEDERATION" }, \
 	{ "TURKS AND CAICOS", "TURKS & CAICOS" }, \
