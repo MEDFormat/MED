@@ -207,6 +207,8 @@ static void AES_inv_cipher_hw_m13(ui1 *in, ui1 *out, ui1 *round_key, si4 nr);
 #endif
 
 // COMPRESSION & COMPUTATION FUNCTIONS  (CMP)
+static tern CMP_fit_CPS_scratch_m13(CPS_m13 *cps, ui4 mode, ui4 block_samples);
+static void CMP_derivative_window_m13(tern pos_derivs, si4 *low_d, si4 *high_d, ui1 *ks_flag);
 static ui1 CMP_overflow_bytes_for_extrema_m13(si8 min_val, si8 max_val, tern pos_derivs);
 static int CMP_VDS_cand_cmp_m13(const void *a, const void *b);
 static sf8 CMP_VDS_delta_at_m13(si8 *in_x, sf8 *in_y, si8 in_len, si8 k);
@@ -3269,7 +3271,7 @@ tern G_decrypt_time_series_m13(FPS_m13 *fps)
 {
 	static tern		warning_delivered = FALSE_m13;
 	si1			enc_level;
-	si8			i, encryption_bytes, encryptable_bytes, n_items;
+	si8			i, n_items;
 	CPS_m13			*cps;
 	CMP_FIXED_BH_m13	*bh;
 	PASSWORD_DATA_m13	*pwd;
@@ -3315,20 +3317,10 @@ tern G_decrypt_time_series_m13(FPS_m13 *fps)
 			continue;
 		}
 
-		// calculate encryption bytes
-		encryptable_bytes = bh->total_block_bytes - CMP_BLOCK_ENCRYPTION_START_OFFSET_m13;
-		if (bh->block_flags & CMP_BF_MBE_ENCODING_m13) {  // MBE readable without other info (e.g. RED/PRED statistics) => encrypt full payload
-			encryption_bytes = encryptable_bytes;  // full 16 byte AES blocks after encryption start point; AES_encrypt/decrypt_m13() handle trailing partial block internally (AES_partial_encrypt/decrypt_m13())
-		} else {
-			encryption_bytes = (bh->total_header_bytes - CMP_BLOCK_ENCRYPTION_START_OFFSET_m13) + ENCRYPTION_BLOCK_BYTES_m13;
-			if (encryption_bytes > encryptable_bytes)
-				encryption_bytes = encryptable_bytes;
-		}
-
-		// decrypt
-		if (G_AES_crypt_m13(uh, pwd, enc_level, (ui1 *) bh + CMP_BLOCK_ENCRYPTION_START_OFFSET_m13, encryption_bytes, FALSE_m13) == FALSE_m13)
+		// decrypt (span rules live in CMP_crypt_block_m13(), the sole owner)
+		if (CMP_crypt_block_m13(uh, pwd, enc_level, bh, FALSE_m13) == FALSE_m13)
 			return_m13(FALSE_m13);
-		
+
 		// mark block as decrypted
 		bh->block_flags &= ~CMP_BF_ENCRYPTED_m13;
 		
@@ -3439,7 +3431,10 @@ si4 G_DST_offset_m13(si8 uutc)
 #endif
 
 	// returns seconds to add to standard time (as UUTC) to adjust for DST on that date, in the globally specified timezone
-	pg = G_proc_globs_m13(NULL);  // find proc globals by process id
+	// ancestry lookup BY DESIGN: time-string conversion has no level header & wants the process's time
+	// constants. Model boundary: with sessions from DIFFERENT timezones open in one thread, this answers
+	// with the thread's first session's DST rule - accepted limitation of the no-lh convenience path
+	pg = G_proc_globs_m13(NULL);
 	if (pg->time_constants.set != TRUE_m13) {  // != TRUE: usable only when set == TRUE (UNKNOWN = not attempted, FALSE = no access - neither gives a real DST rule)
 		G_warning_message_m13("%s(): library time constants not set\n", __FUNCTION__);
 		return_m13(0);
@@ -3656,7 +3651,7 @@ tern	G_encrypt_time_series_m13(FPS_m13 *fps)
 {
 	static tern		warning_delivered = FALSE_m13;
 	si1			enc_level;
-	si8			i, encryptable_bytes, encryption_bytes;
+	si8			i;
 	PASSWORD_DATA_m13	*pwd;
 	CMP_FIXED_BH_m13	*bh;
 	PROC_GLOBS_m13		*pg;
@@ -3675,6 +3670,14 @@ tern	G_encrypt_time_series_m13(FPS_m13 *fps)
 	enc_level = uh->time_series_data_encryption;
 	if (enc_level == NO_ENCRYPTION_m13)
 		return_m13(TRUE_m13);
+	// "no entry" is not an instruction: the caller never said whether this file's contents should be encrypted.
+	// Encrypting on it produced files no reader would ever decrypt (the read path skips decryption on a negative
+	// level), so refuse rather than guess. Every negative level is likewise invalid here - a decrypted transient
+	// means the content is already accounted for by the decrypt path, not something to re-encrypt at level -1.
+	if (enc_level < NO_ENCRYPTION_m13) {
+		G_set_error_m13(E_CRYP_m13, "invalid time series data encryption level (%hhd) in universal header => cannot encrypt", enc_level);
+		return_m13(FALSE_m13);
+	}
 
 	pg = G_proc_globs_m13(fps);
 	pwd = &pg->password_data;
@@ -3695,18 +3698,8 @@ tern	G_encrypt_time_series_m13(FPS_m13 *fps)
 			continue;
 		}
 
-		// calculate encryption bytes
-		encryptable_bytes = bh->total_block_bytes - CMP_BLOCK_ENCRYPTION_START_OFFSET_m13;
-		if (bh->block_flags & CMP_BF_MBE_ENCODING_m13) {  // MBE readable without other info (e.g. RED/PRED statistics) => encrypt full payload
-			encryption_bytes = encryptable_bytes;  // full 16 byte AES blocks after encryption start point; AES_encrypt/decrypt_m13() handle trailing partial block internally (AES_partial_encrypt/decrypt_m13())
-		} else {
-			encryption_bytes = (bh->total_header_bytes - CMP_BLOCK_ENCRYPTION_START_OFFSET_m13) + ENCRYPTION_BLOCK_BYTES_m13;
-			if (encryption_bytes > encryptable_bytes)
-				encryption_bytes = encryptable_bytes;
-		}
-
-		// encrypt
-		if (G_AES_crypt_m13(uh, pwd, enc_level, (ui1 *) bh + CMP_BLOCK_ENCRYPTION_START_OFFSET_m13, encryption_bytes, TRUE_m13) == FALSE_m13)
+		// encrypt (span rules live in CMP_crypt_block_m13(), the sole owner)
+		if (CMP_crypt_block_m13(uh, pwd, enc_level, bh, TRUE_m13) == FALSE_m13)
 			return_m13(FALSE_m13);
 
 		// mark block as encrypted
@@ -5314,10 +5307,10 @@ void	G_free_global_tables_m13(void)
 	tables->CMP_VDS_threshold_map = NULL;
 	tables->E_strings_table = NULL;
 
-	if (tables->CRC_tables)  // CRC tables are COMPUTED at runtime (not a .rodata const) => genuinely heap, must free
-		 free((void *) tables->CRC_tables);
-	if (tables->CMP_log_table) {  // COMPUTED entropy-estimator LUT => heap, must free
-		free((void *) tables->CMP_log_table);
+	if (tables->CRC_tables)  // CRC tables are COMPUTED at runtime (not a .rodata const) => guarded & sealed, free via the guarded path
+		 G_guarded_table_free_m13((void *) tables->CRC_tables, (CRC_TABLES_m13 * sizeof(crc4 *)) + ((size_t) CRC_TABLES_m13 * CRC_TABLE_ENTRIES_m13 * sizeof(crc4)));
+	if (tables->CMP_log_table) {  // COMPUTED entropy-estimator LUT => guarded & sealed, free via the guarded path
+		G_guarded_table_free_m13((void *) tables->CMP_log_table, (size_t) CMP_LOG_TABLE_ENTRIES_m13 * sizeof(sf8));
 		tables->CMP_log_table = NULL;
 	}
 
@@ -5644,7 +5637,7 @@ tern	G_free_ssr_m13(void *ptr)
 	pg = G_proc_globs_m13(ssr);
 	n_segs = pg->current_session.n_segments;
 	// the fps arrays may be NULL: G_open_seg_sess_recs_m13() frees its local ssr through here when there is no
-	// SSR directory (before the arrays are allocated), or mapped_segs == 0 => calloc_m13(0) returned NULL
+	// SSR directory (before the arrays are allocated), or sess_segs == 0 => calloc_m13(0) returned NULL
 	if (ssr->rec_inds_fps != NULL && ssr->rec_data_fps != NULL) {
 		for (i = 0; i < n_segs; ++i) {
 			gen_fps = ssr->rec_inds_fps[i];
@@ -7104,8 +7097,8 @@ tern	G_init_metadata_m13(FPS_m13 *fps, tern init_for_update)
 			tmd2->sampling_frequency = RATE_NO_ENTRY_m13;
 			tmd2->low_frequency_filter_setting = RATE_NO_ENTRY_m13;
 			tmd2->high_frequency_filter_setting = RATE_NO_ENTRY_m13;
-			tmd2->notch_filter_frequency_setting = RATE_NO_ENTRY_m13;
-			tmd2->AC_line_frequency = RATE_NO_ENTRY_m13;
+			tmd2->line_filter_frequency_setting = RATE_NO_ENTRY_m13;
+			tmd2->power_line_frequency = RATE_NO_ENTRY_m13;
 			tmd2->amplitude_units_conversion_factor = TS_METADATA_AMPLITUDE_UNITS_CONVERSION_FACTOR_NO_ENTRY_m13;
 			tmd2->time_base_units_conversion_factor = TS_METADATA_TIME_BASE_UNITS_CONVERSION_FACTOR_NO_ENTRY_m13;
 			tmd2->session_start_sample_number = TS_METADATA_SESSION_START_SAMPLE_NUMBER_NO_ENTRY_m13;
@@ -8083,11 +8076,11 @@ tern	G_merge_metadata_m13(FPS_m13 *md_fps_1, FPS_m13 *md_fps_2, FPS_m13 *merged_
 		if (tmd2_1->high_frequency_filter_setting != tmd2_2->high_frequency_filter_setting) {
 			tmd2_m->high_frequency_filter_setting = RATE_NO_ENTRY_m13; equal = FALSE_m13;
 		}
-		if (tmd2_1->notch_filter_frequency_setting != tmd2_2->notch_filter_frequency_setting) {
-			tmd2_m->notch_filter_frequency_setting = RATE_NO_ENTRY_m13; equal = FALSE_m13;
+		if (tmd2_1->line_filter_frequency_setting != tmd2_2->line_filter_frequency_setting) {
+			tmd2_m->line_filter_frequency_setting = RATE_NO_ENTRY_m13; equal = FALSE_m13;
 		}
-		if (tmd2_1->AC_line_frequency != tmd2_2->AC_line_frequency) {
-			tmd2_m->AC_line_frequency = RATE_NO_ENTRY_m13; equal = FALSE_m13;
+		if (tmd2_1->power_line_frequency != tmd2_2->power_line_frequency) {
+			tmd2_m->power_line_frequency = RATE_NO_ENTRY_m13; equal = FALSE_m13;
 		}
 		if (tmd2_1->amplitude_units_conversion_factor != tmd2_2->amplitude_units_conversion_factor) {
 			tmd2_m->amplitude_units_conversion_factor = TS_METADATA_AMPLITUDE_UNITS_CONVERSION_FACTOR_NO_ENTRY_m13; equal = FALSE_m13;
@@ -8538,7 +8531,7 @@ CHAN_m13	*G_open_channel_m13(CHAN_m13 *chan, SLICE_m13 *slice, const si1 *chan_p
 	tern				free_chan, threading, r_val;
 	const si1			*ext;
 	si1				tmp_str[PATH_BYTES_m13], num_str[FILE_NUMBERING_DIGITS_m13 + 1], *type_str;
-	si4				i, j, k, seg_idx, n_segs, mapped_segs, null_segment_cnt;
+	si4				i, j, k, seg_idx, n_segs, sess_segs, null_segment_cnt;
 	PROC_GLOBS_m13			*pg;
 	SEG_m13				*seg, *first_seg, *last_seg;
 	UH_m13				*uh;
@@ -8653,10 +8646,10 @@ CHAN_m13	*G_open_channel_m13(CHAN_m13 *chan, SLICE_m13 *slice, const si1 *chan_p
 		return_m13(NULL);
 	}
 	n_segs = slice->n_segs;
-	mapped_segs = pg->current_session.n_segments;
+	sess_segs = pg->current_session.n_segments;  // renamed from "mapped_segs" 2026-08-09: the map-a-subset option is long gone - ALL session segments are always allocated (NULL = not yet opened)
 
 	if (chan->segs == NULL) {
-		chan->segs = (SEG_m13 **) calloc_m13((size_t) mapped_segs, sizeof(SEG_m13 *));  // map segments
+		chan->segs = (SEG_m13 **) calloc_m13((size_t) sess_segs, sizeof(SEG_m13 *));  // map segments
 		if (chan->segs == NULL) {
 			if (free_chan == TRUE_m13)
 				G_free_channel_m13(chan);
@@ -9027,7 +9020,7 @@ tern	G_open_records_m13(void *level_header, ...)  // varagrgs(level == ssr): si4
 
 SSR_m13	*G_open_seg_sess_recs_m13(SESS_m13 *sess)
 {
-	si4			i, j, mapped_segs, first_seg_num;
+	si4			i, j, sess_segs, first_seg_num;
 	SSR_m13			*ssr;
 	PROC_GLOBS_m13		*pg;
 	
@@ -9079,12 +9072,12 @@ SSR_m13	*G_open_seg_sess_recs_m13(SESS_m13 *sess)
 	// the per-segment records files inside it are named after - so G_open_records_m13()'s own swap-and-retry
 	// on the SSR (which lazily fills ssr->uh_name from a universal header) starts from the right name.
 
-	mapped_segs = pg->current_session.n_segments;
+	sess_segs = pg->current_session.n_segments;
 	first_seg_num = 1;  // all segments mapped => the first mapped segment is always segment 1
-	ssr->rec_inds_fps = (FPS_m13 **) calloc_m13((size_t) mapped_segs, sizeof(FPS_m13 *));
-	ssr->rec_data_fps = (FPS_m13 **) calloc_m13((size_t) mapped_segs, sizeof(FPS_m13 *));
+	ssr->rec_inds_fps = (FPS_m13 **) calloc_m13((size_t) sess_segs, sizeof(FPS_m13 *));
+	ssr->rec_data_fps = (FPS_m13 **) calloc_m13((size_t) sess_segs, sizeof(FPS_m13 *));
 
-	for (i = first_seg_num, j = 0; j < mapped_segs; ++i, ++j)
+	for (i = first_seg_num, j = 0; j < sess_segs; ++i, ++j)
 		G_open_records_m13((LH_m13 *) ssr, i);
 	
 	// mark as open & publish to the session (see the note at the top of this function)
@@ -10256,34 +10249,43 @@ void	G_proc_globs_delete_m13(void *level_header)
 	if (pg->_id == 0)
 		return;
 		
-	// delete proc globals Sgmt_records_list
+	// capture Sgmt_records_list before the keys are cleared (teardown deferred below)
 	Sgmt_records_list = pg->current_session.Sgmt_recs_list;
-	pthread_mutex_lock_m13(&Sgmt_records_list->mutex);
-	
-	Sgmt_records_entry = Sgmt_records_list->entries;
-	for (i = Sgmt_records_list->top_idx + 1; i--; ++Sgmt_records_entry)
-		free(Sgmt_records_entry->Sgmt_recs);
-	free(Sgmt_records_list->entries);
-	
-	pthread_mutex_unlock_m13(&Sgmt_records_list->mutex);
-	pthread_mutex_destroy_m13(&Sgmt_records_list->mutex);
-	
-	free(Sgmt_records_list);
 
-	// clear entire slot: empty slots are recognized by _id == 0, but stale fields (e.g. current_session.UID)
-	// must not match future searches either (deleted then reopened session would find this dead slot by UID)
-	memset((void *) pg, 0, sizeof(PROC_GLOBS_m13));
-
-	// trim search extents (scan past any hole chain at the top - interior holes are reused by the empty slot searches)
+	// LAZY WIPE: clear only the two SEARCH KEYS here, under the list mutex - _id (empty-slot recognition
+	// & ancestry search) & session UID (UID search) - which makes the slot unreachable to every searcher
+	// (they all hold this mutex). The FULL memset happens at CLAIM time in the create paths, under this
+	// same mutex, immediately before G_proc_globs_init_m13() - init is a PARTIAL initializer that assumes
+	// zeroed memory (e.g. it sets only 3 password_data fields: a stale hints_exist on a reused slot would
+	// skip password processing with the previous occupant's keys still in pwd). Deferring the wipe also
+	// means a transiently held pointer to a deleted pg (found-path returns take no reference) sees frozen
+	// last state rather than fields zeroing mid-read.
 	pg_list = globals_m13->proc_globs_list;
 	pthread_mutex_lock_m13(&pg_list->mutex);
 
+	pg->current_session.UID = UID_NO_ENTRY_m13;
+	pg->_id = 0;
+
+	// trim search extents (scan past any hole chain at the top - interior holes are reused by the empty slot searches)
 	pg_ptrs = pg_list->proc_globs_ptrs;
 	while (pg_list->top_idx >= 0 && pg_ptrs[pg_list->top_idx]->_id == 0)
 		--pg_list->top_idx;
 
 	pthread_mutex_unlock_m13(&pg_list->mutex);
-	
+
+	// delete proc globals Sgmt_records_list (unreachable by new searchers once the keys are cleared above;
+	// its mutex still taken so an already-in-flight holder drains before the entries are freed)
+	if (Sgmt_records_list) {
+		pthread_mutex_lock_m13(&Sgmt_records_list->mutex);
+		Sgmt_records_entry = Sgmt_records_list->entries;
+		for (i = Sgmt_records_list->top_idx + 1; i--; ++Sgmt_records_entry)
+			free(Sgmt_records_entry->Sgmt_recs);
+		free(Sgmt_records_list->entries);
+		pthread_mutex_unlock_m13(&Sgmt_records_list->mutex);
+		pthread_mutex_destroy_m13(&Sgmt_records_list->mutex);
+		free(Sgmt_records_list);
+	}
+
 	return;
 }
 
@@ -10489,12 +10491,18 @@ PROC_GLOBS_m13	*G_proc_globs_m13(void *level_header)
 #ifdef FT_DEBUG_m13
 	G_push_function_m13();
 #endif
-	
+
+	// LIFETIME of the returned pointer: found-path returns take NO reference. The pointer is guaranteed
+	// while the hierarchy it resolved through remains open (lh callers), or while the calling thread lives
+	// & has not closed the session (NULL callers). Do not stash it across either boundary - after the last
+	// unlink the slot's search keys are cleared & it may be wiped & reused by any later creation.
+
 	// find process globals by shortcut or linkage
 	pg = NULL;
+	sess_uid = 0;  // stays 0 unless a universal header supplies one (see the ancestry test below)
 	lh = (LH_m13 *) level_header;
 	if (lh) {
-		// poc_globs passed
+		// proc_globs passed
 		if (lh->type_code == PROC_GLOBS_TYPE_CODE_m13)
 			return_m13((PROC_GLOBS_m13 *) lh);
 
@@ -10546,18 +10554,27 @@ PROC_GLOBS_m13	*G_proc_globs_m13(void *level_header)
 	}
 
 	// find by thread id (recursing up thread ancestral tree as necessary)
+	// ⚠️ This is the WEAKEST strategy & is only a GUESS: it identifies the session the calling THREAD is
+	// working on, not the session this FILE belongs to. Those coincide until a thread touches two sessions.
+	// So a candidate is rejected when it is PROVABLY the wrong session - BOTH UIDs known & different - and
+	// the code below then creates one, still under this mutex, which is what makes "one pg per session" hold.
+	// Either UID unknown => accept, exactly as before: a pg with no session UID is one being filled in as its
+	// fields are generated (recording creation), & a file with no UID cannot contradict anything. The test can
+	// therefore only ever reject an answer that is already wrong - no path that works today changes.
 	_id = gettid_m13();
 	do {
 		pg_ptr = list->proc_globs_ptrs;
 		for (i = n_pg; i--; ++pg_ptr) {
 			if ((*pg_ptr)->_id == _id) {
+				if (sess_uid && (*pg_ptr)->current_session.UID)  // both known & not equal (if equal would have bailed above)
+					continue;
 				pg = *pg_ptr;
 				pthread_mutex_unlock_m13(&list->mutex);
 				goto PROC_GLOBS_FOUND_m13;
 			}
-			if (pg)
+			if (pg)  // stored empty slot
 				continue;
-			if ((*pg_ptr)->_id == 0)  // store first empty
+			if ((*pg_ptr)->_id == 0)  // store first empty slot
 				pg = *pg_ptr;
 		}
 		
@@ -10593,20 +10610,30 @@ PROC_GLOBS_m13	*G_proc_globs_m13(void *level_header)
 		pg = list->proc_globs_ptrs[++list->top_idx];
 	}
 
+	// wipe slot before initializing (lazy wipe: G_proc_globs_delete_m13() clears only the search keys, so
+	// a reused slot is stale & G_proc_globs_init_m13() is a partial initializer that assumes zeroed memory)
+	memset((void *) pg, 0, sizeof(PROC_GLOBS_m13));
+
+	// initialize
+	G_proc_globs_init_m13(pg);
+
 	// claim slot before releasing mutex (concurrent creators could otherwise claim the same empty slot)
 	pg->_id = gettid_m13();
+	++pg->ref_count;  // add a ref count for this thread (balances the thread exit delete; G_proc_globs_new_m13() does the same)
+
+	// set session UID if possible
+	if (sess_uid)
+		pg->current_session.UID = sess_uid;
 
 	// relase mutex
 	pthread_mutex_unlock_m13(&list->mutex);
 
-	// initialize
-	G_proc_globs_init_m13(pg);
-	++pg->ref_count;  // add a ref count for this thread (balances the thread exit delete; G_proc_globs_new_m13() does the same)
 
 PROC_GLOBS_FOUND_m13:
 
+		
+	// set shortcuts
 	if (lh) {
-		// set shortcuts
 		lh->proc_globs = pg;
 		++pg->ref_count;  // add a ref count for link
 		while (lh->parent) {
@@ -10631,17 +10658,21 @@ PROC_GLOBS_FOUND_m13:
 PROC_GLOBS_m13	*G_proc_globs_new_m13(void *level_header)
 {
 	si4			i, n_pg;
+	ui8			sess_uid;
 	LH_m13 			*lh;
+	UH_m13			*uh;
 	PROC_GLOBS_m13		*pg, **pg_ptr, *new_pg;
 	PROC_GLOBS_LIST_m13	*list;
-	
+
 #ifdef FT_DEBUG_m13
 	G_push_function_m13();
 #endif
-	
+
 	// generate a new set of process globals within same thread
 	// e.g. for multiple sessions open in same thread
-	
+	// a duplicate _id is expected & allowed: a thread opening a second session owns two proc_globs;
+	// the ancestry test in G_proc_globs_m13() tells them apart by session UID
+
 	lh = (LH_m13 *) level_header;
 	if (lh == NULL) {
 		G_set_error_m13(E_GEN_m13, "level must be specified");
@@ -10652,61 +10683,93 @@ PROC_GLOBS_m13	*G_proc_globs_new_m13(void *level_header)
 		return_m13(NULL);
 	}
 
+	// session UID, if a read universal header can supply one (pre-universal-header callers pass structs with none)
+	sess_uid = 0;
+	if (G_MED_file_m13(lh->type_code) == TRUE_m13) {
+		uh = ((FPS_m13 *) lh)->uh;
+		if (uh)
+			sess_uid = uh->session_UID;
+	}
+
 	// get mutex
 	list = globals_m13->proc_globs_list;
+	if (list == NULL)  // early initialization: proc globs list not yet created
+		return_m13(NULL);
 	pthread_mutex_lock_m13(&list->mutex);
-			
-	// find first empty entry
+
+	// session UIDs are unique in the list: if this session's proc_globs already exist, use them (re-linked below)
 	pg = NULL;
 	n_pg = list->top_idx + 1;
-	pg_ptr = list->proc_globs_ptrs;
-	for (i = n_pg; i--; ++pg_ptr) {
-		if ((*pg_ptr)->_id == 0) {
-			pg = *pg_ptr;
-			break;
+	if (sess_uid) {
+		pg_ptr = list->proc_globs_ptrs;
+		for (i = n_pg; i--; ++pg_ptr) {
+			if ((*pg_ptr)->current_session.UID == sess_uid) {
+				pg = *pg_ptr;
+				break;
+			}
 		}
 	}
-	
-	// expand list (identical to G_proc_globs_m13(): teardown in G_free_globals_m13() frees by block, so allocation strategies must match)
+
+	// create new proc_globs
 	if (pg == NULL) {
-		if (n_pg == list->size) {
-			n_pg += GLOBALS_PROC_GLOBS_LIST_SIZE_INCREMENT_m13;
-			pg_ptr = (PROC_GLOBS_m13 **) realloc(list->proc_globs_ptrs, (size_t) n_pg * sizeof(PROC_GLOBS_m13 *));
-			if (pg_ptr == NULL) {
-				pthread_mutex_unlock_m13(&list->mutex);
-				G_set_error_m13(E_ALLOC_m13, NULL);
-				return_m13(NULL);
-			}
-			list->proc_globs_ptrs = pg_ptr;
 
-			// allocate new proc_globs (en bloc; calloc: G_proc_globs_init_m13() does not zero the level header fields)
-			new_pg = (PROC_GLOBS_m13 *) calloc((size_t) GLOBALS_PROC_GLOBS_LIST_SIZE_INCREMENT_m13, sizeof(PROC_GLOBS_m13));
-			if (new_pg == NULL) {
-				pthread_mutex_unlock_m13(&list->mutex);
-				G_set_error_m13(E_ALLOC_m13, NULL);
-				return_m13(NULL);
+		// find first empty entry
+		pg_ptr = list->proc_globs_ptrs;
+		for (i = n_pg; i--; ++pg_ptr) {
+			if ((*pg_ptr)->_id == 0) {
+				pg = *pg_ptr;
+				break;
 			}
-			pg_ptr = list->proc_globs_ptrs + list->size;  // list->size is old list->size at this point
-			for (i = GLOBALS_PROC_GLOBS_LIST_SIZE_INCREMENT_m13; i--;)
-				*pg_ptr++ = new_pg++;
-			list->size = n_pg;
 		}
-		pg = list->proc_globs_ptrs[++list->top_idx];
+
+		// expand list (identical to G_proc_globs_m13(): teardown in G_free_globals_m13() frees by block, so allocation strategies must match)
+		if (pg == NULL) {
+			if (n_pg == list->size) {
+				n_pg += GLOBALS_PROC_GLOBS_LIST_SIZE_INCREMENT_m13;
+				pg_ptr = (PROC_GLOBS_m13 **) realloc(list->proc_globs_ptrs, (size_t) n_pg * sizeof(PROC_GLOBS_m13 *));
+				if (pg_ptr == NULL) {
+					pthread_mutex_unlock_m13(&list->mutex);
+					G_set_error_m13(E_ALLOC_m13, NULL);
+					return_m13(NULL);
+				}
+				list->proc_globs_ptrs = pg_ptr;
+
+				// allocate new proc_globs (en bloc; calloc: G_proc_globs_init_m13() does not zero the level header fields)
+				new_pg = (PROC_GLOBS_m13 *) calloc((size_t) GLOBALS_PROC_GLOBS_LIST_SIZE_INCREMENT_m13, sizeof(PROC_GLOBS_m13));
+				if (new_pg == NULL) {
+					pthread_mutex_unlock_m13(&list->mutex);
+					G_set_error_m13(E_ALLOC_m13, NULL);
+					return_m13(NULL);
+				}
+				pg_ptr = list->proc_globs_ptrs + list->size;  // list->size is old list->size at this point
+				for (i = GLOBALS_PROC_GLOBS_LIST_SIZE_INCREMENT_m13; i--;)
+					*pg_ptr++ = new_pg++;
+				list->size = n_pg;
+			}
+			pg = list->proc_globs_ptrs[++list->top_idx];
+		}
+
+		// wipe slot before initializing (lazy wipe: G_proc_globs_delete_m13() clears only the search keys, so
+		// a reused slot is stale & G_proc_globs_init_m13() is a partial initializer that assumes zeroed memory)
+		memset((void *) pg, 0, sizeof(PROC_GLOBS_m13));
+
+		// initialize (before releasing mutex: searchers must never see a claimed but half-built entry)
+		G_proc_globs_init_m13(pg);
+		++pg->ref_count;  // add a ref count for this thread (balances the thread exit delete, as in G_proc_globs_m13())
+
+		// claim slot before releasing mutex (concurrent creators could otherwise claim the same empty slot)
+		pg->_id = gettid_m13();
+
+		// set session UID if possible (visible to concurrent UID searches from creation on)
+		if (sess_uid)
+			pg->current_session.UID = sess_uid;
 	}
 
-	// claim slot before releasing mutex (concurrent creators could otherwise claim the same empty slot)
-	pg->_id = gettid_m13();
-
-	// relase mutex
+	// release mutex
 	pthread_mutex_unlock_m13(&list->mutex);
 
-	// initialize
-	G_proc_globs_init_m13(pg);
-	++pg->ref_count;  // add a ref count for this thread (balances the thread exit delete, as in G_proc_globs_m13())
-
 	// set shortcuts (with ref counts, as in G_proc_globs_m13())
-	// existing links are released & replaced up the full hierarchy - e.g. new session detected in FPS_read_m13()
-	// re-links the hierarchy to the new proc_globs (a partial re-link would split the hierarchy across two proc_globs)
+	// existing links are released & replaced up the full hierarchy (a partial re-link would split the hierarchy across two proc_globs)
 	if (lh->proc_globs)
 		G_proc_globs_delete_m13((LH_m13 *) lh->proc_globs);  // release ref on old proc_globs
 	lh->proc_globs = pg;
@@ -12857,7 +12920,7 @@ SESS_m13	*G_read_session_m13(SESS_m13 *sess, SLICE_m13 *slice, ...)  // varargs(
 		if (ssr == NULL)
 			ssr = G_open_seg_sess_recs_m13(sess);
 		// ssr is non-NULL only when the SSR is open (G_open_seg_sess_recs_m13() publishes sess->ssr on success
-		// only), but still check the arrays: mapped_segs == 0 => calloc_m13(0) returns NULL.
+		// only), but still check the arrays: sess_segs == 0 => calloc_m13(0) returns NULL.
 		// (matches the non-segmented session-records guard above.)
 		if (ssr && ssr->rec_inds_fps && ssr->rec_data_fps)
 			for (i = slice->start_seg_num, j = seg_idx; i <= slice->end_seg_num; ++i, ++j)
@@ -13022,6 +13085,10 @@ si8	G_read_time_series_data_m13(SEG_m13 *seg, SLICE_m13 *slice)
 			if (cached_block_cnt) {
 				// reallocate cache manually so CMP_realloc_CPS_m13() does not free
 				if (n_samps > cps->params.allocated_decompressed_samples) {
+					if (cps->direcs.flags & CPS_DF_CALLER_OWNS_DECOMPRESSED_m13) {  // never freed, never moved: refuse rather than grow
+						G_set_error_m13(E_CMP_m13, "caller-owned decompressed buffer holds %ld samples but %ld are needed", cps->params.allocated_decompressed_samples, n_samps);
+						return_m13(FALSE_m13);
+					}
 					cps->decompressed_data = cps->params.cache = (si4 *) realloc_m13(cps->params.cache, n_samps * sizeof(si4));
 					cps->params.allocated_decompressed_samples = calloc_size_m13(cps->decompressed_data, sizeof(si4));
 				}
@@ -13755,30 +13822,33 @@ si4	G_search_mode_m13(SLICE_m13 *slice)
 }
 
 
-si4	G_search_Sgmt_records_m13(Sgmt_REC_m13 *Sgmt_records, SLICE_m13 *slice, ui4 search_mode)
+si4	G_search_Sgmt_records_m13(Sgmt_REC_m13 *Sgmt_records, si4 n_segs, SLICE_m13 *slice, ui4 search_mode)
 {
-	si1				seg_name[SEG_NAME_BYTES_m13], md_file[PATH_BYTES_m13], num_str[FILE_NUMBERING_DIGITS_m13 + 1];
-	si4				i, idx, low_idx, high_idx;
-	si8				target;
-	PROC_GLOBS_m13			*pg;
-	TS_METADATA_SECTION_2_m13	*md2;
-	CHAN_m13			*chan;
-	FPS_m13				*md_fps;
-	
+	si4	idx, low_idx, high_idx;
+	si8	target;
+
 #ifdef FT_DEBUG_m13
 	G_push_function_m13();
 #endif
 
 	// Note: this may seem like overkill, that a simple forward linear search would suffice,
 	// but in theory there can be a large number of non-uniformly spaced segments.
-	
-	pg = G_proc_globs_m13(NULL);  // use proc_globs from current thread
-		
+
+	// pure function of its arguments: n_segs is the length of the Sgmt_records array & the caller resolves
+	// both from the same level header, so array & count always describe the same session (this function
+	// used to get the count from G_proc_globs_m13(NULL): with two sessions open in one process, thread
+	// ancestry answered for the wrong session & the search ran off the end of the array)
+
+	if (Sgmt_records == NULL || n_segs <= 0) {
+		G_set_error_m13(E_GEN_m13, "no Sgmt records");
+		return_m13(0);
+	}
+
 	if (search_mode == TIME_SEARCH_m13) {
 		// start segment
 		target = slice->start_time;
 		low_idx = 0;
-		high_idx = pg->current_session.n_segments - 1;
+		high_idx = n_segs - 1;
 
 		if (target > Sgmt_records[high_idx].end_time) {
 			slice->start_seg_num = SEGMENT_NUMBER_NO_ENTRY_m13;
@@ -13806,7 +13876,7 @@ si4	G_search_Sgmt_records_m13(Sgmt_REC_m13 *Sgmt_records, SLICE_m13 *slice, ui4 
 		// end segment
 		target = slice->end_time;
 		low_idx = idx;
-		high_idx = pg->current_session.n_segments - 1;
+		high_idx = n_segs - 1;
 		if (target < Sgmt_records[low_idx].start_time) {
 			slice->end_seg_num = SEGMENT_NUMBER_NO_ENTRY_m13;
 			G_warning_message_m13("%s(): requested end time precedes requested start time\n", __FUNCTION__);
@@ -13830,28 +13900,10 @@ si4	G_search_Sgmt_records_m13(Sgmt_REC_m13 *Sgmt_records, SLICE_m13 *slice, ui4 
 		}
 	}
 	else {  // search_mode == INDEX_SEARCH_m13
-		
-		// sample search required, but no sample data in Sgmt_records => fill it in (e.g from session records in variable frequency session)
-		if (Sgmt_records[0].start_idx == INDEX_NO_ENTRY_m13) {
-			chan = pg->current_session.index_channel;
-			for (i = 0; i < pg->current_session.n_segments; ++i) {
-				STR_fixed_width_int_m13(num_str, FILE_NUMBERING_DIGITS_m13, Sgmt_records[i].seg_num);
-				sprintf_m13(seg_name, "%s_s%s", chan->name, num_str);
-				sprintf_m13(md_file, "%s/%s.%s/%s.%s", chan->path, seg_name, TS_SEG_TYPE_STR_m13, seg_name, TS_METADATA_TYPE_STR_m13);
-				md_fps = FPS_read_m13(NULL, FPS_FULL_FILE_m13, METADATA_BYTES_m13, 1, md_file, "r", NULL, NULL, 0);
-				if (md_fps == NULL)
-					continue;
-				md2 = &md_fps->metadata->time_series_section_2;
-				Sgmt_records[i].end_idx = Sgmt_records[i].start_idx = md2->session_start_sample_number;
-				Sgmt_records[i].end_idx += (md2->number_of_samples - 1);
-				FPS_free_m13(md_fps);
-			}
-		}
-
 		// start segment
 		target = slice->start_idx;
 		low_idx = 0;
-		high_idx = pg->current_session.n_segments - 1;
+		high_idx = n_segs - 1;
 		if (target > Sgmt_records[high_idx].end_idx) {
 			slice->start_seg_num = SEGMENT_NUMBER_NO_ENTRY_m13;
 			G_warning_message_m13("%s(): requested start sample is after session end\n", __FUNCTION__);
@@ -13878,7 +13930,7 @@ si4	G_search_Sgmt_records_m13(Sgmt_REC_m13 *Sgmt_records, SLICE_m13 *slice, ui4 
 		// end segment
 		target = slice->end_idx;
 		low_idx = idx;
-		high_idx = pg->current_session.n_segments - 1;
+		high_idx = n_segs - 1;
 		if (target < Sgmt_records[low_idx].start_idx) {
 			slice->end_seg_num = SEGMENT_NUMBER_NO_ENTRY_m13;
 			G_warning_message_m13("%s(): requested end sample precedes requested start sample\n", __FUNCTION__);
@@ -14100,11 +14152,15 @@ si4	G_segment_for_time_m13(void *level_header, si8 target_time)
 
 si4 G_segment_range_m13(void *level_header, SLICE_m13 *slice)
 {
-	si4			search_mode, n_segs;
-	si8			start_time, end_time, last_seg_idx;
-	LH_m13			*lh;
-	PROC_GLOBS_m13		*pg;
-	Sgmt_REC_m13		*Sgmt_records;
+	si1				seg_name[SEG_NAME_BYTES_m13], md_file[PATH_BYTES_m13], num_str[FILE_NUMBERING_DIGITS_m13 + 1];
+	si4				i, search_mode, n_segs, tot_segs;
+	si8				start_time, end_time, last_seg_idx;
+	LH_m13				*lh;
+	PROC_GLOBS_m13			*pg;
+	CHAN_m13			*chan;
+	FPS_m13				*md_fps;
+	TS_METADATA_SECTION_2_m13	*md2;
+	Sgmt_REC_m13			*Sgmt_records;
 	
 #ifdef FT_DEBUG_m13
 	G_push_function_m13();
@@ -14127,13 +14183,36 @@ si4 G_segment_range_m13(void *level_header, SLICE_m13 *slice)
 	Sgmt_records = G_Sgmt_records_m13(lh, search_mode);
 	if (Sgmt_records == NULL)
 		return_m13(UNKNOWN_m13);
-	
+
+	// session segment count: resolved via the same level header as the records array, so count & array
+	// describe the same session (G_search_Sgmt_records_m13() is a pure function of its arguments & the
+	// pairing is this function's responsibility)
+	pg = G_proc_globs_m13(lh);
+	tot_segs = pg->current_session.n_segments;
+
+	// sample search required, but no sample data in Sgmt_records => fill it in (e.g. from session records in
+	// variable frequency session; moved here from G_search_Sgmt_records_m13(), which needed proc_globs only for this)
+	if (search_mode == INDEX_SEARCH_m13 && Sgmt_records[0].start_idx == INDEX_NO_ENTRY_m13) {
+		chan = pg->current_session.index_channel;
+		for (i = 0; i < tot_segs; ++i) {
+			STR_fixed_width_int_m13(num_str, FILE_NUMBERING_DIGITS_m13, Sgmt_records[i].seg_num);
+			sprintf_m13(seg_name, "%s_s%s", chan->name, num_str);
+			sprintf_m13(md_file, "%s/%s.%s/%s.%s", chan->path, seg_name, TS_SEG_TYPE_STR_m13, seg_name, TS_METADATA_TYPE_STR_m13);
+			md_fps = FPS_read_m13(NULL, FPS_FULL_FILE_m13, METADATA_BYTES_m13, 1, md_file, "r", NULL, NULL, 0);
+			if (md_fps == NULL)
+				continue;
+			md2 = &md_fps->metadata->time_series_section_2;
+			Sgmt_records[i].end_idx = Sgmt_records[i].start_idx = md2->session_start_sample_number;
+			Sgmt_records[i].end_idx += (md2->number_of_samples - 1);
+			FPS_free_m13(md_fps);
+		}
+	}
+
 	// search Sgmt_records array
-	n_segs = G_search_Sgmt_records_m13(Sgmt_records, slice, search_mode);
-	
+	n_segs = G_search_Sgmt_records_m13(Sgmt_records, tot_segs, slice, search_mode);
+
 	// set slice segment span (no window to set: all segments are always mapped - the per-channel segs arrays are
 	// full-length & stable, indexed directly by segment_number - 1, so there is nothing to (re)map here)
-	pg = G_proc_globs_m13(lh);
 	slice->n_segs = n_segs ? n_segs : UNKNOWN_m13;
 
 	start_time = Sgmt_records->start_time;
@@ -14141,7 +14220,7 @@ si4 G_segment_range_m13(void *level_header, SLICE_m13 *slice)
 		slice->start_time = start_time;
 	if (slice->start_time == start_time)
 		slice->start_samp_num = Sgmt_records[0].start_samp_num;
-	last_seg_idx = pg->current_session.n_segments - 1;
+	last_seg_idx = tot_segs - 1;
 	end_time = Sgmt_records[last_seg_idx].end_time;
 	if (slice->end_time == END_OF_TIME_m13)
 		slice->end_time = end_time;
@@ -15874,16 +15953,16 @@ tern	G_show_metadata_m13(FPS_m13 *fps, METADATA_m13 *md, ui4 type_code)
 				printf_m13("High Frequency Filter Setting: variable\n");
 			else
 				printf_m13("High Frequency Filter Setting (Hz): %lf\n", tmd2->high_frequency_filter_setting);
-			if (tmd2->notch_filter_frequency_setting == RATE_NO_ENTRY_m13)
+			if (tmd2->line_filter_frequency_setting == RATE_NO_ENTRY_m13)
 				printf_m13("Notch Filter Frequency Setting: no entry\n");
-			else if (tmd2->notch_filter_frequency_setting == RATE_VARIABLE_m13)
+			else if (tmd2->line_filter_frequency_setting == RATE_VARIABLE_m13)
 				printf_m13("Notch Filter Frequency Setting: variable\n");
 			else
-				printf_m13("Notch Filter Frequency Setting (Hz): %lf\n", tmd2->notch_filter_frequency_setting);
-			if (tmd2->AC_line_frequency == RATE_NO_ENTRY_m13)
+				printf_m13("Line Filter Frequency Setting (Hz): %lf\n", tmd2->line_filter_frequency_setting);
+			if (tmd2->power_line_frequency == RATE_NO_ENTRY_m13)
 				printf_m13("AC Line Frequency: no entry\n");
 			else
-				printf_m13("AC Line Frequency (Hz): %lf\n", tmd2->AC_line_frequency);
+				printf_m13("Power Line Frequency (Hz): %lf\n", tmd2->power_line_frequency);
 			if (tmd2->amplitude_units_conversion_factor == TS_METADATA_AMPLITUDE_UNITS_CONVERSION_FACTOR_NO_ENTRY_m13)
 				printf_m13("Amplitiude Units Conversion Factor: no entry\n");
 			else
@@ -16991,6 +17070,34 @@ tern	G_show_universal_header_m13(FPS_m13 *fps, UH_m13 *uh)
 }
 
 
+#if defined MACOS_m13 || defined LINUX_m13
+static si4	G_trap_watchdog_sig_m13 = 0;  // BSS, immune to heap corruption
+
+static void	G_trap_watchdog_m13(si4 alarm_sig)
+{
+	// WATCHDOG for G_signal_trap_m13(): fires if the crash path ITSELF hangs. The trap's diagnostics run
+	// through async-signal-unsafe machinery whose internal bounds all TRUST heap state (the error isem's
+	// period sets its own nap length, its mutex must be intact, stdio locks must be free) - the very
+	// corruption being reported can destroy every one of them (2026-08-09: a heap overrun trashed the
+	// error isem & the trap presented as an infinite spin instead of a crash). Everything here is
+	// async-signal-safe & touches only BSS: raw write, re-raise under default disposition.
+	static const si1	msg[] = "\nmedlib signal trap: crash reporting hung (heap state corrupted) => dying by the original signal's default disposition\n";
+	sigset_t		unblock;
+
+	write(2, msg, sizeof(msg) - 1);
+	if (G_trap_watchdog_sig_m13 && G_trap_watchdog_sig_m13 != alarm_sig) {
+		// the original signal is still BLOCKED here (this handler runs nested inside its handler), so a
+		// bare raise() would only mark it pending & _exit() would win the race - unblock it first so the
+		// process dies by the original signal's default disposition (honest exit status for tools/scripts)
+		sigemptyset(&unblock);
+		sigaddset(&unblock, G_trap_watchdog_sig_m13);
+		raise(G_trap_watchdog_sig_m13);  // pend it (traps already restored to default)
+		sigprocmask(SIG_UNBLOCK, &unblock, NULL);  // delivery happens here
+	}
+	_exit(128 + alarm_sig);  // reached only if the signal is ignored/blocked beyond our control
+}
+#endif
+
 void	G_signal_trap_m13(si4 sig_num)
 {
 	const si1		*error_type, *error_desc, *function;
@@ -17003,14 +17110,68 @@ void	G_signal_trap_m13(si4 sig_num)
 
 	// set signals back to default handlers (a second fault in this handler gets default handling => no recursion)
 	G_set_signal_traps_m13(FALSE_m13);
-	
+
+	// crash reporting must never block: arm a watchdog for the WHOLE report path (see G_trap_watchdog_m13()).
+	// All successful paths exit the process, so the alarm is never cancelled - it simply never fires unless
+	// the report hangs. alarm() is PROCESS-wide, so only the FIRST thread into the trap - the error isem
+	// design's designated reporter - arms it: concurrently faulting threads park on the isem (held until the
+	// reporter's exit kills the process, the original design) & must not restart the deadline.
+	// (No Windows leg: alarm() is POSIX; Windows keeps the prior behavior.)
+	#if defined MACOS_m13 || defined LINUX_m13
+	{
+		static _Atomic si4	watchdog_armed = 0;  // BSS, immune to heap corruption
+		si4			expected = 0;
+
+		if (atomic_compare_exchange_strong(&watchdog_armed, &expected, 1)) {
+			G_trap_watchdog_sig_m13 = sig_num;
+			signal(SIGALRM, G_trap_watchdog_m13);
+			alarm(3);
+		}
+	}
+	#endif
+
 	if (isem_tryown_m13(&globals_m13->error.isem) == FALSE_m13) {
 		if (sig_num == SIGINT) {  // ctrl-C while error executing (e.g. reentrant error loop)
 			isem_chown_m13(&globals_m13->error.isem, ISEM_SELF_m13);
 			exit_exec_m13(__FUNCTION__, __LINE__, E_SIG_m13);
 		}
-		
-		isem_own_m13(&globals_m13->error.isem);  // hold non-owners here
+
+		// BOUNDED wait - crash reporting must never block. The intended holder is another thread mid-
+		// error-report, whose path exits the process, so a short wait suffices. If the isem is still
+		// unavailable after the bound it is not coming: either its state was destroyed by the very
+		// corruption being reported, or this thread faulted while holding it - and an unbounded wait
+		// turns a crash into a HANG (2026-08-09: a heap overrun that trashed the isem neighborhood
+		// presented as a 38%-CPU spin instead of a crash). Fall back to an async-signal-safe raw
+		// report & the signal's default disposition (traps were already restored to default above).
+		{
+			si4	tries;
+
+			for (tries = 200; tries--;) {  // ~2 s at 10 ms per try
+				if (isem_tryown_m13(&globals_m13->error.isem) == TRUE_m13)
+					break;
+				nap_m13("10 ms");
+			}
+			if (tries < 0) {
+				static const si1	trap_msg[] = "\nmedlib signal trap: error isem unavailable (state corrupted, or fault occurred while it was held) => re-raising signal for default handling\n";
+
+				#if defined MACOS_m13 || defined LINUX_m13
+				sigset_t	unblock;
+
+				write(2, trap_msg, sizeof(trap_msg) - 1);
+				// sig_num is still BLOCKED (we are inside its handler): raise() alone only pends it &
+				// _exit() would win - unblock AFTER raise so delivery happens under default disposition
+				sigemptyset(&unblock);
+				sigaddset(&unblock, sig_num);
+				raise(sig_num);
+				sigprocmask(SIG_UNBLOCK, &unblock, NULL);
+				#endif
+				#ifdef WINDOWS_m13
+				_write(2, trap_msg, (unsigned int) (sizeof(trap_msg) - 1));
+				raise(sig_num);
+				#endif
+				_exit(128 + sig_num);  // reached only if the signal is ignored/blocked beyond our control
+			}
+		}
 	}
 
 	switch (sig_num) {
@@ -18388,7 +18549,7 @@ tern	G_update_channel_name_m13(CHAN_m13 *chan)
 }
 
 
-tern	G_update_MED_type_m13(const si1 *path, REKEY_CTX_m13 *rk)  // rk (schema 0->1 re-key): established schema-1 password data (rk->uh) + the two key contexts; NULL => no re-key
+tern	G_update_MED_type_m13(void *level_header, const si1 *path, REKEY_CTX_m13 *rk)  // level_header: any lh of the session being updated (resolves the correct proc globals - files of OTHER paths of the SAME session are passed as path); rk (schema 0->1 re-key): established schema-1 password data (rk->uh) + the two key contexts; NULL => no re-key
 {
 	tern			r_val, convertible;
 	ui1			*rd, *r_rd, *ri_data, *rd_data, *encryption_key, first_rec_encryption;
@@ -18656,7 +18817,11 @@ tern	G_update_MED_type_m13(const si1 *path, REKEY_CTX_m13 *rk)  // rk (schema 0-
 		memset(((ui1 *) rd_uh + UH_SUPPLEMENTARY_PROTECTED_REGION_OFFSET_m13), 0, MED_10_UH_ANONYMIZED_SUBJECT_ID_FIELD_BYTES_m13);
 
 		// get password (re-key: decrypt uses the LEGACY key context; re-encrypt below uses the schema-1 context)
-		pg = G_proc_globs_m13(NULL);
+		// resolve proc globals via the LEVEL HEADER, never thread ancestry: this is a SESSION question (the
+		// keys for THIS file's records) & a thread updating one session may have others open - ancestry
+		// returns the thread's OLDEST session, whose keys would silently mis-decrypt (same defect class as
+		// the Sgmt search count, fixed 2026-08-09)
+		pg = G_proc_globs_m13(level_header);
 		pwd = (rk != NULL) ? &rk->legacy_pwd : &pg->password_data;
 
 		// loop over records
@@ -18991,7 +19156,7 @@ tern	G_update_MED_version_m13(FPS_m13 *fps)
 	
 	// session record indices (will do data)
 	sprintf_m13(path, "%s/%s.%s", sess_path, fs_name, REC_INDS_TYPE_STR_m13);
-	G_update_MED_type_m13(path, rk);
+	G_update_MED_type_m13(fps, path, rk);
 
 	// segmented session records
 	sprintf_m13(path, "%s/%s.%s", sess_path, fs_name, SSR_TYPE_STR_m13);
@@ -18999,7 +19164,7 @@ tern	G_update_MED_version_m13(FPS_m13 *fps)
 		// seg sess record indices (will do data)
 		file_list = G_file_list_m13(NULL, &n_files, path, NULL, REC_INDS_TYPE_STR_m13, GFL_FULL_PATH_m13);
 		for (i = 0; i < n_files; ++i)
-			G_update_MED_type_m13(file_list[i], rk);
+			G_update_MED_type_m13(fps, file_list[i], rk);
 		if (file_list)
 			free_m13(file_list);
 	}
@@ -19012,7 +19177,7 @@ tern	G_update_MED_version_m13(FPS_m13 *fps)
 		// channel record indices (will do data)
 		sprintf_m13(path, "%s/%s.%s", chan_list[i], chan_name, REC_INDS_TYPE_STR_m13);
 		if (G_exists_m13(path) == TRUE_m13)
-			G_update_MED_type_m13(path, rk);
+			G_update_MED_type_m13(fps, path, rk);
 		
 		// time series segments
 		seg_list = G_file_list_m13(NULL, &n_segs, chan_list[i], NULL, TS_SEG_TYPE_STR_m13, GFL_FULL_PATH_m13);
@@ -19022,22 +19187,22 @@ tern	G_update_MED_version_m13(FPS_m13 *fps)
 			// time series metadata
 			sprintf_m13(path, "%s/%s.%s", seg_list[j], seg_name, TS_METADATA_TYPE_STR_m13);
 			if (G_exists_m13(path) == TRUE_m13)
-				G_update_MED_type_m13(path, rk);
+				G_update_MED_type_m13(fps, path, rk);
 
 			// time series indices
 			sprintf_m13(path, "%s/%s.%s", seg_list[j], seg_name, TS_INDS_TYPE_STR_m13);
 			if (G_exists_m13(path) == TRUE_m13)
-				G_update_MED_type_m13(path, rk);
+				G_update_MED_type_m13(fps, path, rk);
 
 			// time series data
 			sprintf_m13(path, "%s/%s.%s", seg_list[j], seg_name, TS_DATA_TYPE_STR_m13);
 			if (G_exists_m13(path) == TRUE_m13)
-				G_update_MED_type_m13(path, rk);
+				G_update_MED_type_m13(fps, path, rk);
 
 			// segment record indices (will do data)
 			sprintf_m13(path, "%s/%s.%s", seg_list[j], seg_name, REC_INDS_TYPE_STR_m13);
 			if (G_exists_m13(path) == TRUE_m13)
-				G_update_MED_type_m13(path, rk);
+				G_update_MED_type_m13(fps, path, rk);
 		}
 		if (seg_list)
 			free_m13(seg_list);
@@ -19053,7 +19218,7 @@ tern	G_update_MED_version_m13(FPS_m13 *fps)
 		// channel record indices (will do data)
 		sprintf_m13(path, "%s/%s.%s", chan_list[i], chan_name, REC_INDS_TYPE_STR_m13);
 		if (G_exists_m13(path) == DIR_EXISTS_m13)
-			G_update_MED_type_m13(path, rk);
+			G_update_MED_type_m13(fps, path, rk);
 
 		// video segments
 		seg_list = G_file_list_m13(NULL, &n_segs, chan_list[i], NULL, VID_SEG_TYPE_STR_m13, GFL_FULL_PATH_m13);
@@ -19063,25 +19228,25 @@ tern	G_update_MED_version_m13(FPS_m13 *fps)
 			// video metadata
 			sprintf_m13(path, "%s/%s.%s", seg_list[j], seg_name, VID_METADATA_TYPE_STR_m13);
 			if (G_exists_m13(path) == TRUE_m13)
-				G_update_MED_type_m13(path, rk);
+				G_update_MED_type_m13(fps, path, rk);
 
 			// video indices
 			sprintf_m13(path, "%s/%s.%s", seg_list[j], seg_name, VID_INDS_TYPE_STR_m13);
 			if (G_exists_m13(path) == TRUE_m13)
-				G_update_MED_type_m13(path, rk);
+				G_update_MED_type_m13(fps, path, rk);
 
 			// video data
 			vid_list = G_file_list_m13(NULL, &n_vids, seg_list[j], "*_n????", NULL, GFL_FULL_PATH_m13);
 			if (n_vids) {
 				for (k = 0; k < n_vids; ++k)
-					G_update_MED_type_m13(vid_list[k], rk);
+					G_update_MED_type_m13(fps, vid_list[k], rk);
 				free_m13(vid_list);
 			}
 			
 			// segment record indices (will do data)
 			sprintf_m13(path, "%s/%s.%s", seg_list[j], seg_name, REC_INDS_TYPE_STR_m13);
 			if (G_exists_m13(path) == TRUE_m13)
-				G_update_MED_type_m13(path, rk);
+				G_update_MED_type_m13(fps, path, rk);
 		}
 		if (seg_list)
 			free_m13(seg_list);
@@ -19612,12 +19777,15 @@ tern	G_validate_encryption_map_m13(UH_m13 *uh, ui4 type_code)
 	// file means the header was written mid-decryption & its payload cannot be trusted: the level says "already
 	// decrypted" while the bytes may still be ciphertext.
 	//
-	// ⚠️ TEST THE DECRYPTED TRANSIENTS SPECIFICALLY (-LEVEL_1 / -LEVEL_2), not "any negative value". Those two
-	// are the only states that make a reader SKIP decryption while the content claims to have been encrypted,
-	// which is the actual hazard. ENCRYPTION_NO_ENTRY_m13 (-128, also spelled ENCRYPTION_LEVEL_NO_ENTRY_m13 /
-	// ENCRYPTION_VARIABLE_m13) is a legitimate "no entry / unknown" sentinel & must pass - it is what
-	// maximum_record_encryption_level carries outside records files, & what FPS_clone_m13() writes into map
-	// entries for regions a cloned file's type cannot contain.
+	// TWO disk-invalid states, both caught only for the file's OWN entry (see the next note):
+	//   - the DECRYPTED TRANSIENTS (-LEVEL_1 / -LEVEL_2), described above.
+	//   - ENCRYPTION_NO_ENTRY_m13 (-128, also spelled ENCRYPTION_LEVEL_NO_ENTRY_m13 / ENCRYPTION_VARIABLE_m13).
+	//     "No entry" means the writer never said whether its OWN contents are encrypted, which no reader can
+	//     resolve - and the write path takes it as "encrypt" while the read path takes it as "do not decrypt",
+	//     so a file carrying it is unreadable ciphertext. -128 must never reach disk for the entry a file's
+	//     type governs. (It legitimately appears in the OTHER entries - a records file may carry it for time
+	//     series data - and is inert there.) FPS_clone_m13() used to write it into every non-owned entry; it no
+	//     longer blanks anything, since the universal header now carries map info for all file types.
 	//
 	// ⚠️ CHECK ONLY THE FIELD THAT GOVERNS THIS FILE'S OWN CONTENTS. The map has an entry per encryptable
 	// region, but a given file holds only one of them & the reader consults only that entry. A stale value in an
@@ -19632,23 +19800,23 @@ tern	G_validate_encryption_map_m13(UH_m13 *uh, ui4 type_code)
 	switch (type_code) {
 		case TS_METADATA_TYPE_CODE_m13:
 		case VID_METADATA_TYPE_CODE_m13:
-			if (G_encryption_decrypted_state_m13(uh->metadata_section_2_encryption) == TRUE_m13) {
+			if (ENCRYPTION_LEVEL_INVALID_ON_DISK_m13(uh->metadata_section_2_encryption) == TRUE_m13) {
 				level = uh->metadata_section_2_encryption;
 				break;
 			}
-			if (G_encryption_decrypted_state_m13(uh->metadata_section_3_encryption) == TRUE_m13) {
+			if (ENCRYPTION_LEVEL_INVALID_ON_DISK_m13(uh->metadata_section_3_encryption) == TRUE_m13) {
 				level = uh->metadata_section_3_encryption;
 				break;
 			}
 			return_m13(TRUE_m13);
 		case TS_DATA_TYPE_CODE_m13:
-			if (G_encryption_decrypted_state_m13(uh->time_series_data_encryption) == TRUE_m13) {
+			if (ENCRYPTION_LEVEL_INVALID_ON_DISK_m13(uh->time_series_data_encryption) == TRUE_m13) {
 				level = uh->time_series_data_encryption;
 				break;
 			}
 			return_m13(TRUE_m13);
 		case VID_DATA_TYPE_CODE_m13:
-			if (G_encryption_decrypted_state_m13(uh->video_data_encryption) == TRUE_m13) {
+			if (ENCRYPTION_LEVEL_INVALID_ON_DISK_m13(uh->video_data_encryption) == TRUE_m13) {
 				level = uh->video_data_encryption;
 				break;
 			}
@@ -19657,7 +19825,10 @@ tern	G_validate_encryption_map_m13(UH_m13 *uh, ui4 type_code)
 			return_m13(TRUE_m13);
 	}
 
-	G_set_error_m13(E_CRYP_m13, "universal header records a DECRYPTED encryption level (%hhd) for this file's own contents => it was written while those contents were decrypted in memory, so the stored bytes cannot be trusted", level);
+	if (level == ENCRYPTION_NO_ENTRY_m13)
+		G_set_error_m13(E_CRYP_m13, "universal header records NO ENTRY (%hhd) as the encryption level for this file's own contents => the writer never stated whether they are encrypted, so they cannot be read", level);
+	else
+		G_set_error_m13(E_CRYP_m13, "universal header records a DECRYPTED encryption level (%hhd) for this file's own contents => it was written while those contents were decrypted in memory, so the stored bytes cannot be trusted", level);
 	return_m13(FALSE_m13);
 }
 
@@ -22231,6 +22402,137 @@ CMP_BUFFERS_m13  *CMP_allocate_buffers_m13(CMP_BUFFERS_m13 *buffers, si8 n_buffe
 }
 
 
+// ---------------------------------------------------------------------------------------------------
+// Per-block SCRATCH fit: the one place that knows which scratch buffers the CURRENT algorithm needs, in the
+// current mode, and makes sure they exist.
+//
+// SCRATCH is per-block working memory whose contents are rebuilt from nothing every block - the RED/PRED
+// count family, the derivative buffers, SRRED's residuals & overflows, the VDS work buffers. Its lifetime
+// belongs to the library, so it can be created at any block boundary.
+//
+// That is deliberately NOT true of the DATA buffers (decompressed_data/cache & the FPS compressed data).
+// The caller sizes those up front - exactly, from a slice on read or block count x CMP_max_compressed_bytes
+// on write - and the library WALKS them by advancing decompressed_ptr / block_header. Growing one mid-walk
+// discards already-decoded blocks and resets the walk position, so they belong to CMP_realloc_CPS_m13()
+// alone and are never touched here.
+//
+// Called EVERY block by CMP_encode_m13() & CMP_decode_m13(), unguarded. On decode that is the only point at
+// which the right question can even be asked: the algorithm is not known until the block header has been
+// read. It early-outs whenever everything is already present, which is the normal case & what makes a
+// per-block call affordable - and being on the every-block path means it cannot rot the way a rarely-taken
+// branch does.
+//
+// ⭐ It exists because the old "allocate creates, realloc grows" split left a hole: realloc could only grow
+// a buffer that already existed (`if (residuals_buffer) {...}`), so a codec whose buffer had never been
+// created had no way to obtain one. Every SRRED block in a MED file dereferenced NULL on read for exactly
+// that reason. Buffers are only ever ADDED here, never freed: a stream may legitimately mix a codec with the
+// algorithms it redirects to (VDS -> PRED2/RED2, SRRED -> RED2, anything -> MBE), and freeing on each switch
+// would thrash.
+//
+// ⚠️ A NEW CODEC DECLARES ITS SCRATCH HERE. That is the whole point of the function.
+// ---------------------------------------------------------------------------------------------------
+static tern	CMP_fit_CPS_scratch_m13(CPS_m13 *cps, ui4 mode, ui4 block_samples)
+{
+	tern	compression, pred_family, red_family;
+	si8	pad_samples;
+
+	compression = (mode == CMP_COMPRESSION_MODE_m13) ? TRUE_m13 : FALSE_m13;
+	red_family = (cps->direcs.flags & (CPS_DF_RED1_ALGORITHM_m13 | CPS_DF_RED2_ALGORITHM_m13 | CPS_DF_SSE_ALGORITHM_m13)) ? TRUE_m13 : FALSE_m13;  // SSE uses flat (RED-style) count buffers
+	pred_family = (cps->direcs.flags & (CPS_DF_PRED1_ALGORITHM_m13 | CPS_DF_PRED2_ALGORITHM_m13 | CPS_DF_VDS_ALGORITHM_m13 | CPS_DF_SRRED_ALGORITHM_m13)) ? TRUE_m13 : FALSE_m13;  // VDS & SRRED use PRED-shaped buffers
+
+	// count family. Only COMPRESSION builds counts - a decoder reads its model out of the block - but both
+	// modes need cumulative_count & minimum_range for the range coder.
+	if (pred_family == TRUE_m13) {
+		if (compression == TRUE_m13 && cps->params.PRED_base_count == NULL) {
+			if ((cps->params.PRED_base_count = cps->params.count = calloc_2D_m13((size_t) CMP_PRED_CATS_m13, CMP_RED_MAX_STATS_BINS_m13, sizeof(ui4))) == NULL)
+				return(FALSE_m13);
+			if ((cps->params.PRED_base_sorted_count = cps->params.sorted_count = calloc_2D_m13((size_t) CMP_PRED_CATS_m13, CMP_RED_MAX_STATS_BINS_m13, sizeof(CMP_STATISTICS_BIN_m13))) == NULL)
+				return(FALSE_m13);
+			if ((cps->params.PRED_base_symbol_map = cps->params.symbol_map = calloc_2D_m13((size_t) CMP_PRED_CATS_m13, CMP_RED_MAX_STATS_BINS_m13, sizeof(ui1))) == NULL)
+				return(FALSE_m13);
+		}
+		if (cps->params.cumulative_count == NULL)
+			if ((cps->params.PRED_base_cumulative_count = cps->params.cumulative_count = calloc_2D_m13((size_t) CMP_PRED_CATS_m13, CMP_RED_MAX_STATS_BINS_m13 + 1, sizeof(ui8))) == NULL)
+				return(FALSE_m13);
+		if (cps->params.minimum_range == NULL)
+			if ((cps->params.PRED_base_minimum_range = cps->params.minimum_range = calloc_2D_m13((size_t) CMP_PRED_CATS_m13, CMP_RED_MAX_STATS_BINS_m13, sizeof(ui8))) == NULL)
+				return(FALSE_m13);
+	} else if (red_family == TRUE_m13) {
+		if (compression == TRUE_m13 && cps->params.count == NULL) {
+			if ((cps->params.count = calloc_m13(CMP_RED_MAX_STATS_BINS_m13, sizeof(ui4))) == NULL)
+				return(FALSE_m13);
+			if ((cps->params.sorted_count = calloc_m13(CMP_RED_MAX_STATS_BINS_m13, sizeof(CMP_STATISTICS_BIN_m13))) == NULL)
+				return(FALSE_m13);
+			if ((cps->params.symbol_map = calloc_m13(CMP_RED_MAX_STATS_BINS_m13, sizeof(ui1))) == NULL)
+				return(FALSE_m13);
+		}
+		if (cps->params.cumulative_count == NULL)
+			if ((cps->params.cumulative_count = calloc_m13(CMP_RED_MAX_STATS_BINS_m13 + 1, sizeof(ui8))) == NULL)
+				return(FALSE_m13);
+		if (cps->params.minimum_range == NULL)
+			if ((cps->params.minimum_range = calloc_m13(CMP_RED_MAX_STATS_BINS_m13, sizeof(ui8))) == NULL)
+				return(FALSE_m13);
+	}
+	// MBE builds no model of its own, so as a FALL-THROUGH target it rides on whatever the redirecting
+	// algorithm allocated. But when MBE is the DIRECTED algorithm it still goes through
+	// CMP_differentiate_m13(), whose FIND branch lists CPS_DF_MBE_ALGORITHM_m13 & ranks candidate levels with
+	// CMP_RED_estimate_bytes_m13() off CMP_get_counts_m13() - which needs the RED-family count buffers &
+	// calls CMP_swap_RED_PRED_m13(). Nothing allocated them, so "set the MBE directive & call
+	// CMP_encode_m13()" died in the swap with "neither RED nor PRED buffers are allocated". Latent until
+	// CPS_DF_FIND_DERIVATIVE_LEVEL_m13 became the default (2026-08-02); found by
+	// dev/claude_tests/codec_file_test.c. RED-shaped, because that is what the ranking estimator reads.
+	// (Reverted 2026-08-05 while the CPS_PARAMS_m13 stack-garbage bug made every ASan run ambiguous;
+	// restored 2026-08-06 once CMP_init_params_m13() was fixed to zero the struct.)
+	if (compression == TRUE_m13 && (cps->direcs.flags & CPS_DF_MBE_ALGORITHM_m13)) {
+		if (cps->params.count == NULL) {
+			if ((cps->params.count = calloc_m13(CMP_RED_MAX_STATS_BINS_m13, sizeof(ui4))) == NULL)
+				return(FALSE_m13);
+			if ((cps->params.sorted_count = calloc_m13(CMP_RED_MAX_STATS_BINS_m13, sizeof(CMP_STATISTICS_BIN_m13))) == NULL)
+				return(FALSE_m13);
+			if ((cps->params.symbol_map = calloc_m13(CMP_RED_MAX_STATS_BINS_m13, sizeof(ui1))) == NULL)
+				return(FALSE_m13);
+		}
+	}
+
+	// derivative buffer: every compressing algorithm needs it, MBE included
+	if (compression == TRUE_m13 && cps->params.derivative_buffer == NULL)
+		if ((cps->params.derivative_buffer = (si4 *) malloc_m13((size_t) (block_samples << 2))) == NULL)
+			return(FALSE_m13);
+
+	// next_derivative_buffer: the derivative-level search & SRRED both walk two levels at once
+	if (compression == TRUE_m13 && ((cps->direcs.flags & CPS_DF_FIND_DERIVATIVE_LEVEL_m13) || (cps->direcs.flags & CPS_DF_SRRED_ALGORITHM_m13)))
+		if (cps->params.next_derivative_buffer == NULL)
+			if ((cps->params.next_derivative_buffer = (si4 *) malloc_m13((size_t) (block_samples << 2))) == NULL)
+				return(FALSE_m13);
+
+	// SRRED: residuals_buffer is read by DECODE as well as written by encode, which is precisely why gating
+	// it on the directive at construction time failed - see the header comment.
+	if (cps->direcs.flags & CPS_DF_SRRED_ALGORITHM_m13) {
+		if (cps->params.residuals_buffer == NULL)
+			if ((cps->params.residuals_buffer = (si4 *) malloc_m13((size_t) (block_samples << 2))) == NULL)
+				return(FALSE_m13);
+		if (compression == TRUE_m13 && cps->params.overflows_buffer == NULL)  // separated overflows for the count-domain scale search
+			if ((cps->params.overflows_buffer = (si4 *) malloc_m13((size_t) (block_samples << 2))) == NULL)
+				return(FALSE_m13);
+	}
+
+	// VDS work buffers
+	if (cps->direcs.flags & CPS_DF_VDS_ALGORITHM_m13) {
+		if (cps->params.VDS_input_buffers == NULL || cps->params.VDS_output_buffers == NULL) {
+			pad_samples = (compression == TRUE_m13) ? (CMP_VDS_LOWPASS_ORDER_m13 * 6) : CMP_MAK_PAD_SAMPLES_m13;
+			if (cps->params.VDS_input_buffers == NULL)
+				if ((cps->params.VDS_input_buffers = CMP_allocate_buffers_m13(NULL, CMP_VDS_INPUT_BUFFERS_m13, (si8) block_samples + pad_samples, sizeof(sf8), FALSE_m13, FALSE_m13)) == NULL)
+					return(FALSE_m13);
+			if (cps->params.VDS_output_buffers == NULL)
+				if ((cps->params.VDS_output_buffers = CMP_allocate_buffers_m13(NULL, CMP_VDS_OUTPUT_BUFFERS_m13, (si8) block_samples, sizeof(sf8), FALSE_m13, FALSE_m13)) == NULL)
+					return(FALSE_m13);
+		}
+	}
+
+	return(TRUE_m13);
+}
+
+
 CPS_m13	*CMP_allocate_CPS_m13(FPS_m13 *fps, ui4 mode, si8 data_samples, si8 compressed_data_bytes, si8 keysample_bytes, ui4 block_samples, CPS_DIRECS_m13 *directives, CPS_PARAMS_m13 *parameters)
 {
 	tern		need_compressed_data = FALSE_m13;
@@ -22238,19 +22540,18 @@ CPS_m13	*CMP_allocate_CPS_m13(FPS_m13 *fps, ui4 mode, si8 data_samples, si8 comp
 	tern		need_original_data = FALSE_m13;
 	tern		need_keysample_buffer = FALSE_m13;
 	tern		need_detrended_buffer = FALSE_m13;
-	tern		need_derivative_buffer = FALSE_m13;
-	tern		need_next_derivative_buffer = FALSE_m13;
-	tern		need_scaled_amplitude_buffer = FALSE_m13;
-	tern		need_scaled_frequency_buffer = FALSE_m13;
-	tern		need_VDS_buffers = FALSE_m13;
-	si8		pad_samples;
 	CPS_m13		*cps;
 	
 #ifdef FT_DEBUG_m13
 	G_push_function_m13();
 #endif
 
-	// pass CMP_SELF_MANAGED_MEMORY_m13 for data_samples to prevent automatic re-allocation
+	// to keep a DATA buffer the library must never free or move (a MATLAB mxArray, an mmap'd region, pinned
+	// memory), set CPS_DF_CALLER_OWNS_DECOMPRESSED_m13 / CPS_DF_CALLER_OWNS_COMPRESSED_m13 in the directives &
+	// supply BOTH the pointer & its true size in the passed CPS_PARAMS_m13; this function validates them &
+	// allocates nothing for that buffer. The size must be true: the library keeps bounds-checking & fails
+	// loudly rather than growing. (Replaces CMP_SELF_MANAGED_MEMORY_m13, deleted 2026-08-07 - it lived in the
+	// size field, so it destroyed the very number the check needed, & never reached that field anyway.)
 	//
 	// pass ZERO for compressed_data_bytes (compression mode) to let the library size the compressed buffer.
 	// This is the preferred form: sizing it correctly needs the variable region, the algorithm, the derivative
@@ -22302,47 +22603,20 @@ CPS_m13	*CMP_allocate_CPS_m13(FPS_m13 *fps, ui4 mode, si8 data_samples, si8 comp
 	else
 		cps->direcs.flags &= ~CPS_DF_COMPRESSION_MODE_m13;
 	
-	// allocate RED/PRED buffers
-	if (cps->direcs.flags & (CPS_DF_RED1_ALGORITHM_m13 | CPS_DF_RED2_ALGORITHM_m13 | CPS_DF_SSE_ALGORITHM_m13)) {  // SSE uses flat (RED-style) count/sorted_count/symbol_map buffers
-		if (mode == CMP_COMPRESSION_MODE_m13) {
-			cps->params.count = calloc_m13(CMP_RED_MAX_STATS_BINS_m13, sizeof(ui4));
-			cps->params.sorted_count = calloc_m13(CMP_RED_MAX_STATS_BINS_m13, sizeof(CMP_STATISTICS_BIN_m13));
-			cps->params.symbol_map = calloc_m13(CMP_RED_MAX_STATS_BINS_m13, sizeof(ui1));
-			need_derivative_buffer = TRUE_m13;
-		} else {
-			cps->params.count = NULL;
-			cps->params.sorted_count = NULL;
-			cps->params.symbol_map = NULL;
-		}
-		cps->params.cumulative_count = calloc_m13(CMP_RED_MAX_STATS_BINS_m13 + 1, sizeof(ui8));
-		cps->params.minimum_range = calloc_m13(CMP_RED_MAX_STATS_BINS_m13, sizeof(ui8));
-	} else if (cps->direcs.flags & (CPS_DF_PRED1_ALGORITHM_m13 | CPS_DF_PRED2_ALGORITHM_m13 | CPS_DF_VDS_ALGORITHM_m13 | CPS_DF_SRRED_ALGORITHM_m13)) {  // VDS uses RED & PRED, but buffers allocated for PRED
-		if (mode == CMP_COMPRESSION_MODE_m13) {
-			cps->params.PRED_base_count = cps->params.count = calloc_2D_m13((size_t) CMP_PRED_CATS_m13, CMP_RED_MAX_STATS_BINS_m13, sizeof(ui4));
-			cps->params.PRED_base_sorted_count = cps->params.sorted_count = calloc_2D_m13((size_t) CMP_PRED_CATS_m13, CMP_RED_MAX_STATS_BINS_m13, sizeof(CMP_STATISTICS_BIN_m13));
-			cps->params.PRED_base_symbol_map = cps->params.symbol_map = calloc_2D_m13((size_t) CMP_PRED_CATS_m13, CMP_RED_MAX_STATS_BINS_m13, sizeof(ui1));
-			need_derivative_buffer = TRUE_m13;
-		} else {
-			cps->params.PRED_base_count = cps->params.count = NULL;
-			cps->params.PRED_base_sorted_count = cps->params.sorted_count = NULL;
-			cps->params.PRED_base_symbol_map = cps->params.symbol_map = NULL;
-		}
-		cps->params.PRED_base_cumulative_count = cps->params.cumulative_count = calloc_2D_m13((size_t) CMP_PRED_CATS_m13, CMP_RED_MAX_STATS_BINS_m13 + 1, sizeof(ui8));
-		cps->params.PRED_base_minimum_range = cps->params.minimum_range = calloc_2D_m13((size_t) CMP_PRED_CATS_m13, CMP_RED_MAX_STATS_BINS_m13, sizeof(ui8));
-	} else {
-		if (mode == CMP_COMPRESSION_MODE_m13)  // MBE needs derivative buffer for compression
-			need_derivative_buffer = TRUE_m13;
-		cps->params.PRED_base_count = cps->params.count = NULL;
-		cps->params.PRED_base_sorted_count = cps->params.sorted_count = NULL;
-		cps->params.PRED_base_symbol_map = cps->params.symbol_map = NULL;
-		cps->params.PRED_base_cumulative_count = cps->params.cumulative_count = NULL;
-		cps->params.PRED_base_minimum_range = cps->params.minimum_range = NULL;
-	}
+	// Per-algorithm SCRATCH is CMP_fit_CPS_scratch_m13()'s business - one definition of what each codec
+	// needs, shared with the per-block call from CMP_encode_m13()/CMP_decode_m13(). Start from a known
+	// state so it can tell "absent" from "present".
+	cps->params.PRED_base_count = cps->params.count = NULL;
+	cps->params.PRED_base_sorted_count = cps->params.sorted_count = NULL;
+	cps->params.PRED_base_symbol_map = cps->params.symbol_map = NULL;
+	cps->params.PRED_base_cumulative_count = cps->params.cumulative_count = NULL;
+	cps->params.PRED_base_minimum_range = cps->params.minimum_range = NULL;
+	cps->params.derivative_buffer = NULL;
+	cps->params.next_derivative_buffer = NULL;
+	cps->params.residuals_buffer = NULL;
+	cps->params.overflows_buffer = NULL;
+	cps->params.VDS_input_buffers = cps->params.VDS_output_buffers = NULL;
 
-	// VDS
-	if (cps->direcs.flags & CPS_DF_VDS_ALGORITHM_m13)
-		need_VDS_buffers = TRUE_m13;
-	
 	// decompression
 	if (mode == CMP_DECOMPRESSION_MODE_m13) {
 		need_compressed_data = TRUE_m13;
@@ -22355,16 +22629,34 @@ CPS_m13	*CMP_allocate_CPS_m13(FPS_m13 *fps, ui4 mode, si8 data_samples, si8 comp
 		
 		if (cps->direcs.flags & CPS_DF_DETREND_DATA_m13)
 			need_detrended_buffer = TRUE_m13;
-		if ((cps->direcs.flags & CPS_DF_FIND_DERIVATIVE_LEVEL_m13) || (cps->direcs.flags & CPS_DF_SRRED_ALGORITHM_m13))
-			need_next_derivative_buffer = TRUE_m13;
-		if (cps->direcs.flags & (CPS_DF_SET_AMPLITUDE_SCALE_m13 | CPS_DF_FIND_AMPLITUDE_SCALE_m13))
-			need_scaled_amplitude_buffer = TRUE_m13;
-		if (cps->direcs.flags & (CPS_DF_SET_FREQUENCY_SCALE_m13 | CPS_DF_FIND_FREQUENCY_SCALE_m13))
-			need_scaled_frequency_buffer = TRUE_m13;
-		if (cps->direcs.flags & (CPS_DF_FIND_AMPLITUDE_SCALE_m13 | CPS_DF_FIND_FREQUENCY_SCALE_m13))
-			need_decompressed_data = TRUE_m13;
 	}
 	
+	// CALLER-OWNED DATA BUFFERS (CPS_DF_CALLER_OWNS_*): validated HERE, before anything is allocated, so a
+	// rejection cannot leak the buffers allocated below (this function fails by returning NULL, with no
+	// cleanup label). The caller supplied the pointer & the TRUE size in the CPS_PARAMS_m13 copied above; a
+	// set bit with either missing is an error, not a quiet fallback to allocating - the caller believes it
+	// owns this memory, & silently replacing it is the surprise the directive exists to prevent.
+	if (cps->direcs.flags & CPS_DF_CALLER_OWNS_DECOMPRESSED_m13) {
+		if (cps->params.cache == NULL) {
+			G_set_error_m13(E_CMP_m13, "CPS_DF_CALLER_OWNS_DECOMPRESSED_m13 is set but params.cache is NULL");
+			return_m13(NULL);
+		}
+		if (cps->params.allocated_decompressed_samples <= 0) {
+			G_set_error_m13(E_CMP_m13, "CPS_DF_CALLER_OWNS_DECOMPRESSED_m13 is set but params.allocated_decompressed_samples is not positive");
+			return_m13(NULL);
+		}
+	}
+	if (cps->direcs.flags & CPS_DF_CALLER_OWNS_COMPRESSED_m13) {
+		if (fps == NULL || fps->params.raw_data == NULL) {
+			G_set_error_m13(E_CMP_m13, "CPS_DF_CALLER_OWNS_COMPRESSED_m13 is set but there is no caller-supplied file buffer");
+			return_m13(NULL);
+		}
+		if (cps->params.allocated_compressed_bytes <= 0) {
+			G_set_error_m13(E_CMP_m13, "CPS_DF_CALLER_OWNS_COMPRESSED_m13 is set but params.allocated_compressed_bytes is not positive");
+			return_m13(NULL);
+		}
+	}
+
 	// original_data - caller specified array size
 	if (need_original_data == TRUE_m13 && data_samples > 0)
 		cps->input_buffer = cps->original_ptr = cps->original_data = (si4 *) calloc_m13((size_t) data_samples, sizeof(si4));
@@ -22379,7 +22671,7 @@ CPS_m13	*CMP_allocate_CPS_m13(FPS_m13 *fps, ui4 mode, si8 data_samples, si8 comp
 	if (need_compressed_data == TRUE_m13 && mode == CMP_COMPRESSION_MODE_m13 && block_samples) {
 		si8	n_blocks, lib_bytes;
 
-		if (data_samples == CMP_SELF_MANAGED_MEMORY_m13 || data_samples <= 0)
+		if (data_samples <= 0)  // (CMP_SELF_MANAGED_MEMORY_m13 was -1, folded in here; deleted 2026-08-07)
 			n_blocks = 1;
 		else
 			n_blocks = (data_samples + (si8) block_samples - 1) / (si8) block_samples;
@@ -22424,8 +22716,17 @@ CPS_m13	*CMP_allocate_CPS_m13(FPS_m13 *fps, ui4 mode, si8 data_samples, si8 comp
 		cps->params.allocated_keysample_bytes = 0;
 	}
 
-	// decompressed_data - caller specified array size
-	if (need_decompressed_data == TRUE_m13) {
+	// decompressed_data - caller specified array size, or CALLER-OWNED (CPS_DF_CALLER_OWNS_DECOMPRESSED_m13):
+	// the caller supplied both the buffer & its true size in the CPS_PARAMS_m13 copied above, so validate them
+	// & allocate nothing. A set bit with no pointer or no size is an ERROR, not a quiet fallback to allocating:
+	// the caller believes it owns this memory, & silently replacing it is exactly the surprise the directive
+	// exists to prevent.
+	if (cps->direcs.flags & CPS_DF_CALLER_OWNS_DECOMPRESSED_m13) {  // validated above; allocate nothing
+		if (cps->decompressed_data == NULL)  // default the caller's view to the base it gave us
+			cps->decompressed_data = cps->params.cache;
+		if (cps->decompressed_ptr == NULL)
+			cps->decompressed_ptr = cps->decompressed_data;
+	} else if (need_decompressed_data == TRUE_m13) {
 		if (mode == CMP_DECOMPRESSION_MODE_m13)
 			cps->params.cache = cps->decompressed_data = cps->decompressed_ptr = (si4 *) calloc_m13((size_t) data_samples, sizeof(si4));
 		else // cps->direcs.compression_mode == CMP_COMPRESSION_MODE_m13  (decompressed_ptr used to calculate mean residual ratio for each block)
@@ -22442,56 +22743,16 @@ CPS_m13	*CMP_allocate_CPS_m13(FPS_m13 *fps, ui4 mode, si8 data_samples, si8 comp
 	else
 		cps->params.detrended_buffer = NULL;
 	
-	// derivative_buffer - maximum bytes required for caller specified block size
-	if (need_derivative_buffer == TRUE_m13)
-		cps->params.derivative_buffer = (si4 *) malloc_m13((size_t) (block_samples << 2));
-	else
-		cps->params.derivative_buffer = NULL;
 
-	// next_derivative_buffer: here maximum bytes required for caller specified block size
-	if (need_next_derivative_buffer == TRUE_m13)
-		cps->params.next_derivative_buffer = (si4 *) malloc_m13((size_t) (block_samples << 2));
-	else
-		cps->params.next_derivative_buffer = NULL;
-
-	// SRRED residuals_buffer (both modes: decode reads it) & overflows_buffer (compression only: separated overflows
-	// for the count-domain scale search). Scaled-stream stats reuse the normal count/sorted_count/symbol_map buffers.
-	if (cps->direcs.flags & CPS_DF_SRRED_ALGORITHM_m13) {
-		cps->params.residuals_buffer = (si4 *) malloc_m13((size_t) (block_samples << 2));
-		if (mode == CMP_COMPRESSION_MODE_m13)
-			cps->params.overflows_buffer = (si4 *) malloc_m13((size_t) (block_samples << 2));
-		else
-			cps->params.overflows_buffer = NULL;
-	} else {
-		cps->params.residuals_buffer = NULL;
-		cps->params.overflows_buffer = NULL;
-	}
 	cps->params.SRRED_scale_center = (sf8) -1.0;  // no anchor yet => first block does a full-range anchor scan
 	cps->params.SRRED_scale_refresh_ctr = 0;
 	cps->params.SRRED_sub_encode = FALSE_m13;
 
-	// scaled_amplitude_buffer - maximum bytes required for caller specified block size
-	if (need_scaled_amplitude_buffer == TRUE_m13)
-		cps->params.scaled_amplitude_buffer = (si4 *) calloc_m13((size_t) block_samples, sizeof(si4));
-	else
-		cps->params.scaled_amplitude_buffer = NULL;
-	
-	// scaled_frequency_buffer - maximum bytes required for caller specified block size
-	if (need_scaled_frequency_buffer == TRUE_m13)
-		cps->params.scaled_frequency_buffer = (si4 *) calloc_m13((size_t) block_samples, sizeof(si4));
-	else
-		cps->params.scaled_frequency_buffer = NULL;
-	
-	// VDS buffers - maximum bytes required for caller specified block size
-	if (need_VDS_buffers == TRUE_m13) {
-		if (mode == CMP_COMPRESSION_MODE_m13)
-			pad_samples = CMP_VDS_LOWPASS_ORDER_m13 * 6;
-		else
-			pad_samples = CMP_MAK_PAD_SAMPLES_m13;
-		cps->params.VDS_input_buffers = CMP_allocate_buffers_m13(NULL, CMP_VDS_INPUT_BUFFERS_m13, (si8) block_samples + pad_samples, sizeof(sf8), FALSE_m13, FALSE_m13);
-		cps->params.VDS_output_buffers = CMP_allocate_buffers_m13(NULL, CMP_VDS_OUTPUT_BUFFERS_m13, (si8) block_samples, sizeof(sf8), FALSE_m13, FALSE_m13);
-	} else {
-		cps->params.VDS_input_buffers = cps->params.VDS_output_buffers = NULL;
+	// per-algorithm scratch (count family, derivative buffers, SRRED, VDS) - one owner, shared with the
+	// per-block fit. Anything a future codec needs is declared there, not here.
+	if (CMP_fit_CPS_scratch_m13(cps, mode, block_samples) == FALSE_m13) {
+		G_set_error_m13(E_ALLOC_m13, "could not allocate algorithm scratch buffers");
+		return_m13(NULL);
 	}
 
 	return_m13(cps);
@@ -22838,6 +23099,92 @@ sf8	CMP_calculate_mean_residual_ratio_m13(si4 *original_data, si4 *lossy_data, u
 }
 
 
+tern	CMP_calculate_noise_scores_m13(CPS_m13 *cps, si4 *data, si8 len)
+{
+	ui4			packed, which;
+	sf8			ns[CMP_NS_BYTES_m13];
+	si8			i;
+
+#ifdef FT_DEBUG_m13
+	G_push_function_m13();
+#endif
+
+	// Fills params.noise_scores & writes them, packed into one ui4, to the block's noise-score parameter.
+	//
+	// ⚠️ CALL SITE MATTERS. This must run AFTER CMP_set_variable_region_m13() (which builds the parameter map
+	// this writes through) but BEFORE the detrend (which reassigns cps->input_buffer to the detrended buffer).
+	// The scores describe the RECORDING, so they are taken from the raw block; scoring a transformed buffer
+	// would make the same data score differently depending on the caller's directives.
+	//
+	// Byte 0 (line noise) is NOT computed here. It costs ~100x the other three standalone & is only a few
+	// percent when FILT_line_noise_m13() is already running, so an application that filters deposits it in
+	// params.noise_scores[CMP_NS_LINE_NOISE_IDX_m13] before this call. Whatever is there is used as-is; every
+	// byte is reset to NO_ENTRY afterwards so a value cannot silently carry into the next block.
+
+	if (cps == NULL || data == NULL || len < 3) {
+		G_set_error_m13(E_CMP_m13, "noise scores need a CPS & at least 3 samples");
+		return_m13(FALSE_m13);
+	}
+	if (CMP_BLOCK_PARAM_PRESENT_m13(cps, CMP_PF_NOISE_SCORES_IDX_m13) == 0) {
+		G_set_error_m13(E_CMP_m13, "noise score parameter is not present in this block");
+		return_m13(FALSE_m13);
+	}
+
+	// LINE NOISE (byte 0). A value the caller has already DEPOSITED wins - an application running the true
+	// filter (FILT_line_noise_m13()) gets the REAL score for a few percent of that run & deposits it; with
+	// CPS_DF_LINE_NOISE_FILTERED_m13 also set (see CMP_encode_m13(), which stamps the block flag) the byte
+	// then records what was REMOVED from this block's samples. When nothing was deposited the library
+	// computes the FAST ESTIMATE (FILT_line_noise_estimate_m13(): ~45x cheaper, ordering-faithful,
+	// conservative ~25% in the mid range) - the full filter machinery is never run from here; its cost
+	// belongs to applications that want the filtering itself.
+	if ((cps->direcs.flags & CPS_DF_LINE_NOISE_SCORE_m13) &&
+	    cps->params.noise_scores[CMP_NS_LINE_NOISE_IDX_m13] == CMP_NS_NO_ENTRY_m13) {
+		if (cps->params.sampling_frequency > (sf8) 0.0 && cps->params.line_frequency > (sf8) 0.0) {
+			sf8	ln_score;
+
+			// estimate buffers are kept across blocks (reallocated as needed)
+			cps->params.noise_score_buffers = CMP_allocate_buffers_m13(cps->params.noise_score_buffers, 1, len, sizeof(sf8), FALSE_m13, FALSE_m13);
+			if (cps->params.noise_score_buffers != NULL) {
+				ln_score = FILT_line_noise_estimate_m13(data, len, cps->params.sampling_frequency,
+									cps->params.line_frequency, cps->params.noise_score_buffers);
+				// a block too short to estimate returns -1: leave the byte absent rather than guess
+				if (ln_score >= (sf8) 0.0 && isnan(ln_score) == 0)
+					cps->params.noise_scores[CMP_NS_LINE_NOISE_IDX_m13] = CMP_NS_SCORE_BYTE_m13(ln_score);
+			}
+		}
+	}
+
+	// ONE call for whichever of the three were asked for - they share their passes over the data, so a subset
+	// is not necessarily cheaper: entropy & normality use BOTH passes, so requesting one costs the same as
+	// requesting both (measured 30 us / 29 us / 30 us at 10,000 samples). Only LLP alone is genuinely cheaper,
+	// needing just the first pass. See CMP_noise_scores_m13().
+	which = 0;
+	if (cps->direcs.flags & CPS_DF_ENTROPY_DEFICIT_SCORE_m13)
+		which |= CMP_NS_ENTROPY_DEFICIT_SEL_m13;
+	if (cps->direcs.flags & CPS_DF_NON_NORMALITY_SCORE_m13)
+		which |= CMP_NS_NON_NORMALITY_SEL_m13;
+	if (cps->direcs.flags & CPS_DF_LLP_SCORE_m13)
+		which |= CMP_NS_LLP_SEL_m13;
+	if (which && CMP_noise_scores_m13(data, len, ns, which) == TRUE_m13) {
+		if (which & CMP_NS_ENTROPY_DEFICIT_SEL_m13)
+			cps->params.noise_scores[CMP_NS_ENTROPY_DEFICIT_IDX_m13] = CMP_NS_SCORE_BYTE_m13(ns[CMP_NS_ENTROPY_DEFICIT_IDX_m13]);
+		if (which & CMP_NS_NON_NORMALITY_SEL_m13)
+			cps->params.noise_scores[CMP_NS_NON_NORMALITY_IDX_m13] = CMP_NS_SCORE_BYTE_m13(ns[CMP_NS_NON_NORMALITY_IDX_m13]);
+		if (which & CMP_NS_LLP_SEL_m13)
+			cps->params.noise_scores[CMP_NS_LLP_IDX_m13] = CMP_NS_SCORE_BYTE_m13(ns[CMP_NS_LLP_IDX_m13]);
+	}
+
+	// pack little-endian by byte index, so byte 0 is the low byte of the stored ui4
+	for (packed = 0, i = CMP_NS_BYTES_m13; i--;)
+		packed = (packed << 8) | (ui4) cps->params.noise_scores[i];
+	CMP_BLOCK_PARAM_m13(cps, CMP_PF_NOISE_SCORES_IDX_m13, ui4) = packed;
+
+	memset((void *) cps->params.noise_scores, CMP_NS_NO_ENTRY_m13, (size_t) CMP_NS_BYTES_m13);
+
+	return_m13(TRUE_m13);
+}
+
+
 tern	CMP_calculate_statistics_m13(REC_Stat_v10_m13 *stats, si4 *input_buffer, si8 len, CMP_NODE_m13 *nodes)
 {
 	CMP_NODE_m13	*np, head, tail;
@@ -22927,159 +23274,6 @@ tern	CMP_calculate_statistics_m13(REC_Stat_v10_m13 *stats, si4 *input_buffer, si
 		free_m13(nodes);
 	
 	return_m13(TRUE_m13);
-}
-
-
-tern	CMP_check_CPS_allocation_m13(FPS_m13 *fps)
-{
-	tern		r_val = TRUE_m13;
-	si1		need_compressed_data = FALSE_m13;
-	si1		need_decompressed_data = FALSE_m13;
-	si1		need_original_data = FALSE_m13;
-	si1		need_detrended_buffer = FALSE_m13;
-	si1		need_derivative_buffer = FALSE_m13;
-	si1		need_scaled_amplitude_buffer = FALSE_m13;
-	si1		need_scaled_frequency_buffer = FALSE_m13;
-	si1		need_keysample_buffer = FALSE_m13;
-	si1		need_VDS_buffers = FALSE_m13;
-	CPS_m13		*cps;
-	
-#ifdef FT_DEBUG_m13
-	G_push_function_m13();
-#endif
-
-	if (fps->uh->type_code != TS_DATA_TYPE_CODE_m13) {
-		G_set_error_m13(E_GEN_m13, "fps must be time series data");
-		return_m13(FALSE_m13);
-	}
-	
-	cps = fps->params.cps;
-	if (cps == NULL) {
-		G_set_error_m13(E_GEN_m13, "cps is not allocated");
-		return_m13(FALSE_m13);
-	}
-	
-	if (cps->direcs.flags & CPS_DF_VDS_ALGORITHM_m13)
-		need_VDS_buffers = TRUE_m13;
-
-	need_compressed_data = TRUE_m13;
-	need_keysample_buffer = TRUE_m13;
-	
-	// compression
-	if (cps->direcs.flags & CPS_DF_COMPRESSION_MODE_m13) {
-		need_original_data = TRUE_m13;
-		if (cps->direcs.flags & CPS_DF_DETREND_DATA_m13)
-			need_detrended_buffer = TRUE_m13;
-		if (cps->direcs.flags & (CPS_DF_SET_DERIVATIVE_LEVEL_m13 | CPS_DF_FIND_DERIVATIVE_LEVEL_m13))
-			need_derivative_buffer = TRUE_m13;
-		if (cps->direcs.flags & (CPS_DF_SET_AMPLITUDE_SCALE_m13 | CPS_DF_FIND_AMPLITUDE_SCALE_m13))
-			need_scaled_amplitude_buffer = TRUE_m13;
-		if (cps->direcs.flags & (CPS_DF_SET_FREQUENCY_SCALE_m13 | CPS_DF_FIND_FREQUENCY_SCALE_m13))
-			need_scaled_frequency_buffer = TRUE_m13;
-		if (cps->direcs.flags & (CPS_DF_FIND_AMPLITUDE_SCALE_m13 | CPS_DF_FIND_FREQUENCY_SCALE_m13))
-			need_decompressed_data = TRUE_m13;
-	} else { // decompression
-		need_decompressed_data = TRUE_m13;
-	}
-
-	
-	// check compressed_data
-	if (need_compressed_data == TRUE_m13 && fps->ts_data == NULL) {
-		G_warning_message_m13("%s(): \"compressed_data\" is not allocated in the FILE_PROCESSING_STRUCT\n", __FUNCTION__);
-		r_val = FALSE_m13;
-	}
-	
-	// check keysample_buffer
-	if (need_keysample_buffer == TRUE_m13 && cps->params.keysample_buffer == NULL) {
-		G_warning_message_m13("%s(): \"keysample_buffer\" is not allocated in the CMP_PROCESSING_STRUCT\n", __FUNCTION__);
-		r_val = FALSE_m13;
-	}
-	
-	// check original_data
-	if (need_original_data == TRUE_m13 && cps->original_data == NULL) {
-		G_warning_message_m13("%s(): \"original_data\" is not allocated in the CMP_PROCESSING_STRUCT\n", __FUNCTION__);
-		r_val = FALSE_m13;
-	}
-	if (need_original_data == FALSE_m13 && cps->original_data) {
-		G_warning_message_m13("%s(): \"original_data\" is needlessly allocated in the CMP_PROCESSING_STRUCT => freeing\n", __FUNCTION__);
-		free_m13(cps->original_data);
-		cps->original_ptr = cps->original_data = NULL;
-		r_val = FALSE_m13;
-	}
-	
-	// check decompressed_data
-	if (need_decompressed_data == TRUE_m13 && cps->decompressed_data == NULL) {
-		G_warning_message_m13("%s(): \"decompressed_data\" is not allocated in the CMP_PROCESSING_STRUCT\n", __FUNCTION__);
-		r_val = FALSE_m13;
-	}
-	if (need_decompressed_data == FALSE_m13 && cps->decompressed_data) {
-		G_warning_message_m13("%s(): \"decompressed_data\" is needlessly allocated in the CMP_PROCESSING_STRUCT => freeing\n", __FUNCTION__);
-		free_m13(cps->decompressed_data);
-		cps->decompressed_ptr = cps->decompressed_data = NULL;
-		r_val = FALSE_m13;
-	}
-	
-	// check detrended_buffer
-	if (need_detrended_buffer == TRUE_m13 && cps->params.detrended_buffer == NULL) {
-		G_warning_message_m13("%s(): \"detrended_buffer\" is not allocated in the CMP_PROCESSING_STRUCT\n", __FUNCTION__);
-		r_val = FALSE_m13;
-	}
-	if (need_detrended_buffer == FALSE_m13 && cps->params.detrended_buffer) {
-		G_warning_message_m13("%s(): \"detrended_buffer\" is needlessly allocated in the CMP_PROCESSING_STRUCT => freeing\n", __FUNCTION__);
-		free_m13(cps->params.detrended_buffer);
-		cps->params.detrended_buffer = NULL;
-		r_val = FALSE_m13;
-	}
-	
-	// check derivative_buffer
-	if (need_derivative_buffer == TRUE_m13 && cps->params.derivative_buffer == NULL) {
-		G_warning_message_m13("%s(): \"derivative_buffer\" is not allocated in the CMP_PROCESSING_STRUCT\n", __FUNCTION__);
-		r_val = FALSE_m13;
-	}
-	if (need_derivative_buffer == FALSE_m13 && cps->params.derivative_buffer) {
-		G_warning_message_m13("%s(): \"derivative_buffer\" is needlessly allocated in the CMP_PROCESSING_STRUCT => freeing\n", __FUNCTION__);
-		free_m13(cps->params.derivative_buffer);
-		cps->params.derivative_buffer = NULL;
-		r_val = FALSE_m13;
-	}
-	
-	// check scaled_amplitude_buffer
-	if (need_scaled_amplitude_buffer == TRUE_m13 && cps->params.scaled_amplitude_buffer == NULL) {
-		G_warning_message_m13("%s(): \"scaled_amplitude_buffer\" is not allocated in the CMP_PROCESSING_STRUCT\n", __FUNCTION__);
-		r_val = FALSE_m13;
-	}
-	if (need_scaled_amplitude_buffer == FALSE_m13 && cps->params.scaled_amplitude_buffer) {
-		G_warning_message_m13("%s(): \"scaled_amplitude_buffer\" is needlessly allocated in the CMP_PROCESSING_STRUCT => freeing\n", __FUNCTION__);
-		free_m13(cps->params.scaled_amplitude_buffer);
-		cps->params.scaled_amplitude_buffer = NULL;
-		r_val = FALSE_m13;
-	}
-	
-	// check scaled_frequency_buffer
-	if (need_scaled_frequency_buffer == TRUE_m13 && cps->params.scaled_frequency_buffer == NULL) {
-		G_warning_message_m13("%s(): \"scaled_frequency_buffer\" is not allocated in the CMP_PROCESSING_STRUCT\n", __FUNCTION__);
-		r_val = FALSE_m13;
-	}
-	if (need_scaled_frequency_buffer == FALSE_m13 && cps->params.scaled_frequency_buffer) {
-		G_warning_message_m13("%s(): \"scaled_frequency_buffer\" is needlessly allocated in the CMP_PROCESSING_STRUCT => freeing\n", __FUNCTION__);
-		free_m13(cps->params.scaled_frequency_buffer);
-		cps->params.scaled_frequency_buffer = NULL;
-		r_val = FALSE_m13;
-	}
-	
-	// check VDS buffers
-	if (need_VDS_buffers == TRUE_m13 && (cps->params.VDS_input_buffers == NULL || cps->params.VDS_output_buffers == NULL)) {
-		G_warning_message_m13("%s(): \"VDS_buffers\" are not allocated in the CMP_PROCESSING_STRUCT\n", __FUNCTION__);
-		r_val = FALSE_m13;
-	}
-	if (need_VDS_buffers == FALSE_m13 && (cps->params.VDS_input_buffers || cps->params.VDS_output_buffers)) {
-		G_warning_message_m13("%s(): \"VDS_buffers\" are needlessly allocated in the CMP_PROCESSING_STRUCT => freeing\n", __FUNCTION__);
-		CMP_free_buffers_m13(&cps->params.VDS_input_buffers);
-		CMP_free_buffers_m13(&cps->params.VDS_output_buffers);
-		r_val = FALSE_m13;
-	}
-	
-	return_m13(r_val);
 }
 
 
@@ -23182,10 +23376,7 @@ si4 CMP_compare_si8_m13(const void *a, const void * b)
 
 tern	CMP_decode_m13(FPS_m13 *fps)
 {
-	ui4			offset;
-	si4			*si4_p;
-	sf4			*sf4_p;
-	sf8			intercept, gradient, amplitude_scale, frequency_scale;
+	sf8			intercept, gradient;
 	tern			(*decompression_f)(CPS_m13 *cps);
 	CMP_FIXED_BH_m13	*bh;
 	CPS_m13			*cps;
@@ -23215,6 +23406,19 @@ tern	CMP_decode_m13(FPS_m13 *fps)
 	
 	// get variable region
 	CMP_get_variable_region_m13(cps);
+
+	// NOISE SCORES land in params.noise_scores[] - the same field the encoder stages them in, holding the
+	// scores of whatever block is being processed in either direction. Absent (or absent parameter) reads as
+	// CMP_NS_NO_ENTRY_m13 in every byte, so a caller never sees a stale value from the previous block.
+	if (CMP_BLOCK_PARAM_PRESENT_m13(cps, CMP_PF_NOISE_SCORES_IDX_m13)) {
+		ui4	ns_packed = CMP_BLOCK_PARAM_m13(cps, CMP_PF_NOISE_SCORES_IDX_m13, ui4);
+		si8	ns_i;
+
+		for (ns_i = 0; ns_i < CMP_NS_BYTES_m13; ++ns_i)
+			cps->params.noise_scores[ns_i] = (ui1) ((ns_packed >> (ns_i * 8)) & 0xff);
+	} else {
+		memset((void *) cps->params.noise_scores, CMP_NS_NO_ENTRY_m13, (size_t) CMP_NS_BYTES_m13);
+	}
 	
 	// decompress
 	cps->direcs.flags &= ~CPS_DF_ALGORITHM_MASK_m13;  // clear directives algorithm flags
@@ -23251,36 +23455,24 @@ tern	CMP_decode_m13(FPS_m13 *fps)
 			G_set_error_m13(E_GEN_m13, "unrecognized compression algorithm (%u)", bh->block_flags & CMP_BF_ALGORITHMS_MASK_m13);
 			return_m13(FALSE_m13);
 	}
+	// Per-block scratch fit. The algorithm is only settled here - it comes from the block header - so this is
+	// the first point at which the right question can be asked. Unguarded & cheap: it early-outs when every
+	// buffer is already present, and living on the every-block path is what keeps it exercised rather than
+	// rotting like a rarely-taken branch. DATA buffers are not its business; those are the caller's contract,
+	// grown only by CMP_realloc_CPS_m13().
+	if (CMP_fit_CPS_scratch_m13(cps, CMP_DECOMPRESSION_MODE_m13, cps->block_header->number_of_samples) == FALSE_m13) {
+		G_set_error_m13(E_ALLOC_m13, "could not fit algorithm scratch buffers");
+		return_m13(FALSE_m13);
+	}
+
 	(*decompression_f)(cps);  // block-specific decompression algorithm
 
 	if (!(cps->direcs.flags & CPS_DF_VDS_ALGORITHM_m13)) {
-		// unscale frequency-scaled decompressed_data if scaled (in place)
-		// no blockwise frequency scaling in VDS encoded data
-		if (bh->parameter_flags & CMP_PF_FREQUENCY_SCALE_m13) {
-			sf4_p = (sf4 *) cps->block_parameters;
-			offset = cps->params.block_parameter_map[CMP_PF_FREQUENCY_SCALE_IDX_m13];
-			frequency_scale = (sf8) *(sf4_p + offset);
-			CMP_unscale_frequency_si4_m13(cps->decompressed_ptr, cps->decompressed_ptr, (si8) bh->number_of_samples, frequency_scale);
-		}
-		
-		// unscale amplitude-scaled decompressed_data if scaled (in place)
-		// VDS_decode_m13() does amplitude scaling itself
-		if (bh->parameter_flags & CMP_PF_AMPLITUDE_SCALE_m13) {
-			sf4_p = (sf4 *) cps->block_parameters;
-			offset = cps->params.block_parameter_map[CMP_PF_AMPLITUDE_SCALE_IDX_m13];
-			amplitude_scale = (sf8) *(sf4_p + offset);
-			CMP_unscale_amplitude_si4_m13(cps->decompressed_ptr, cps->decompressed_ptr, (si8) bh->number_of_samples, amplitude_scale);
-		}
-		
 		// add trend to decompressed_data if detrended (in place)
 		// VDS_decode_m13() does retrending itself
 		if (CMP_IS_DETRENDED_m13(bh)) {
-			sf4_p = (sf4 *) cps->block_parameters;
-			offset = cps->params.block_parameter_map[CMP_PF_GRADIENT_IDX_m13];
-			gradient = (sf8) *(sf4_p + offset);
-			si4_p = (si4 *) cps->block_parameters;
-			offset = cps->params.block_parameter_map[CMP_PF_INTERCEPT_IDX_m13];
-			intercept = (sf8) *(si4_p + offset);
+			gradient = (sf8) CMP_BLOCK_PARAM_m13(cps, CMP_PF_GRADIENT_IDX_m13, sf4);
+			intercept = (sf8) CMP_BLOCK_PARAM_m13(cps, CMP_PF_INTERCEPT_IDX_m13, si4);
 			CMP_retrend_si4_m13(cps->decompressed_ptr, cps->decompressed_ptr, bh->number_of_samples, gradient, intercept);
 		}
 	}
@@ -23297,10 +23489,109 @@ tern	CMP_decode_m13(FPS_m13 *fps)
 }
 
 
+tern	CMP_crypt_block_m13(UH_m13 *uh, PASSWORD_DATA_m13 *pwd, si1 enc_level, CMP_FIXED_BH_m13 *bh, tern encrypt)
+{
+	ui1	*base, *model_hdr;
+	ui4	algorithm;
+	ui2	sub_model_bytes;
+	si8	encryptable_bytes, hdr_bytes, stage_1_bytes, total_bytes;
+
+#ifdef FT_DEBUG_m13
+	G_push_function_m13();
+#endif
+
+	// SOLE owner of the block encryption span, in BOTH directions. It exists because this arithmetic was
+	// open-coded in four places (G_encrypt_time_series_m13(), G_decrypt_time_series_m13(), CMP_encrypt_m13(),
+	// CMP_decrypt_m13()) & they all carried the same defect: the MBE branch stayed correct while the
+	// RED/PRED branch silently corrupted every encrypted block. Same scar as CMP_MBE_estimate_bytes_m13() &
+	// CMP_overflow_bytes_for_extrema_m13(). Callers own only the CMP_BF_ENCRYPTED_m13 flag.
+	//
+	// See the block encryption map at CMP_BLOCK_ENCRYPTION_START_OFFSET_m13 for the region layout. Both
+	// directions issue the SAME sequence of AES calls over the SAME ranges: the cipher is ECB with
+	// ciphertext stealing, so a split at a different point would steal from a different block.
+
+	encryptable_bytes = (si8) bh->total_block_bytes - CMP_BLOCK_ENCRYPTION_START_OFFSET_m13;
+	if (encryptable_bytes <= 0) {
+		G_set_error_m13(E_CRYP_m13, "block total bytes (%u) leaves no encryptable region", bh->total_block_bytes);
+		return_m13(FALSE_m13);
+	}
+
+	// header region: exactly one AES block. total_header_bytes sits immediately above it & stays in the
+	// clear, because the span below is computed from it.
+	if (G_AES_crypt_m13(uh, pwd, enc_level, (ui1 *) bh + CMP_BLOCK_ENCRYPTION_HDR_START_OFFSET_m13, (si8) CMP_BLOCK_ENCRYPTION_HDR_BYTES_m13, encrypt) == FALSE_m13)
+		return_m13(FALSE_m13);
+
+	base = (ui1 *) bh + CMP_BLOCK_ENCRYPTION_START_OFFSET_m13;
+	algorithm = bh->block_flags & CMP_BF_ALGORITHMS_MASK_m13;
+
+	// MBE has no statistics model to hide behind - its samples are readable straight out of the payload -
+	// so the whole payload is covered. Its rule needs only block_flags & total_block_bytes, both clear.
+	if (algorithm & CMP_BF_MBE_ENCODING_m13)
+		return_m13(G_AES_crypt_m13(uh, pwd, enc_level, base, encryptable_bytes, encrypt));
+
+	hdr_bytes = (si8) bh->total_header_bytes - CMP_BLOCK_ENCRYPTION_START_OFFSET_m13;
+	if (hdr_bytes < 0 || (si8) bh->total_header_bytes > (si8) bh->total_block_bytes) {
+		G_set_error_m13(E_CRYP_m13, "block total header bytes (%u) is out of range for a block of %u bytes", bh->total_header_bytes, bh->total_block_bytes);
+		return_m13(FALSE_m13);
+	}
+
+	// SRRED & VDS split the payload into two sub-blocks, each with its OWN model region BEYOND
+	// total_header_bytes, so one span cannot reach the first sub-block's statistics. Stage 1 covers the
+	// outer header remainder - which ends in the 16-byte SRRED/VDS model header - & stage 2 extends through
+	// the first sub-block's model region + 16 bytes of its compressed data. Withholding that much is
+	// sufficient: the second sub-block (SRRED residuals / VDS times) reconstructs nothing on its own, & the
+	// first sub-block's range-coded bytes are undecodable without its statistics.
+	if (algorithm & (CMP_BF_SRRED_ENCODING_m13 | CMP_BF_VDS_ENCODING_m13)) {
+		stage_1_bytes = CMP_AES_ROUND_UP_m13(hdr_bytes);
+		if (stage_1_bytes > encryptable_bytes)
+			stage_1_bytes = encryptable_bytes;
+		if (hdr_bytes < (si8) CMP_SRRED_MODEL_FIXED_HDR_BYTES_m13) {  // == CMP_VDS_MODEL_FIXED_HDR_BYTES_m13
+			G_set_error_m13(E_CRYP_m13, "block header (%lld bytes past the encryption start) is too small to hold a two-sub-block model header", (long long) hdr_bytes);
+			return_m13(FALSE_m13);
+		}
+		// the sub-block model size lives at the SAME offset in both model headers
+		// (CMP_SRRED_MODEL_SCALED_BLOCK_MODEL_BYTES_OFFSET_m13 == CMP_VDS_MODEL_AMPLITUDE_BLOCK_MODEL_BYTES_OFFSET_m13)
+		model_hdr = (ui1 *) bh + bh->total_header_bytes - CMP_SRRED_MODEL_FIXED_HDR_BYTES_m13;
+
+		// on ENCRYPT the model header is still plaintext; on DECRYPT stage 1 is what exposes it. Read it on
+		// the correct side of the stage 1 call so both directions compute identical ranges.
+		if (encrypt == TRUE_m13)
+			sub_model_bytes = *((ui2 *) (model_hdr + CMP_SRRED_MODEL_SCALED_BLOCK_MODEL_BYTES_OFFSET_m13));
+		if (G_AES_crypt_m13(uh, pwd, enc_level, base, stage_1_bytes, encrypt) == FALSE_m13)
+			return_m13(FALSE_m13);
+		if (encrypt == FALSE_m13)
+			sub_model_bytes = *((ui2 *) (model_hdr + CMP_SRRED_MODEL_SCALED_BLOCK_MODEL_BYTES_OFFSET_m13));
+
+		// fail closed: on decrypt this value came out of ciphertext, & a wrong span here would land as
+		// corrupt samples rather than an error - the exact failure signature this rework exists to remove
+		if (sub_model_bytes == 0 || ((si8) bh->total_header_bytes + (si8) sub_model_bytes) > (si8) bh->total_block_bytes) {
+			G_set_error_m13(E_CRYP_m13, "sub-block model bytes (%u) is out of range for a block of %u bytes with a %u byte header", sub_model_bytes, bh->total_block_bytes, bh->total_header_bytes);
+			return_m13(FALSE_m13);
+		}
+
+		total_bytes = CMP_AES_ROUND_UP_m13(hdr_bytes + (si8) sub_model_bytes + ENCRYPTION_BLOCK_BYTES_m13);
+		if (total_bytes > encryptable_bytes)
+			total_bytes = encryptable_bytes;
+		if (total_bytes > stage_1_bytes)  // stage 2: resumes exactly where stage 1 stopped
+			if (G_AES_crypt_m13(uh, pwd, enc_level, base + stage_1_bytes, total_bytes - stage_1_bytes, encrypt) == FALSE_m13)
+				return_m13(FALSE_m13);
+
+		return_m13(TRUE_m13);
+	}
+
+	// RED / PRED / SSE: a single stream, model region inside total_header_bytes. Cover it plus at least
+	// 16 bytes of compressed data, so the coder's opening state is out of reach as well as its statistics.
+	total_bytes = CMP_AES_ROUND_UP_m13(hdr_bytes + ENCRYPTION_BLOCK_BYTES_m13);
+	if (total_bytes > encryptable_bytes)
+		total_bytes = encryptable_bytes;
+
+	return_m13(G_AES_crypt_m13(uh, pwd, enc_level, base, total_bytes, encrypt));
+}
+
+
 tern	CMP_decrypt_m13(FPS_m13 *fps)
 {
 	si1			enc_level;
-	si8			encryption_bytes, encryptable_bytes;
 	PROC_GLOBS_m13		*pg;
 	UH_m13			*uh;
 	CMP_FIXED_BH_m13	*bh;
@@ -23332,23 +23623,13 @@ tern	CMP_decrypt_m13(FPS_m13 *fps)
 		return_m13(FALSE_m13);
 	}
 
-	// calculate encryption bytes
-	encryptable_bytes = bh->total_block_bytes - CMP_BLOCK_ENCRYPTION_START_OFFSET_m13;
-	if (bh->block_flags & CMP_BF_MBE_ENCODING_m13) {  // MBE readable without other info (e.g. RED/PRED statistics) => encrypt full payload
-		encryption_bytes = encryptable_bytes;  // full 16 byte AES blocks after encryption start point; AES_encrypt/decrypt_m13() handle trailing partial block internally (AES_partial_encrypt/decrypt_m13())
-	} else {
-		encryption_bytes = (bh->total_header_bytes - CMP_BLOCK_ENCRYPTION_START_OFFSET_m13) + ENCRYPTION_BLOCK_BYTES_m13;
-		if (encryption_bytes > encryptable_bytes)
-			encryption_bytes = encryptable_bytes;
-	}
-
 	// decrypt
-	if (G_AES_crypt_m13(uh, pwd, enc_level, (ui1 *) bh + CMP_BLOCK_ENCRYPTION_START_OFFSET_m13, encryption_bytes, FALSE_m13) == FALSE_m13)
+	if (CMP_crypt_block_m13(uh, pwd, enc_level, bh, FALSE_m13) == FALSE_m13)
 		return_m13(FALSE_m13);
-	
+
 	// mark block as decrypted
 	bh->block_flags &= ~CMP_BF_ENCRYPTED_m13;
-	
+
 	return_m13(TRUE_m13);
 }
 
@@ -23378,8 +23659,8 @@ tern	CMP_detrend_m13(si4 *input_buffer, si4 *output_buffer, si8 len, CPS_m13 *cp
 		sf4_m = (sf4) m;
 		si4_b = CMP_round_si4_m13(b);  // this is an integer because sf4 can only precisely encode offsets up to 24 bits, but MED guarantees 32-bit lossless detrending
 		// store the values
-		*((sf4 *) cps->block_parameters + cps->params.block_parameter_map[CMP_PF_GRADIENT_IDX_m13]) = sf4_m;
-		*((si4 *) cps->block_parameters + cps->params.block_parameter_map[CMP_PF_INTERCEPT_IDX_m13]) = si4_b;
+		CMP_BLOCK_PARAM_m13(cps, CMP_PF_GRADIENT_IDX_m13, sf4) = sf4_m;
+		CMP_BLOCK_PARAM_m13(cps, CMP_PF_INTERCEPT_IDX_m13, si4) = si4_b;
 		// promote back to sf8, maintaining demoted precision
 		m = (sf8) sf4_m;
 		b = (sf8) si4_b;
@@ -23424,6 +23705,7 @@ tern	CMP_detrend_sf8_m13(sf8 *input_buffer, sf8 *output_buffer, si8 len)
 
 ui1	CMP_differentiate_m13(CPS_m13 *cps)
 {
+	tern			est_swap;
 	ui1			deriv_level, set_deriv_level;
 	ui4			n_samps, n_diffs;
 	si4			*input_buffer, *curr_deriv_buffer, *next_deriv_buffer, samp_min, samp_max, diff_min, diff_max;
@@ -23521,6 +23803,10 @@ ui1	CMP_differentiate_m13(CPS_m13 *cps)
 	if (set_deriv_level == 0xFF) {  // find_derivative_level option
 		switch (cps->direcs.flags & CPS_DF_ALGORITHM_MASK_m13) {
 			case CPS_DF_SRRED_ALGORITHM_m13:
+				// SRRED runs RED-side from here THROUGH the rest of its encode: the search below, &
+				// later CMP_SRRED_find_parameters_m13()'s count+estimate pairs, all rely on this swap
+				// staying in effect (CMP_get_counts_m13() now REQUIRES the RED side - it no longer
+				// switches sides itself). The RED->PRED restore happens in CMP_SRRED_encode_m13().
 				CMP_swap_RED_PRED_m13(cps, CMP_PRED_TO_RED_m13);  // swap to RED buffers, if necessary
 			case CPS_DF_RED1_ALGORITHM_m13:
 			case CPS_DF_PRED1_ALGORITHM_m13:
@@ -23549,8 +23835,18 @@ ui1	CMP_differentiate_m13(CPS_m13 *cps)
 			// build PRED's 3 model aggregates (its per-category counts, as CMP_PRED2_encode_m13() does) & call
 			// CMP_PRED_estimate_bytes_m13() instead - no other change needed. (estimate_PRED is already used for the
 			// PRED-vs-MBE choice, where the category counts already exist.)
+			// Hold the RED-side buffers across the count+estimate PAIR. CMP_get_counts_m13() swaps to the
+			// RED buffers, fills the RED count array, & swaps BACK on exit - so under a PRED directive
+			// params.count then aims at the PRED-side array & the estimator scored UNINITIALIZED/STALE
+			// memory (bug #12, 2026-08-09: a ~30M garbage base on every score, varying per process,
+			// flipping near-tie level choices - the position/process nondeterminism of compressed sizes).
+			// With the swap held here, get_counts' inner swap is a no-op & the estimator reads the
+			// histogram it just built. RED2 was immune (the swap is a no-op under a RED directive).
+			est_swap = CMP_swap_RED_PRED_m13(cps, CMP_PRED_TO_RED_m13);
 			CMP_get_counts_m13(cps, FALSE_m13);
 			last_score = CMP_RED_estimate_bytes_m13(cps->params.count, (si8) CMP_RED_MAX_STATS_BINS_m13);
+			if (est_swap == TRUE_m13)
+				CMP_swap_RED_PRED_m13(cps, CMP_RED_TO_PRED_m13);
 		}
 	}
 	
@@ -23605,8 +23901,11 @@ ui1	CMP_differentiate_m13(CPS_m13 *cps)
 				CMP_get_counts_m13(cps, TRUE_m13);  // separated overflows
 				score = CMP_SRRED_estimate_bytes_m13(cps, CMP_SRRED_RANK_SCALE_m13);  // rank at the scale SRRED will use
 			} else {
+				est_swap = CMP_swap_RED_PRED_m13(cps, CMP_PRED_TO_RED_m13);  // hold RED side across the pair (see baseline note above)
 				CMP_get_counts_m13(cps, FALSE_m13);
-				score = CMP_RED_estimate_bytes_m13(cps->params.count, (si8) CMP_RED_MAX_STATS_BINS_m13);  // estimated RED size (see baseline note above)
+				score = CMP_RED_estimate_bytes_m13(cps->params.count, (si8) CMP_RED_MAX_STATS_BINS_m13);  // estimated RED size
+				if (est_swap == TRUE_m13)
+					CMP_swap_RED_PRED_m13(cps, CMP_RED_TO_PRED_m13);
 			}
 			if (score < last_score) {  // monotonic decrease to minimum score; monotonic increase after minimum score
 				last_score = score;
@@ -23649,8 +23948,7 @@ ui1	CMP_differentiate_m13(CPS_m13 *cps)
 
 tern	CMP_encode_m13(FPS_m13 *fps, si8 start_time, si4 acquisition_channel_number, ui4 n_samples)
 {
-	tern 	 		data_is_compressed, allow_lossy_compression;
-	ui1			normality;
+	tern 	 		data_is_compressed;
 	tern			(*compression_f)(CPS_m13 *cps);
 	CPS_m13			*cps;
 	CMP_FIXED_BH_m13	*bh;
@@ -23700,6 +23998,12 @@ tern	CMP_encode_m13(FPS_m13 *fps, si8 start_time, si4 acquisition_channel_number
 		if (cps->direcs.flags & CPS_DF_RESET_DISCONTINUITY_m13)
 			cps->params.discontinuity = FALSE_m13;
 	}
+
+	// line-noise-filtered provenance: the application toggles the directive as it switches true line-noise
+	// filtering on & off during recording; the flag is per-block truth. When set, the line-noise score byte
+	// (deposited by the application from the filter run) records what was REMOVED, not what remains.
+	if (cps->direcs.flags & CPS_DF_LINE_NOISE_FILTERED_m13)
+		bh->block_flags |= CMP_BF_LINE_NOISE_FILTERED_m13;
 		
 	// select compression
 	// (compression algorithms are responsible for filling in: algorithm block flag, total_header_bytes, total_block_bytes, model_region_bytes, & model details)
@@ -23730,46 +24034,30 @@ tern	CMP_encode_m13(FPS_m13 *fps, si8 start_time, si4 acquisition_channel_number
 			return_m13(FALSE_m13);
 	}
 	
+	// noise scores - on the RAW block, so this MUST stay above the detrend below (which reassigns input_buffer)
+	if (cps->direcs.flags & CPS_DF_ALL_NOISE_SCORES_m13)
+		CMP_calculate_noise_scores_m13(cps, cps->input_buffer, (si8) bh->number_of_samples);
+
 	// detrend
 	if (cps->direcs.flags & CPS_DF_DETREND_DATA_m13) {
 		CMP_detrend_m13(cps->input_buffer, cps->params.detrended_buffer, bh->number_of_samples, cps);
 		cps->input_buffer = cps->params.detrended_buffer;
 	}
 	
-	// lossy compression
+	// lossy compression - CALLER-SET scales only. The goal-seeking machinery that used to live here (iterate the
+	// scale until a target compression ratio / mean residual ratio was hit, gated on a normality score) was
+	// retired 2026-08-07: SRRED & VDS replaced it. See CPS_PARAMS_m13 for the fields that went with it.
 	data_is_compressed = FALSE_m13;
-	if (compression_f != CMP_VDS_encode_m13) {
-		allow_lossy_compression = TRUE_m13;
-		if (cps->direcs.flags & CPS_DF_REQUIRE_NORMALITY_m13) {
-			normality = CMP_normality_score_m13(cps->input_buffer, bh->number_of_samples);
-			if (normality < cps->params.minimum_normality) {
-				allow_lossy_compression = FALSE_m13;
-				bh->parameter_flags &= ~(CMP_PF_AMPLITUDE_SCALE_m13 | CMP_PF_FREQUENCY_SCALE_m13);
-			}
-		}
-		if (allow_lossy_compression == TRUE_m13) {
-			if (cps->direcs.flags & (CPS_DF_SET_AMPLITUDE_SCALE_m13 | CPS_DF_FIND_AMPLITUDE_SCALE_m13)) {
-				if (cps->direcs.flags & CPS_DF_FIND_AMPLITUDE_SCALE_m13)
-					data_is_compressed = CMP_find_amplitude_scale_m13(cps, compression_f);
-				else if (cps->direcs.flags & CPS_DF_SET_AMPLITUDE_SCALE_m13)
-					CMP_scale_amplitude_si4_m13(cps->input_buffer, cps->params.scaled_amplitude_buffer, bh->number_of_samples, (sf8) cps->params.amplitude_scale, cps);
-				cps->input_buffer = cps->params.scaled_amplitude_buffer;
-			}
-			  if (cps->direcs.flags & (CPS_DF_SET_FREQUENCY_SCALE_m13 | CPS_DF_FIND_FREQUENCY_SCALE_m13)) {
-				if (cps->direcs.flags & CPS_DF_FIND_FREQUENCY_SCALE_m13)
-					data_is_compressed = CMP_find_frequency_scale_m13(cps, compression_f);
-				else if (cps->direcs.flags & CPS_DF_SET_FREQUENCY_SCALE_m13)
-					CMP_scale_frequency_si4_m13(cps->input_buffer, cps->params.scaled_frequency_buffer, bh->number_of_samples, (sf8)cps->params.frequency_scale, cps);
-				cps->input_buffer = cps->params.scaled_frequency_buffer;
-			}
-		}
+
+	// Per-block scratch fit, once the algorithm is settled & before any dispatch. It covers the amplitude-scale
+	// retries below too - those re-invoke the SAME codec, so the scratch requirement does not change. Unguarded
+	// & cheap: early-outs when every buffer is present, and living on the every-block path keeps it exercised.
+	// DATA buffers are not its business - those are the caller's contract, grown only by CMP_realloc_CPS_m13().
+	if (CMP_fit_CPS_scratch_m13(cps, CMP_COMPRESSION_MODE_m13, bh->number_of_samples) == FALSE_m13) {
+		G_set_error_m13(E_ALLOC_m13, "could not fit algorithm scratch buffers");
+		return_m13(FALSE_m13);
 	}
-	
-	// noise scores
-	if (cps->direcs.flags & CPS_DF_INCLUDE_NOISE_SCORES_m13) {
-		// code not written yet
-	}
-	
+
 	// compress
 	if (data_is_compressed == FALSE_m13)
 		(*compression_f)(cps);
@@ -23789,7 +24077,6 @@ tern	CMP_encode_m13(FPS_m13 *fps, si8 start_time, si4 acquisition_channel_number
 tern	CMP_encrypt_m13(FPS_m13 *fps)
 {
 	si1				enc_level;
-	ui4				encryption_bytes, encryptable_bytes;
 	PROC_GLOBS_m13		*pg;
 	UH_m13		*uh;
 	PASSWORD_DATA_m13		*pwd;
@@ -23808,6 +24095,10 @@ tern	CMP_encrypt_m13(FPS_m13 *fps)
 	enc_level = uh->time_series_data_encryption;
 	if (enc_level == NO_ENCRYPTION_m13)
 		return_m13(TRUE_m13);
+	if (enc_level < NO_ENCRYPTION_m13) {  // "no entry" or a decrypted transient: not an instruction to encrypt (see G_encrypt_time_series_m13())
+		G_set_error_m13(E_CRYP_m13, "invalid time series data encryption level (%hhd) in universal header => cannot encrypt", enc_level);
+		return_m13(FALSE_m13);
+	}
 
 	// the block to encrypt lives in the compression processing struct: without one there is nothing to
 	// encrypt, & no data_ptrs fallback either (unlike FPS_update_maximum_entry_size_m13(), nothing has
@@ -23831,116 +24122,14 @@ tern	CMP_encrypt_m13(FPS_m13 *fps)
 		return_m13(FALSE_m13);
 	}
 
-	// calculate encryption bytes
-	encryptable_bytes = bh->total_block_bytes - CMP_BLOCK_ENCRYPTION_START_OFFSET_m13;
-	if (bh->block_flags & CMP_BF_MBE_ENCODING_m13) {  // MBE readable without other info (e.g. RED/PRED statistics) => encrypt full payload
-		encryption_bytes = encryptable_bytes;  // full 16 byte AES blocks after encryption start point; AES_encrypt/decrypt_m13() handle trailing partial block internally (AES_partial_encrypt/decrypt_m13())
-	} else {
-		encryption_bytes = (bh->total_header_bytes - CMP_BLOCK_ENCRYPTION_START_OFFSET_m13) + ENCRYPTION_BLOCK_BYTES_m13;
-		if (encryption_bytes > encryptable_bytes)
-			encryption_bytes = encryptable_bytes;
-	}
-
-	// encrypt
-	if (G_AES_crypt_m13(uh, pwd, enc_level, (ui1 *) bh + CMP_BLOCK_ENCRYPTION_START_OFFSET_m13, encryption_bytes, TRUE_m13) == FALSE_m13)
+	// encrypt (span rules live in CMP_crypt_block_m13(), the sole owner)
+	if (CMP_crypt_block_m13(uh, pwd, enc_level, bh, TRUE_m13) == FALSE_m13)
 		return_m13(FALSE_m13);
-	
+
 	// mark block as encrypted
 	bh->block_flags |= CMP_BF_ENCRYPTED_m13;
 
 	return_m13(TRUE_m13);
-}
-
-
-tern	CMP_find_amplitude_scale_m13(CPS_m13 *cps, tern (*compression_f)(CPS_m13 *cps))
-{
-	tern 			data_is_compressed;
-	si8 			i;
-	si4			*input_buffer;
-	sf8 			original_size, goal_compression_ratio;
-	sf8 			low_sf, high_sf, mrr, mrr2, mrr5, sf_per_mrr;
-	sf8 			goal_low_bound, goal_high_bound, goal_mrr, goal_tol;
-	sf4 			new_scale_factor;
-	CMP_FIXED_BH_m13	*bh;
-	
-#ifdef FT_DEBUG_m13
-	G_push_function_m13();
-#endif
-
-	input_buffer = cps->input_buffer;
-	bh = cps->block_header;
-	data_is_compressed = FALSE_m13;
-
-	if (cps->direcs.flags & CPS_DF_USE_COMPRESSION_RATIO_m13) {
-		goal_compression_ratio = cps->params.goal_ratio;
-		goal_low_bound = goal_compression_ratio - cps->params.goal_tolerance;
-		goal_high_bound = goal_compression_ratio + cps->params.goal_tolerance;
-		cps->params.amplitude_scale = (sf4) 1.0;
-		(*compression_f)(cps);
-		data_is_compressed = TRUE_m13;
-		original_size = (sf8) bh->number_of_samples * (sf8) sizeof(si4);
-		cps->params.actual_ratio = (sf8) bh->total_block_bytes / original_size;
-		if (cps->params.actual_ratio > goal_high_bound) {
-			// loop until acceptable scale factor found
-			for (i = cps->params.maximum_goal_attempts; i--;) {
-				new_scale_factor = cps->params.amplitude_scale * (sf4) (cps->params.actual_ratio / goal_compression_ratio);
-				if ((ABS_m13(new_scale_factor - cps->params.amplitude_scale) <= (sf4) 0.000001) || (new_scale_factor <= (sf4) 1.0))
-					break;
-				cps->params.amplitude_scale = new_scale_factor;
-				(*compression_f)(cps);  // compress
-				cps->params.actual_ratio = (sf8) bh->total_block_bytes / original_size;
-				if ((cps->params.actual_ratio <= goal_high_bound) && (cps->params.actual_ratio >= goal_low_bound))
-					break;
-			}
-		}
-	}
-	if (cps->direcs.flags & CPS_DF_USE_MEAN_RESIDUAL_RATIO_m13) {
-		// get residual ratio at sf 2 & 5 (roughly linear relationship: reasonable sample points)
-		cps->params.amplitude_scale = (sf4) 2.0;
-		CMP_generate_lossy_data_m13(cps, input_buffer, cps->decompressed_ptr, CMP_AMPLITUDE_SCALE_MODE_m13);
-		mrr2 = CMP_calculate_mean_residual_ratio_m13(input_buffer, cps->decompressed_ptr, bh->number_of_samples);
-		if (mrr2 == (sf8) 0.0) {  // all zeros in block
-			cps->params.amplitude_scale = (sf4) 1.0;
-			cps->params.actual_ratio = (sf8) 0.0;
-			(*compression_f)(cps);
-			goto CMP_MRR_DONE_m13;
-		}
-		cps->params.amplitude_scale = (sf4) 5.0;
-		CMP_generate_lossy_data_m13(cps, input_buffer, cps->decompressed_ptr, CMP_AMPLITUDE_SCALE_MODE_m13);
-		mrr5 = CMP_calculate_mean_residual_ratio_m13(input_buffer, cps->decompressed_ptr, bh->number_of_samples);
-		sf_per_mrr = (sf8) 3.0 / (mrr5 - mrr2);
-		// estimate starting points
-		goal_mrr = cps->params.goal_ratio;
-		goal_tol = cps->params.goal_tolerance;
-		goal_low_bound = goal_mrr - goal_tol;
-		goal_high_bound = goal_mrr + goal_tol;
-		cps->params.amplitude_scale = (sf4)(((goal_mrr - mrr2) * sf_per_mrr) + (sf8)2.0);
-		high_sf = ((goal_high_bound - mrr2) * sf_per_mrr) + (sf8) 2.0;
-		high_sf *= (sf8) 2.0;  // empirically reasonable
-		low_sf = (sf8) 1.0;
-		for (i = cps->params.maximum_goal_attempts; i--;) {
-			CMP_generate_lossy_data_m13(cps, input_buffer, cps->decompressed_ptr, CMP_AMPLITUDE_SCALE_MODE_m13);
-			mrr = CMP_calculate_mean_residual_ratio_m13(input_buffer, cps->decompressed_ptr, bh->number_of_samples);
-			if (mrr < goal_low_bound)
-				low_sf = (sf8) cps->params.amplitude_scale;
-			else if (mrr > goal_high_bound)
-				high_sf = (sf8) cps->params.amplitude_scale;
-			else
-				break;
-			new_scale_factor = (sf4) ((low_sf + high_sf) / (sf8) 2.0);
-			if (new_scale_factor <= (sf4) 1.0)
-				break;
-			cps->params.amplitude_scale = new_scale_factor;
-			if ((high_sf - low_sf) < (sf8) 0.005)
-				break;
-		}
-		cps->params.actual_ratio = mrr;
-	} else {
-		G_set_error_m13(E_GEN_m13, "either use_compression_ratio or use_mean_residual_ratio directive must be set");
-		return_m13(data_is_compressed);
-	} CMP_MRR_DONE_m13:
-	
-	return_m13(data_is_compressed);
 }
 
 
@@ -24172,18 +24361,6 @@ tern	CMP_find_extrema_m13(si4 *input_buffer, si8 len, si4 *minimum, si4 *maximum
 }
 
 
-tern	CMP_find_frequency_scale_m13(CPS_m13 *cps, tern (*compression_f)(CPS_m13 *cps))
-{
-#ifdef FT_DEBUG_m13
-	G_push_function_m13();
-#endif
-
-	// code not written yet
-	
-	return_m13(TRUE_m13);
-}
-
-
 void	CMP_free_buffer_depot_m13(void)
 {
 	si8			i;
@@ -24253,7 +24430,9 @@ tern	CMP_free_CPS_cache_m13(CPS_m13 *cps)
 	if (cps == NULL)
 		return_m13(freed);
 
-	if (cps->params.cache) {
+	// a CALLER-OWNED cache is never freed & never unhooked: returning freed == FALSE_m13 also stops
+	// CMP_realloc_CPS_m13()'s out-of-memory remedy from retrying on memory it cannot reclaim
+	if (cps->params.cache && (cps->direcs.flags & CPS_DF_CALLER_OWNS_DECOMPRESSED_m13) == 0) {
 		free_m13((void * ) cps->params.cache);
 		cps->params.allocated_decompressed_samples = 0;
 		cps->decompressed_data = cps->decompressed_ptr = cps->params.cache = NULL;
@@ -24285,7 +24464,7 @@ tern	CMP_free_CPS_m13(CPS_m13 *cps, tern free_structure)
 	if (cps->original_data)
 		free_m13(cps->original_data);
 	
-	if (cps->params.cache)  // decompressed_data is pointer into cache
+	if (cps->params.cache && (cps->direcs.flags & CPS_DF_CALLER_OWNS_DECOMPRESSED_m13) == 0)  // decompressed_data is pointer into cache; caller-owned is never freed
 		free_m13(cps->params.cache);
 	
 	if (cps->params.keysample_buffer)
@@ -24306,15 +24485,18 @@ tern	CMP_free_CPS_m13(CPS_m13 *cps, tern free_structure)
 	if (cps->params.detrended_buffer)
 		free_m13(cps->params.detrended_buffer);
 	
-	if (cps->params.scaled_amplitude_buffer)
-		free_m13(cps->params.scaled_amplitude_buffer);
-	
-	if (cps->params.scaled_frequency_buffer)
-		free_m13(cps->params.scaled_frequency_buffer);
-	
+	// scrap_buffers is CALLER-OWNED: the library neither allocates nor reads it (e.g. DHN_Acq uses it as
+	// multipurpose per-CPS scratch). Freeing it here anyway is a deliberate CONVENIENCE - the caller's
+	// scratch dies with the CPS it was hung on, so callers get one teardown instead of two.
+	// ⚠️ The price of that convenience is an INVARIANT: this field must be NULL unless a caller deliberately
+	// set it. CMP_init_params_m13() therefore zeroes the whole CPS_PARAMS_m13 before applying defaults -
+	// without that, a stack-allocated params struct (the normal app pattern, & CMP_allocate_CPS_m13() copies
+	// it wholesale) delivers uninitialised stack garbage straight to this free. That is exactly what
+	// happened: a leftover sf4 32.0 (0x42000000) reached here & crashed at G_free_session_m13() time,
+	// masquerading for two days as intermittent heap corruption inside the RED2 codec (fixed 2026-08-06).
 	if (cps->params.scrap_buffers)
 		CMP_free_buffers_m13(&cps->params.scrap_buffers);
-	
+
 	if (cps->params.count)
 		free_m13(cps->params.count);
 	
@@ -24330,6 +24512,10 @@ tern	CMP_free_CPS_m13(CPS_m13 *cps, tern free_structure)
 	if (cps->params.symbol_map)
 		free_m13(cps->params.symbol_map);
 	
+	if (cps->params.noise_score_buffers)
+		CMP_free_buffers_m13(&cps->params.noise_score_buffers);
+	if (cps->params.line_noise_buffers)
+		CMP_free_buffers_m13(&cps->params.line_noise_buffers);
 	if (cps->params.VDS_input_buffers)
 		CMP_free_buffers_m13(&cps->params.VDS_input_buffers);
 	if (cps->params.VDS_output_buffers)
@@ -24587,37 +24773,6 @@ sf8	CMP_gamma_ser_m13(sf8 a, sf8 x, sf8 *g_ln)
 }
 
 
-tern	CMP_generate_lossy_data_m13(CPS_m13 *cps, si4 *input_buffer, si4 *output_buffer, ui1 mode)
-{
-	CMP_FIXED_BH_m13	*bh;
-	
-#ifdef FT_DEBUG_m13
-	G_push_function_m13();
-#endif
-
-	// generates lossy data from input_buffer to output_buffer
-	// if input_buffer == output_buffer lossy data will be made in place
-	bh = cps->block_header;
-	
-	if (mode == CMP_AMPLITUDE_SCALE_MODE_m13) {
-		// amplitude scale from input_buffer to scaled_amplitude_buffer (lossy)
-		CMP_scale_amplitude_si4_m13(input_buffer, cps->params.scaled_amplitude_buffer, bh->number_of_samples, (sf8) cps->params.amplitude_scale, cps);
-		// unscale from scaled_amplitude_buffer to output_buffer
-		CMP_unscale_amplitude_si4_m13(cps->params.scaled_amplitude_buffer, output_buffer, bh->number_of_samples, (sf8) cps->params.amplitude_scale);
-	} else if (mode == CMP_FREQUENCY_SCALE_MODE_m13) {
-		// frequency scale from input_buffer to scaled_frequency_buffer (lossy)
-		CMP_scale_frequency_si4_m13(input_buffer, cps->params.scaled_frequency_buffer, bh->number_of_samples, (sf8) cps->params.frequency_scale, cps);
-		// unscale from scaled_frequency_buffer to output_buffer
-		CMP_unscale_frequency_si4_m13(cps->params.scaled_frequency_buffer, output_buffer, bh->number_of_samples, (sf8) cps->params.frequency_scale);
-	} else {
-		G_set_error_m13(E_GEN_m13, "unrecognized lossy compression mode => no data generated");
-		return_m13(FALSE_m13);
-	}
-	
-	return_m13(TRUE_m13);
-}
-
-
 tern	CMP_generate_parameter_map_m13(CPS_m13 *cps)
 {
 	ui4			bit, flags, n_params, i, *p_map;
@@ -24631,6 +24786,12 @@ tern	CMP_generate_parameter_map_m13(CPS_m13 *cps)
 	bh = cps->block_header;
 	flags = bh->parameter_flags;
 	p_map = cps->params.block_parameter_map;
+	// Absent parameters must read as NO_ENTRY, not as whatever the previous block left behind. The CPS is
+	// reused block to block, & this loop only writes entries whose bit is SET - so without this the map kept
+	// stale, plausible-looking offsets for parameters that are not in THIS block, and a caller who indexed the
+	// map without first testing parameter_flags silently read a different parameter's value. See the note at
+	// CMP_PF_MAP_NO_ENTRY_m13.
+	memset((void *) p_map, 0xFF, (size_t) CMP_PF_PARAMETER_FLAG_BITS_m13 * sizeof(ui4));
 	for (bit = 1, n_params = i = 0; i < CMP_PF_PARAMETER_FLAG_BITS_m13; ++i, bit <<= 1)
 		if (flags & bit)
 			p_map[i] = n_params++;
@@ -24642,9 +24803,45 @@ tern	CMP_generate_parameter_map_m13(CPS_m13 *cps)
 }
 
 
+// ---------------------------------------------------------------------------------------------------
+// The RED coding window: 255 representable derivative values plus ONE byte value reserved as the overflow
+// flag. Only the window's PLACEMENT varies - today either -127..127 (flag -128) or, for promised-positive
+// derivatives, 1..255 (flag 0). A value inside the window costs one symbol; a value outside costs the flag
+// symbol plus 2-4 raw bytes, so placement is purely an overflow question.
+//
+// These two live together because the ENCODER and the ESTIMATOR must reach the SAME answer. The estimator
+// predicts what the encoder is about to do - nothing is stamped yet, so both resolve from the caller's
+// DIRECTIVES, never from a header. When they disagree the estimator prices a block that will never be
+// produced, which is the defect class behind the SRRED step-3 regression & the all-positive-derivative
+// divergence. One rule, one place to teach when the per-block derivative offset lands.
+//
+// The DECODER answers the same question from the header (what actually HAPPENED, not what was asked for)
+// & is deliberately not routed through here: its reconstruction loop walks the keysample buffer as ui1 in
+// the positive case & si1 otherwise, so it differs in structure, not just in bounds.
+// ---------------------------------------------------------------------------------------------------
+
+static void	CMP_derivative_window_m13(tern pos_derivs, si4 *low_d, si4 *high_d, ui1 *ks_flag)
+{
+	// The 255-value coding window. pos_derivs is the LEGACY all-positive model: RETIRED from the encoders
+	// 2026-08-06 (they all pass FALSE_m13 now), still honoured by the decoders for files in the wild.
+	// A per-block window OFFSET was built & measured 2026-08-06, then reverted: the derivative-level search
+	// already centres the distribution, so it rescued a mean of 9-17 values per 4096-sample block on real
+	// data, for 2.4% encode time & a permanent format bit. Bit 4 of both flag words is FREE - never shipped.
+	// See the cmp-derivative-offset-design note before rebuilding it.
+	if (pos_derivs == TRUE_m13) {
+		*low_d = 1; *high_d = 255;
+		*ks_flag = CMP_POS_DERIV_KEYSAMPLE_FLAG_m13;  // == 0 (non-overflow range: 1 to 255)
+	} else {
+		*low_d = -127; *high_d = 127;
+		*ks_flag = (ui1) CMP_UI1_KEYSAMPLE_FLAG_m13;  // == -128 (non-overflow range: -127 to +127)
+	}
+
+	return;
+}
+
+
 void	CMP_get_counts_m13(CPS_m13 *cps, tern overflows)
 {
-	tern		swap_back;
 	ui1		*key_p, *ui1_p, ks_flag;
 	ui4		*count, *sorted_count, tmp_sorted_count, n_deriv_samps;
 	si4 		*si4_p, *overflow_samps, deriv_level, diff, low_d, high_d, n_stats_entries;
@@ -24663,13 +24860,25 @@ void	CMP_get_counts_m13(CPS_m13 *cps, tern overflows)
 	
 	deriv_level = (si4) cps->params.derivative_level;
 	n_deriv_samps = cps->block_header->number_of_samples - deriv_level;  // skip initial values
-	
-	swap_back = CMP_swap_RED_PRED_m13(cps, CMP_PRED_TO_RED_m13);
+
+	// PRECONDITION: the caller holds the RED-side buffers. This function used to swap to RED itself &
+	// swap BACK on exit - which meant that under a PRED directive, params.count no longer aimed at the
+	// histogram just built the moment this returned, & the derivative-level search scored uninitialized/
+	// stale PRED-side memory (bug #12, fixed 2026-08-09: position/process-nondeterministic compressed
+	// sizes). Every caller now holds the RED side across the count+estimate PAIR (CMP_differentiate_m13()
+	// explicitly; the SRRED paths run swapped for the whole search & CMP_SRRED_find_parameters_m13() - see
+	// the note at the SRRED search-entry swap), so the silent side-switch is retired & misuse fails loudly:
+	if (cps->params.PRED_base_count != NULL && cps->params.count == cps->params.PRED_base_count) {
+		G_set_error_m13(E_CMP_m13, "caller must hold the RED-side buffers (CMP_swap_RED_PRED_m13)");
+		return_void_m13;
+	}
 	count = (ui4 *) cps->params.count;
 	memset(count, (si4) 0, (size_t) (CMP_RED_MAX_STATS_BINS_m13 * sizeof(ui4)));  // zero all bins (array is ui4[CMP_RED_MAX_STATS_BINS_m13])
 	key_p = (ui1 *) cps->params.keysample_buffer;
 	si4_p = cps->params.derivative_buffer + deriv_level;  // skip initial values
-	low_d = (si4) -127; high_d = (si4) 127;
+	// ESTIMATOR side of the shared window rule. It passes pos_derivs FALSE: the legacy all-positive model is
+	// retired from the encoders & this function never modelled it (see the note at the overflow fold below).
+	CMP_derivative_window_m13(FALSE_m13, &low_d, &high_d, &ks_flag);
 
 	// generate counts
 	if (overflows == TRUE_m13) {
@@ -24683,7 +24892,7 @@ void	CMP_get_counts_m13(CPS_m13 *cps, tern overflows)
 		}
 		cps->params.SRRED_overflow_samples = j;
 		cps->params.n_stats_entries = CMP_RED_MAX_STATS_BINS_m13;
-		
+
 		return_void_m13;  // counts with overflows are not sorted - they need their true values
 	}
 	
@@ -24734,9 +24943,6 @@ void	CMP_get_counts_m13(CPS_m13 *cps, tern overflows)
 			}
 		}
 	} while ((i = j) > 1);
-	
-	if (swap_back == TRUE_m13)
-		CMP_swap_RED_PRED_m13(cps, CMP_RED_TO_PRED_m13);
 
 	return_void_m13;
 }
@@ -24782,35 +24988,35 @@ ui1	CMP_get_overflow_bytes_m13(CPS_m13 *cps, ui4 mode, ui4 algorithm)
 		}
 		// set block flag
 		if (algorithm == CMP_RED1_COMPRESSION_m13 || algorithm == CMP_RED2_COMPRESSION_m13) {
-			RED_header->flags &= ~CMP_RED_OVERFLOW_BYTES_MASK_m13;
+			RED_header->flags &= ~CMP_RED_FLAGS_OVERFLOW_BYTES_MASK_m13;
 			if (cps->params.overflow_bytes == 2)
-				RED_header->flags |= CMP_RED_2_BYTE_OVERFLOWS_m13;
+				RED_header->flags |= CMP_RED_FLAGS_2_BYTE_OVERFLOWS_m13;
 			else if	(cps->params.overflow_bytes == 3)
-				RED_header->flags |= CMP_RED_3_BYTE_OVERFLOWS_m13;
+				RED_header->flags |= CMP_RED_FLAGS_3_BYTE_OVERFLOWS_m13;
 		} else if (algorithm == CMP_PRED1_COMPRESSION_m13 || algorithm == CMP_PRED2_COMPRESSION_m13 ) {
 			PRED_header = (CMP_PRED_MODEL_FIXED_HDR_m13 *) cps->params.model_region;
-			PRED_header->flags &= ~CMP_PRED_OVERFLOW_BYTES_MASK_m13;
+			PRED_header->flags &= ~CMP_PRED_FLAGS_OVERFLOW_BYTES_MASK_m13;
 			if (cps->params.overflow_bytes == 2)
-				PRED_header->flags |= CMP_PRED_2_BYTE_OVERFLOWS_m13;
+				PRED_header->flags |= CMP_PRED_FLAGS_2_BYTE_OVERFLOWS_m13;
 			else if	(cps->params.overflow_bytes == 3)
-				PRED_header->flags |= CMP_PRED_3_BYTE_OVERFLOWS_m13;
+				PRED_header->flags |= CMP_PRED_FLAGS_3_BYTE_OVERFLOWS_m13;
 		}
 	} else {  // CMP_DECOMPRESSION_MODE_m13
 		if (algorithm == CMP_RED1_COMPRESSION_m13 || algorithm == CMP_RED2_COMPRESSION_m13) {
 			RED_header = (CMP_RED_MODEL_FIXED_HDR_m13 *) cps->params.model_region;
-			flags = RED_header->flags & CMP_RED_OVERFLOW_BYTES_MASK_m13;
-			if (flags == CMP_RED_2_BYTE_OVERFLOWS_m13)
+			flags = RED_header->flags & CMP_RED_FLAGS_OVERFLOW_BYTES_MASK_m13;
+			if (flags == CMP_RED_FLAGS_2_BYTE_OVERFLOWS_m13)
 				cps->params.overflow_bytes =  2;
-			else if (flags == CMP_RED_3_BYTE_OVERFLOWS_m13)
+			else if (flags == CMP_RED_FLAGS_3_BYTE_OVERFLOWS_m13)
 				cps->params.overflow_bytes =  3;
 			else
 				cps->params.overflow_bytes = CPS_PARAMS_OVERFLOW_BYTES_DEFAULT_m13;  // 4
 		} else if (algorithm == CMP_PRED_COMPRESSION_m13) {
 			PRED_header = (CMP_PRED_MODEL_FIXED_HDR_m13 *) cps->params.model_region;
-			flags = PRED_header->flags & CMP_PRED_OVERFLOW_BYTES_MASK_m13;
-			if (flags == CMP_PRED_2_BYTE_OVERFLOWS_m13)
+			flags = PRED_header->flags & CMP_PRED_FLAGS_OVERFLOW_BYTES_MASK_m13;
+			if (flags == CMP_PRED_FLAGS_2_BYTE_OVERFLOWS_m13)
 				cps->params.overflow_bytes =  2;
-			else if (flags == CMP_PRED_3_BYTE_OVERFLOWS_m13)
+			else if (flags == CMP_PRED_FLAGS_3_BYTE_OVERFLOWS_m13)
 				cps->params.overflow_bytes =  3;
 			else
 				cps->params.overflow_bytes = CPS_PARAMS_OVERFLOW_BYTES_DEFAULT_m13;  // 4
@@ -24981,9 +25187,6 @@ CPS_DIRECS_m13	*CMP_init_direcs_m13(CPS_DIRECS_m13 *direcs, ui1 compression_mode
 	if (CPS_DIRECTIVES_RESET_DISCONTINUITY_DEFAULT_m13 == TRUE_m13)
 		flags |= CPS_DF_RESET_DISCONTINUITY_m13;
 
-	if (CPS_DIRECTIVES_INCLUDE_NOISE_SCORES_DEFAULT_m13 == TRUE_m13)
-		flags |= CPS_DF_INCLUDE_NOISE_SCORES_m13;
-
 	if (CPS_DIRECTIVES_NO_ZERO_COUNTS_DEFAULT_m13 == TRUE_m13)
 		flags |= CPS_DF_NO_ZERO_COUNTS_m13;
 
@@ -25005,39 +25208,12 @@ CPS_DIRECS_m13	*CMP_init_direcs_m13(CPS_DIRECS_m13 *direcs, ui1 compression_mode
 	if (CPS_DIRECTIVES_DETREND_DATA_DEFAULT_m13 == TRUE_m13)
 		flags |= CPS_DF_DETREND_DATA_m13;
 
-	if (CPS_DIRECTIVES_REQUIRE_NORMALITY_DEFAULT_m13 == TRUE_m13)
-		flags |= CPS_DF_REQUIRE_NORMALITY_m13;
-
-	if (CPS_DIRECTIVES_USE_COMPRESSION_RATIO_DEFAULT_m13 == TRUE_m13)
-		flags |= CPS_DF_USE_COMPRESSION_RATIO_m13;
-
-	if (CPS_DIRECTIVES_USE_MEAN_RESIDUAL_RATIO_DEFAULT_m13 == TRUE_m13)
-		flags |= CPS_DF_USE_MEAN_RESIDUAL_RATIO_m13;
-
-	if (CPS_DIRECTIVES_USE_RELATIVE_RATIO_DEFAULT_m13 == TRUE_m13)
-		flags |= CPS_DF_USE_RELATIVE_RATIO_m13;
-
-	if (CPS_DIRECTIVES_SET_AMPLITUDE_SCALE_DEFAULT_m13 == TRUE_m13)
-		flags |= CPS_DF_SET_AMPLITUDE_SCALE_m13;
-
-	if (CPS_DIRECTIVES_FIND_AMPLITUDE_SCALE_DEFAULT_m13 == TRUE_m13)
-		flags |= CPS_DF_FIND_AMPLITUDE_SCALE_m13;
-
-	if (CPS_DIRECTIVES_SET_FREQUENCY_SCALE_DEFAULT_m13 == TRUE_m13)
-		flags |= CPS_DF_SET_FREQUENCY_SCALE_m13;
-
-	if (CPS_DIRECTIVES_FIND_FREQUENCY_SCALE_DEFAULT_m13 == TRUE_m13)
-		flags |= CPS_DF_FIND_FREQUENCY_SCALE_m13;
-
 	if (CPS_DIRECTIVES_SET_OVERFLOW_BYTES_DEFAULT_m13 == TRUE_m13)
 		flags |= CPS_DF_SET_OVERFLOW_BYTES_m13;
 
 	if (CPS_DIRECTIVES_FIND_OVERFLOW_BYTES_DEFAULT_m13 == TRUE_m13)
 		flags |= CPS_DF_FIND_OVERFLOW_BYTES_m13;
 	
-	if (CPS_DIRECTIVES_VDS_SCALE_BY_BASELINE_DEFAULT_m13 == TRUE_m13)
-		flags |= CPS_DF_VDS_SCALE_BY_BASELINE_m13;
-		
 	direcs->flags = flags;
 	
 	return_m13(direcs);
@@ -25050,9 +25226,23 @@ CPS_PARAMS_m13	*CMP_init_params_m13(CPS_PARAMS_m13 *params)
 	G_push_function_m13();
 #endif
 
+	// ⭐ ZERO FIRST, then apply the non-zero defaults below. Callers stack-allocate this struct
+	// (DAT2MED.c:1541, dev/claude_tests/codec_file_test.c) & CMP_allocate_CPS_m13() copies it WHOLESALE
+	// (`cps->params = *parameters`), so any field this function fails to set arrives in the CPS as caller
+	// stack garbage. 15 pointer fields were being left that way. Most are then overwritten by
+	// CMP_allocate_CPS_m13(), but scrap_buffers is not - it is CALLER-OWNED, the library never allocates it,
+	// and CMP_free_CPS_m13() frees it if non-NULL. So a stack slot holding 0x42000000 (a leftover sf4 32.0)
+	// became a wild free at G_free_session_m13() time.
+	// ⚠️ That is why it presented as a rare, ASan-only, "intermittent" heap corruption in the CODEC: the
+	// garbage is whatever the caller's stack happened to hold, so it moved with every codegen change &
+	// usually pointed somewhere dereferenceable. Found 2026-08-06 via dev/claude_tests/codec_file_test.c.
+	// The memset (rather than 15 more assignments) is deliberate: this function fell behind as fields were
+	// added, and zero-then-default cannot fall behind again.
 	if (params == NULL)
 		params = (CPS_PARAMS_m13 *) calloc_m13((size_t) 1, sizeof(CPS_PARAMS_m13));
-	
+	else
+		memset((void *) params, 0, sizeof(CPS_PARAMS_m13));
+
 	params->cache = NULL;
 	params->cached_blocks = NULL;
 	params->cached_block_cnt = 0;
@@ -25078,13 +25268,10 @@ CPS_PARAMS_m13	*CMP_init_params_m13(CPS_PARAMS_m13 *params)
 	params->protected_region_bytes = CMP_PROTECTED_REGION_BYTES_DEFAULT_m13;
 	params->user_discretionary_region_bytes = CMP_USER_DISCRETIONARY_REGION_BYTES_DEFAULT_m13;
 	params->variable_region_bytes = 0;
-	params->goal_ratio = CPS_PARAMS_GOAL_RATIO_DEFAULT_m13;
-	params->goal_tolerance = CPS_PARAMS_GOAL_TOLERANCE_DEFAULT_m13;
-	params->maximum_goal_attempts = CPS_PARAMS_MAXIMUM_GOAL_ATTEMPTS_DEFAULT_m13;
-	params->minimum_normality = CPS_PARAMS_MINIMUM_NORMALITY_DEFAULT_m13;
-	params->amplitude_scale = CPS_PARAMS_AMPLITUDE_SCALE_DEFAULT_m13;
-	params->frequency_scale = CPS_PARAMS_FREQUENCY_SCALE_DEFAULT_m13;
-	params->VDS_sampling_frequency = RATE_NO_ENTRY_m13;
+	memset((void *) params->noise_scores, CMP_NS_NO_ENTRY_m13, (size_t) CMP_NS_BYTES_m13);  // absent until computed, or deposited by the caller
+	params->VDS_goal_attempts = CPS_PARAMS_VDS_GOAL_ATTEMPTS_DEFAULT_m13;
+	params->sampling_frequency = RATE_NO_ENTRY_m13;
+	params->line_frequency = RATE_NO_ENTRY_m13;
 	params->VDS_LFP_high_fc = RATE_NO_ENTRY_m13;
 	params->VDS_threshold = CPS_PARAMS_VDS_THRESHOLD_DEFAULT_m13;
 	params->SRRED_scale_window = CMP_SRRED_SCALE_WINDOW_DEFAULT_m13;
@@ -25119,7 +25306,7 @@ tern	CMP_init_tables_m13(void)
 			sf8	*log_table;
 			si8	i;
 
-			log_table = (sf8 *) malloc((size_t) CMP_LOG_TABLE_ENTRIES_m13 * sizeof(sf8));
+			log_table = (sf8 *) G_guarded_table_alloc_m13((size_t) CMP_LOG_TABLE_ENTRIES_m13 * sizeof(sf8));  // sealed read-only once filled
 			if (log_table == NULL) {
 				pthread_mutex_unlock_m13(&tables->mutex);
 				return(FALSE_m13);  // leave the "done" flag unset so a caller may retry
@@ -25127,6 +25314,7 @@ tern	CMP_init_tables_m13(void)
 			log_table[0] = (sf8) 0.0;  // log2(0) is undefined; never indexed (estimator counts are > 0)
 			for (i = 1; i < CMP_LOG_TABLE_ENTRIES_m13; ++i)
 				log_table[i] = log2((sf8) i);
+			G_guarded_table_seal_m13((void *) log_table, (size_t) CMP_LOG_TABLE_ENTRIES_m13 * sizeof(sf8));
 			tables->CMP_log_table = log_table;
 		}
 		// point at the read-only masters (cannot fail)
@@ -25249,6 +25437,71 @@ tern	CMP_lad_reg_2_sf8_m13(sf8 *x_input_buffer, sf8 *y_input_buffer, si8 len, sf
 	free(buf);
 
 	return_m13(TRUE_m13);
+}
+
+
+sf8	CMP_entropy_deficit_m13(si4 *data, si8 len)
+{
+	sf8	scores[CMP_NS_BYTES_m13];
+
+#ifdef FT_DEBUG_m13
+	G_push_function_m13();
+#endif
+
+	// ENTROPY DEFICIT in [0,1]: how much LESS information the block carries than its own dynamic range could
+	// hold. 0 == the range is filled as evenly as the resolution can show; 1 == no information at all.
+	// An INFORMATION-LOSS measure - it catches dropout, a dead or stuck channel, and excessive quantization.
+	// It does NOT flag noise: a signal that fills its range is healthy by this measure, & the LLP score is what
+	// carries unpredictability. Reference points: flat 1.0, stuck on two values 0.875, gaussian filling its
+	// range 0.10, white uniform noise 0.004.
+	// The histogram spans the OBSERVED range so the score is scale invariant, & Hmax is log2 of the bins
+	// actually in play, so a signal that legitimately occupies few codes does not read as degraded.
+	// Deficit rather than raw entropy so this does not track the normality score: for a given variance the
+	// gaussian MAXIMIZES entropy, so raw entropy & normality would agree on exactly the clean data where
+	// resolution is wanted.
+	// ⭐ Side effect worth knowing: a large outlier inflates the range & collapses the bulk into few bins, so
+	// impulsive artifact registers here - the failure mode the KS score is weakest on.
+
+	scores[CMP_NS_ENTROPY_DEFICIT_IDX_m13] = (sf8) 1.0;
+	CMP_noise_scores_m13(data, len, scores, CMP_NS_ENTROPY_DEFICIT_SEL_m13);
+
+	return_m13(scores[CMP_NS_ENTROPY_DEFICIT_IDX_m13]);
+}
+
+
+sf8	CMP_KS_score_m13(si4 *data, ui4 n_samps)
+{
+	sf8	scores[CMP_NS_BYTES_m13];
+
+#ifdef FT_DEBUG_m13
+	G_push_function_m13();
+#endif
+
+	// KOLMOGOROV-SMIRNOV statistic D = max |F_empirical - F_normal|, both CDFs normalized to [0,1]. Range
+	// [0,1]: 0 == indistinguishable from normal, 1 == maximally non-normal. A DEGRADATION measure (0 == clean),
+	// matching the polarity of the other noise scores.
+	//
+	// ⚠️ REWRITTEN 2026-08-07. It previously computed a PEARSON CORRELATION between the two CDFs, which is not
+	// a KS statistic despite the name. Any two monotone functions rising 0 -> 1 over the same support are
+	// highly correlated, so the statistic was pinned near 1 by construction & the discriminating signal lived
+	// in the 4th decimal: MEASURED over known distributions at 8192 samples, every non-degenerate case fell in
+	// [0.982, 1.000] - gaussian, uniform, sawtooth & laplace all quantized to the SAME byte, and a bimodal
+	// distribution reached only byte 4 of 254. The old CMP_KS_CORRECTION_m13 was an empirical fudge sized to
+	// drag that saturated statistic's ideal case onto exactly 1.0 - a symptom of a functional with no dynamic
+	// range, not an approximation better fitting could improve. True D needs no such constant.
+	//
+	// ⚠️ D is a BULK statistic: insensitive to a handful of extreme samples, because it is a supremum over the
+	// CDF & in the tails both CDFs are pinned near 0 or 1, so the deviation there is necessarily small.
+	// ⭐ This is INTRINSIC to KS, NOT a consequence of the +/-3.1 sigma table - MEASURED by widening the range
+	// to +/-4, 5, 6 & 8 sigma: every distribution moved less than 1%. Gross contamination IS caught (1% of
+	// samples at 12 sigma gives D = 0.102); only a few outliers pass unnoticed.
+	//
+	// The null expectation is subtracted so clean data reads ~0 at ANY block size - see CMP_KS_NULL_COEF_m13.
+
+	scores[CMP_NS_NON_NORMALITY_IDX_m13] = (sf8) 1.0;
+	CMP_noise_scores_m13(data, (si8) n_samps, scores, CMP_NS_NON_NORMALITY_SEL_m13);
+
+	return_m13(scores[CMP_NS_NON_NORMALITY_IDX_m13]);
 }
 
 
@@ -25737,6 +25990,195 @@ tern	CMP_lin_reg_si4_m13(si4 *input_buffer, si8 len, sf8 *m, sf8 *b)
 }
 
 
+tern	CMP_noise_scores_m13(si4 *data, si8 len, sf8 *scores, ui4 which)
+{
+	const sf8	*norm_cdf;
+	sf8		sx, sx2, mx, sd, val, z, H, Hmax, p, inv_n, d, dk, e, sn, sd2, r, run, tot, D, diff, ncdf_max;
+	si8		i, span, n_bins, bin, cnt[CMP_NS_ENTROPY_BINS_m13], kcnt[CMP_NORMAL_CDF_TABLE_ENTRIES_m13];
+	si4		mn, mx_i;
+
+#ifdef FT_DEBUG_m13
+	G_push_function_m13();
+#endif
+
+	// ONE implementation of the three library-computed noise scores, sharing their passes over the data.
+	// scores[] is sf8[CMP_NS_BYTES_m13] & each selected entry is written in [0,1]; unselected entries are left
+	// alone. Byte 0 (line noise) is not produced here - it needs the filter, not a pass over the samples.
+	//
+	// Merged because all three walk the SAME array: separately they cost five passes (entropy needs extrema
+	// then a histogram, normality needs mean/sd then a histogram, LLP needs one), and together they cost two.
+	// The selector keeps a single-score caller from paying for the others, so the wrappers below stay honest.
+	//
+	// Each score is documented at its wrapper: CMP_entropy_deficit_m13(), CMP_KS_score_m13(), CMP_LLP_score_m13().
+
+	if (data == NULL || scores == NULL || len < 1) {
+		G_set_error_m13(E_CMP_m13, "noise scores need data & at least one sample");
+		return_m13(FALSE_m13);
+	}
+
+	// ---- PASS 1: extrema, first two moments, & the LLP difference sums ---------------------------------
+	mn = mx_i = data[0];
+	sx = sx2 = sn = sd2 = (sf8) 0.0;
+	d = (len > 1) ? ((sf8) data[1] - (sf8) data[0]) : (sf8) 0.0;
+	for (i = 0; i < len; ++i) {
+		val = (sf8) data[i];
+		if (data[i] < mn)
+			mn = data[i];
+		else if (data[i] > mx_i)
+			mx_i = data[i];
+		sx += val;
+		sx2 += val * val;
+		if (i >= 2) {
+			dk = val - (sf8) data[i - 1];
+			e = d - dk;
+			sn += e * e;
+			sd2 += d * d;
+			d = dk;
+		}
+	}
+	mx = sx / (sf8) len;
+	sd = sqrt((sx2 / (sf8) len) - (mx * mx));
+
+	// ---- LLP (no second pass needed) ----------------------------------------------------------------------
+	if (which & CMP_NS_LLP_SEL_m13) {
+		if (len < 3 || sd2 <= (sf8) 0.0) {
+			r = (sf8) 0.0;
+		} else {
+			r = sqrt(sn / sd2) / sqrt((sf8) 3.0);
+			if (r > (sf8) 1.0)
+				r = (sf8) 1.0;
+		}
+		scores[CMP_NS_LLP_IDX_m13] = r;
+	}
+
+	if ((which & (CMP_NS_ENTROPY_DEFICIT_SEL_m13 | CMP_NS_NON_NORMALITY_SEL_m13)) == 0)
+		return_m13(TRUE_m13);
+
+	// ---- PASS 2: both histograms together ------------------------------------------------------------------
+	span = (si8) mx_i - (si8) mn + 1;
+	n_bins = (span < (si8) CMP_NS_ENTROPY_BINS_m13) ? span : (si8) CMP_NS_ENTROPY_BINS_m13;
+	if (n_bins < 1)
+		n_bins = 1;
+	memset((void *) cnt, 0, (size_t) n_bins * sizeof(si8));
+	memset((void *) kcnt, 0, sizeof(kcnt));
+	tot = (sf8) 0.0;
+	for (i = 0; i < len; ++i) {
+		val = (sf8) data[i];
+		if (span > 1) {
+			bin = (((si8) data[i] - (si8) mn) * n_bins) / span;
+			if (bin >= n_bins)
+				bin = n_bins - 1;
+			++cnt[bin];
+		}
+		z = (val - mx) / sd;
+		if (isnan(z))
+			continue;
+		bin = (si8) ((z + (sf8) 3.1) * (sf8) 10.0);
+		if (bin < 0)
+			bin = 0;
+		else if (bin >= CMP_NORMAL_CDF_TABLE_ENTRIES_m13)
+			bin = CMP_NORMAL_CDF_TABLE_ENTRIES_m13 - 1;
+		++kcnt[bin];
+		tot += (sf8) 1.0;
+	}
+
+	// ---- ENTROPY DEFICIT ------------------------------------------------------------------------------------
+	if (which & CMP_NS_ENTROPY_DEFICIT_SEL_m13) {
+		if (span <= 1) {
+			scores[CMP_NS_ENTROPY_DEFICIT_IDX_m13] = (sf8) 1.0;   // flat: no information
+		} else {
+			inv_n = (sf8) 1.0 / (sf8) len;
+			H = (sf8) 0.0;
+			for (i = 0; i < n_bins; ++i) {
+				if (cnt[i]) {
+					p = (sf8) cnt[i] * inv_n;
+					H -= p * log2(p);
+				}
+			}
+			Hmax = log2((sf8) n_bins);
+			if (Hmax <= (sf8) 0.0) {
+				scores[CMP_NS_ENTROPY_DEFICIT_IDX_m13] = (sf8) 1.0;
+			} else {
+				H = (sf8) 1.0 - (H / Hmax);
+				if (H < (sf8) 0.0) H = (sf8) 0.0;
+				else if (H > (sf8) 1.0) H = (sf8) 1.0;
+				scores[CMP_NS_ENTROPY_DEFICIT_IDX_m13] = H;
+			}
+		}
+	}
+
+	// ---- NORMALITY (Kolmogorov-Smirnov D, null corrected) ----------------------------------------------------
+	if (which & CMP_NS_NON_NORMALITY_SEL_m13) {
+		if (tot == (sf8) 0.0) {
+			scores[CMP_NS_NON_NORMALITY_IDX_m13] = (sf8) 1.0;   // a point mass is maximally non-normal
+		} else {
+			if (globals_m13->tables->CMP_normal_CDF_table == NULL)
+				CMP_init_tables_m13();
+			norm_cdf = globals_m13->tables->CMP_normal_CDF_table;
+			ncdf_max = norm_cdf[CMP_NORMAL_CDF_TABLE_ENTRIES_m13 - 1];
+			run = D = (sf8) 0.0;
+			for (i = 0; i < CMP_NORMAL_CDF_TABLE_ENTRIES_m13; ++i) {
+				run += (sf8) kcnt[i];
+				diff = (run / tot) - (norm_cdf[i] / ncdf_max);
+				if (diff < (sf8) 0.0)
+					diff = -diff;
+				if (diff > D)
+					D = diff;
+			}
+			D -= ((sf8) CMP_KS_NULL_COEF_m13 / sqrt(tot)) + (sf8) CMP_KS_NULL_FLOOR_m13;
+			if (D < (sf8) 0.0) D = (sf8) 0.0;
+			else if (D > (sf8) 1.0) D = (sf8) 1.0;
+			scores[CMP_NS_NON_NORMALITY_IDX_m13] = D;
+		}
+	}
+
+	return_m13(TRUE_m13);
+}
+
+
+sf8	CMP_LLP_score_m13(si4 *data, si8 len)
+{
+	sf8	scores[CMP_NS_BYTES_m13];
+
+#ifdef FT_DEBUG_m13
+	G_push_function_m13();
+#endif
+
+	// LOCAL LINEAR PREDICTION. The second difference is exactly the residual of predicting each sample by
+	// linear extrapolation from the two before it; normalizing by the first difference makes the statistic
+	// scale free. Returns [0,1]: 0 == perfectly predictable, 1 == at least as unpredictable as white noise.
+	//
+	// NORMALIZED BY sqrt(3), which is EXACT, not calibrated: for an iid sequence of variance v, Var(d1x) = 2v
+	// & Var(d2x) = 6v, so the white-noise ratio of standard deviations is sqrt(6/2) = sqrt(3).
+	//
+	// ⚠️ SUMS OF SQUARES, not absolute values. Under the absolute form the white-noise reference drifts with
+	// distribution shape - MEASURED gaussian 1.731, laplace 1.742, uniform 1.751, heavy-tailed 1.813, bimodal
+	// 1.940 - so merely non-gaussian data reads as noisier than white noise & clips. Under the RMS form the
+	// reference is sqrt(3) for ANY iid finite-variance sequence. On real data it matters: dataset y reads
+	// 1.579 under the absolute form but 1.500 under RMS. (An earlier MATLAB prototype used 1.75, which is
+	// sqrt(3) measured on UNIFORM white noise - rand, not randn.)
+	//
+	// The clip at 1 is meaningful: strong sample-to-sample alternation IS less predictable than white noise.
+	// A flat block returns 0 - perfectly predictable, which is true. The ENTROPY score is what separates
+	// flat-and-dead from smooth-and-real; these bytes are meant to be read as a vector.
+	// ⚠️ A random walk scores 0.816 (sqrt(2)/sqrt(3)), not near 0: its increments are unpredictable even though
+	// it looks smooth. And on a signal whose second difference falls below one quantization step, this measures
+	// the QUANTIZATION FLOOR rather than the signal.
+	//
+	// ⭐ USEFUL SIDE EFFECT: this ratio is a SPECTRAL SLOPE proxy, computed for free. Var(d2)/Var(d1) is
+	// 4*integral(sin^4 . S) / integral(sin^2 . S), which is 3 for a flat spectrum & falls as the spectrum
+	// steepens. MEASURED on synthetic noise at 1 kHz: white (f^0) 254, pink (1/f) 232, brown (1/f^2) 207.
+	// The background slope of neural data shifts in physiologically meaningful ways (state, depth of
+	// anaesthesia, pathology), so this byte carries more than a noise verdict - it tracks that slope, and
+	// nothing else in the block does.
+
+	scores[CMP_NS_LLP_IDX_m13] = (sf8) 0.0;
+	CMP_noise_scores_m13(data, len, scores, CMP_NS_LLP_SEL_m13);
+
+	return_m13(scores[CMP_NS_LLP_IDX_m13]);
+}
+
+
 tern	CMP_lock_buffers_m13(CMP_BUFFERS_m13 *buffers)
 {
 #ifdef FT_DEBUG_m13
@@ -25941,11 +26383,7 @@ si8	CMP_max_compressed_bytes_m13(CPS_m13 *cps, si8 block_samps, si8 n_blocks)
 	flags = cps->params.user_parameter_flags;
 	if (cps->direcs.flags & CPS_DF_DETREND_DATA_m13)
 		flags |= (CMP_PF_INTERCEPT_m13 | CMP_PF_GRADIENT_m13);
-	if (cps->direcs.flags & (CPS_DF_SET_AMPLITUDE_SCALE_m13 | CPS_DF_FIND_AMPLITUDE_SCALE_m13))
-		flags |= CMP_PF_AMPLITUDE_SCALE_m13;
-	if (cps->direcs.flags & (CPS_DF_SET_FREQUENCY_SCALE_m13 | CPS_DF_FIND_FREQUENCY_SCALE_m13))
-		flags |= CMP_PF_FREQUENCY_SCALE_m13;
-	if (cps->direcs.flags & CPS_DF_INCLUDE_NOISE_SCORES_m13)
+	if (cps->direcs.flags & CPS_DF_ALL_NOISE_SCORES_m13)  // any score requested => the block carries the parameter
 		flags |= CMP_PF_NOISE_SCORES_m13;
 	for (bit = 1, n_params = i = 0; i < CMP_PF_PARAMETER_FLAG_BITS_m13; ++i, bit <<= 1)
 		if (flags & bit)
@@ -26240,89 +26678,6 @@ si8	CMP_MBE_estimate_bytes_m13(CPS_m13 *cps, tern *use_raw, si4 *bits_per_sample
 }
 
 
-sf8	CMP_normality_score_m13(si4 *data, ui4 n_samps)
-{
-	const sf8	*norm_cdf;
-	sf8		sx, sx2, sy, sy2, sxy, mx, mx2, sd, val, z, r, n;
-	sf8		num, den1, den2, cdf[CMP_NORMAL_CDF_TABLE_ENTRIES_m13];
-	si8		i, count[CMP_NORMAL_CDF_TABLE_ENTRIES_m13] = {0};
-	si4		*si4_p, bin;
-	
-#ifdef FT_DEBUG_m13
-	G_push_function_m13();
-#endif
-
-	// Returns the correlation of the distribution in the data to that expected from a normal distribution.
-	// Essentially a Kolmogorov-Smirnov test normalized to range [-1 to 0) = 0 & [0 to 1] = [0 to 1]
-	
-	if (globals_m13->tables->CMP_normal_CDF_table == NULL)
-		CMP_init_tables_m13();
-	norm_cdf = globals_m13->tables->CMP_normal_CDF_table;
-
-	// calculate mean & standard deviation
-	n = (sf8) n_samps;
-	si4_p = data;
-	sx = sx2 = (sf8) 0.0;
-	for (i = n_samps; i--;) {
-		val = (sf8) *si4_p++;
-		sx += val;
-		sx2 += val * val;
-	}
-	mx = sx / n;
-	mx2 = sx2 / n;
-	sd = sqrt(mx2 - (mx * mx));
-	
-	// bin the samples
-	si4_p = data;
-	for (i = n_samps; i--;) {
-		val = (sf8) *si4_p++;
-		z = (val - mx) / sd;
-		if (isnan(z))
-			continue;
-		bin = (si4) ((z + (sf8) 3.1) * (sf8) 10.0);
-		if (bin < 0)
-			bin = 0;
-		else if (bin >= CMP_NORMAL_CDF_TABLE_ENTRIES_m13)
-			bin = CMP_NORMAL_CDF_TABLE_ENTRIES_m13 - 1;
-		++count[bin];
-	}
-	
-	// generate data CDF
-	cdf[0] = (sf8) count[0];
-	for (i = 1; i < CMP_NORMAL_CDF_TABLE_ENTRIES_m13; ++i)
-		cdf[i] = (sf8) count[i] + cdf[i - 1];
-	
-	// calculate correlation between data CDF and normal CDF
-	sx = sx2 = sxy = (sf8) 0.0;
-	sy = CMP_SUM_NORMAL_CDF_m13;
-	sy2 = CMP_SUM_SQ_NORMAL_CDF_m13;
-	for (i = 0; i < CMP_NORMAL_CDF_TABLE_ENTRIES_m13; ++i) {
-		sx += cdf[i];
-		sx2 += cdf[i] * cdf[i];
-		sxy += cdf[i] * norm_cdf[i];
-	}
-	
-	num = (n * sxy) - (sx * sy);
-	den1 = (n * sx2) - (sx * sx);
-	den2 = (n * sy2) - (sy * sy);
-	
-	//  handle rounding errors
-	if ((den1 <= (sf8) 0.0) || (den2 <= (sf8) 0.0))
-		r = (sf8) 0.0;
-	else
-		r = num / (sqrt(den1) * sqrt(den2));
-	
-	// calculate Kolmogorov Smirnov correlation
-	r += CMP_KS_CORRECTION_m13;
-	if (r < (sf8) 0.0)
-		r = (sf8) 0.0;
-	else if (r > (sf8) 1.0)
-		r = (sf8) 1.0;
-	
-	return_m13(r);
-}
-
-
 // Bytes RED emits per overflow value, from the stream's extrema. Pure: no CPS or header is touched, so the
 // estimators can call it on hypothetical extrema (SRRED needs it on the SCALED stream, i.e. extrema x scale)
 // without the header-stamping side effect CMP_get_overflow_bytes_m13() performs for the encoder.
@@ -26577,7 +26932,12 @@ tern	CMP_PRED1_encode_m13(CPS_m13 *cps)
 	
 	PRED_header = (CMP_PRED_MODEL_FIXED_HDR_m13 *) cps->params.model_region;
 	n_samps = bh->number_of_samples;
-	PRED_header->flags = (ui1) 0;
+	PRED_header->flags = (ui2) 0;
+	// pad is WRITTEN TO THE FILE, so it must be deterministic. model_region is a reused CPS buffer &
+	// nothing anywhere assigns pad, so it otherwise carries bytes left by whatever block used the buffer
+	// before: byte-identical re-encoding is impossible, & arbitrary heap contents land in a WORM archive.
+	// (These are also the bytes a per-block derivative offset would live in - see the offset design.)
+	memset(PRED_header->pad, 0, sizeof(PRED_header->pad));
 
 	// zero or one or samples
 	if (n_samps <= 1) {
@@ -27090,7 +27450,12 @@ tern	CMP_PRED2_encode_m13(CPS_m13 *cps)
 	
 	PRED_header = (CMP_PRED_MODEL_FIXED_HDR_m13 *) cps->params.model_region;
 	n_samps = bh->number_of_samples;
-	PRED_header->flags = (ui1) 0;
+	PRED_header->flags = (ui2) 0;
+	// pad is WRITTEN TO THE FILE, so it must be deterministic. model_region is a reused CPS buffer &
+	// nothing anywhere assigns pad, so it otherwise carries bytes left by whatever block used the buffer
+	// before: byte-identical re-encoding is impossible, & arbitrary heap contents land in a WORM archive.
+	// (These are also the bytes a per-block derivative offset would live in - see the offset design.)
+	memset(PRED_header->pad, 0, sizeof(PRED_header->pad));
 
 	// zero or one or samples
 	if (n_samps <= 1) {
@@ -27511,7 +27876,7 @@ CPS_m13		*CMP_realloc_CPS_m13(FPS_m13 *fps, ui4 compression_mode, si8 data_sampl
 	ui4			new_val;
 	si4			i;
 	si8			new_compressed_bytes, new_keysample_bytes, new_decompressed_samples;
-	si8			mem_units_used, mem_units_avail, pad_samples;
+	si8			mem_units_used, mem_units_avail, pad_samples, block_header_offset;
 	CPS_m13			*cps;
 	PROC_GLOBS_m13		*pg;
 	CHAN_m13		*chan;
@@ -27562,8 +27927,13 @@ CPS_m13		*CMP_realloc_CPS_m13(FPS_m13 *fps, ui4 compression_mode, si8 data_sampl
 					realloc_flag = TRUE_m13;
 				}
 			}
-			if (cps->params.allocated_decompressed_samples) {
-				mem_units_used = cps->decompressed_ptr - cps->decompressed_data;
+			if (cps->params.allocated_decompressed_samples > 0) {
+				// extent measured from params.cache, the REAL base: decompressed_data is the shallow caller's
+				// view (cache + offset, see CMP_decode_m13() & G_read_time_series_data_m13()) &
+				// allocated_decompressed_samples sizes the whole cache. Measuring the used extent from
+				// decompressed_data instead dropped the (decompressed_data - cache) offset, over-reporting the
+				// space left by exactly that offset - so a cache that needed to grow could be judged big enough.
+				mem_units_used = cps->decompressed_ptr - cps->params.cache;
 				mem_units_avail = cps->params.allocated_decompressed_samples - mem_units_used;
 				if (mem_units_avail < block_samples) {
 					new_decompressed_samples = mem_units_used + block_samples;
@@ -27572,8 +27942,8 @@ CPS_m13		*CMP_realloc_CPS_m13(FPS_m13 *fps, ui4 compression_mode, si8 data_sampl
 			}
 			break;
 		case CMP_DECOMPRESSION_MODE_m13:
-			if (cps->params.allocated_decompressed_samples != CMP_SELF_MANAGED_MEMORY_m13) {
-				mem_units_used = cps->decompressed_ptr - cps->decompressed_data;
+			if (cps->params.allocated_decompressed_samples > 0) {  // see the note above
+				mem_units_used = cps->decompressed_ptr - cps->params.cache;
 				mem_units_avail = cps->params.allocated_decompressed_samples - mem_units_used;
 				if (mem_units_avail < data_samples) {
 					new_decompressed_samples = mem_units_used + data_samples;
@@ -27589,9 +27959,32 @@ CPS_m13		*CMP_realloc_CPS_m13(FPS_m13 *fps, ui4 compression_mode, si8 data_sampl
 	if (realloc_flag == FALSE_m13)
 		return_m13(cps);
 
-	// reallocate (free & alloc for speed - don't copy data)
-	if (new_compressed_bytes) // FPS_reallocate_m13() resets cps->block_header for time series data fps
-		FPS_realloc_m13(fps, new_compressed_bytes);
+	// CALLER-OWNED buffers are never freed & never moved, so a needed growth cannot be satisfied - fail LOUDLY
+	// rather than proceed into a buffer we cannot grow. The sizes above are true (ownership is a directive, not
+	// a sentinel in the size field), so this is a real bounds check & not a guess.
+	if (new_decompressed_samples && (cps->direcs.flags & CPS_DF_CALLER_OWNS_DECOMPRESSED_m13)) {
+		G_set_error_m13(E_CMP_m13, "caller-owned decompressed buffer holds %ld samples but %ld are needed", cps->params.allocated_decompressed_samples, new_decompressed_samples);
+		return_m13(NULL);
+	}
+	if (new_compressed_bytes && (cps->direcs.flags & CPS_DF_CALLER_OWNS_COMPRESSED_m13)) {
+		G_set_error_m13(E_CMP_m13, "caller-owned compressed buffer holds %ld bytes but %ld are needed", cps->params.allocated_compressed_bytes, new_compressed_bytes);
+		return_m13(NULL);
+	}
+
+	// reallocate. SCRATCH buffers below are free & alloc (nothing in them outlives the block); the DECOMPRESSED
+	// cache is copied, since its whole purpose is to survive (see the note at that branch).
+	if (new_compressed_bytes) {
+		// FPS_realloc_m13() PRESERVES the buffer contents (recalloc_m13) but resets cps->block_header to the BASE
+		// of the data region. In compression mode that pointer is the WRITE CURSOR for the next block, & any
+		// blocks already encoded but not yet written to disk sit behind it - so the reset made the next block
+		// header land on top of BLOCK 0: bytes kept, cursor lost, which is worse than a clean discard because the
+		// caller has no way to know. Capture the offset before the buffer moves & restore it after.
+		// NOTE: mem_units_used cannot be reused here - the decompressed branch of the switch above overwrites it.
+		block_header_offset = (ui1 *) cps->block_header - fps->ts_data;
+		if (FPS_realloc_m13(fps, new_compressed_bytes) == FALSE_m13)
+			goto CMP_REALLOC_CPS_FAIL_m13;
+		cps->block_header = (CMP_FIXED_BH_m13 *) (fps->ts_data + block_header_offset);
+	}
 	
 	if (new_keysample_bytes) {
 		free_m13((void * ) cps->params.keysample_buffer);
@@ -27601,11 +27994,37 @@ CPS_m13		*CMP_realloc_CPS_m13(FPS_m13 *fps, ui4 compression_mode, si8 data_sampl
 	}
 	
 	if (new_decompressed_samples) {
-		if (cps->decompressed_data)
-			free_m13((void * ) cps->params.cache);
-		if ((cps->decompressed_data = cps->decompressed_ptr = cps->params.cache = (si4 *) calloc_m13((size_t) new_decompressed_samples, sizeof(si4))) == NULL)
+		// PRESERVE the decode cache across the grow. params.cache is the real base; decompressed_data is the
+		// shallow caller's view into it & decompressed_ptr its movable index. The cache exists so that blocks
+		// already read & decoded are not re-read & re-decompressed when the next request is contiguous, so
+		// free+calloc here silently threw away exactly what the cache is for - & reset both pointers to the
+		// base, moving the caller's array out from under it. Copy the window, then re-derive both pointers from
+		// their old offsets off the new base.
+		// Needing to grow at all is normally a CALLER sizing error (DATA buffers are the caller's contract - see
+		// CMP_fit_CPS_scratch_m13() for what the library owns), hence the warning: handled, but not silently.
+		si4	*new_cache;
+		si8	old_samples, data_offset, ptr_offset;
+
+		if ((new_cache = (si4 *) calloc_m13((size_t) new_decompressed_samples, sizeof(si4))) == NULL)
 			goto CMP_REALLOC_CPS_FAIL_m13;
-		cps->params.allocated_decompressed_samples = calloc_size_m13(cps->decompressed_data, sizeof(si4));
+		data_offset = ptr_offset = 0;
+		if (cps->params.cache) {
+			old_samples = cps->params.allocated_decompressed_samples;
+			if (old_samples > new_decompressed_samples)  // never on a grow, but the copy must not outrun either block
+				old_samples = new_decompressed_samples;
+			if (old_samples > 0)
+				memcpy((void *) new_cache, (void *) cps->params.cache, (size_t) old_samples * sizeof(si4));
+			data_offset = cps->decompressed_data - cps->params.cache;
+			ptr_offset = cps->decompressed_ptr - cps->params.cache;
+			free_m13((void * ) cps->params.cache);
+		}
+		cps->params.cache = new_cache;
+		cps->decompressed_data = new_cache + data_offset;
+		cps->decompressed_ptr = new_cache + ptr_offset;
+		cps->params.allocated_decompressed_samples = calloc_size_m13(new_cache, sizeof(si4));
+		if (cps->params.allocated_decompressed_samples == 0)  // size query unavailable (MATLAB persistent): use the requested size
+			cps->params.allocated_decompressed_samples = new_decompressed_samples;
+		G_warning_message_m13("%s(): decompressed data buffer grown to %ld samples - caller under-sized the CPS data buffer\n", __FUNCTION__, cps->params.allocated_decompressed_samples);
 	}
 		
 	// reallocate the following if they were previously allocated
@@ -27642,16 +28061,6 @@ CPS_m13		*CMP_realloc_CPS_m13(FPS_m13 *fps, ui4 compression_mode, si8 data_sampl
 				goto CMP_REALLOC_CPS_FAIL_m13;
 		}
 
-		if (cps->params.scaled_amplitude_buffer) {
-			free_m13((void * ) cps->params.scaled_amplitude_buffer);
-			if ((cps->params.scaled_amplitude_buffer = (si4 *) calloc_m13((size_t) block_samples, sizeof(si4))) == NULL)
-				goto CMP_REALLOC_CPS_FAIL_m13;
-		}
-		if (cps->params.scaled_frequency_buffer) {
-			free_m13((void * ) cps->params.scaled_frequency_buffer);
-			if ((cps->params.scaled_frequency_buffer = (si4 *) calloc_m13((size_t) block_samples, sizeof(si4))) == NULL)
-				goto CMP_REALLOC_CPS_FAIL_m13;
-		}
 		if (cps->params.VDS_input_buffers) {
 			if (compression_mode == CMP_COMPRESSION_MODE_m13)
 				pad_samples = CMP_VDS_LOWPASS_ORDER_m13 * 6;
@@ -27915,7 +28324,12 @@ tern	CMP_RED1_encode_m13(CPS_m13 *cps)
 
 	RED_header = (CMP_RED_MODEL_FIXED_HDR_m13 *) cps->params.model_region;
 	n_samps = bh->number_of_samples;
-	RED_header->flags = (ui1) 0;
+	RED_header->flags = (ui2) 0;
+	// pad is WRITTEN TO THE FILE, so it must be deterministic. model_region is a reused CPS buffer &
+	// nothing anywhere assigns pad, so it otherwise carries bytes left by whatever block used the buffer
+	// before: byte-identical re-encoding is impossible, & arbitrary heap contents land in a WORM archive.
+	// (These are also the bytes a per-block derivative offset would live in - see the offset design.)
+	memset(RED_header->pad, 0, sizeof(RED_header->pad));
 
 	// zero or one or samples
 	if (n_samps <= 1) {
@@ -27944,14 +28358,12 @@ tern	CMP_RED1_encode_m13(CPS_m13 *cps)
 
 	// set model parameters
 	RED_header->derivative_level = n_derivs;
-	// Selected by DIRECTIVE (a caller promise), never inferred from the data - see CPS_DF_POSITIVE_DERIVATIVES_m13
-	// in medlib_m13.h for why the old "minimum_difference_value > 0" sniff was removed 2026-08-02.
-	if (n_derivs && (cps->direcs.flags & CPS_DF_POSITIVE_DERIVATIVES_m13)) {
-		pos_derivs = TRUE_m13;
-		RED_header->flags |= CMP_RED_FLAGS_POSITIVE_DERIVATIVES_m13;
-	} else {
-		pos_derivs = FALSE_m13;
-	}
+	// RETIRED 2026-08-06: the all-positive model is no longer emitted. The per-block derivative offset covers
+	// the same ground (it places the 255-value window where the data is, instead of assuming 128) and covers
+	// more of it, so its last caller - VDS times - now relies on the offset. DECODERS still honour the flag:
+	// files in the wild may carry it, because before 2026-08-02 it was set by an auto-detect sniff that fired
+	// on ordinary sample data. ⚠️ Do NOT reuse bit 1 (see CMP_RED_FLAGS_POSITIVE_DERIVATIVES_m13).
+	pos_derivs = FALSE_m13;
 	if (cps->direcs.flags & CPS_DF_NO_ZERO_COUNTS_m13) {
 		no_zero_counts = TRUE_m13;
 		RED_header->flags |= CMP_RED_FLAGS_NO_ZERO_COUNTS_m13;
@@ -27961,13 +28373,8 @@ tern	CMP_RED1_encode_m13(CPS_m13 *cps)
 	overflow_bytes = CMP_get_overflow_bytes_m13(cps, CMP_COMPRESSION_MODE_m13, CMP_RED_COMPRESSION_m13);
 
 	// generate count & build keysample array
-	if (pos_derivs == TRUE_m13) {
-		low_d = 1; high_d = 255;
-		ks_flag = CMP_POS_DERIV_KEYSAMPLE_FLAG_m13;  // == 0 (non-overflow range: 1 to 255)
-	} else {
-		low_d = -127; high_d = 127;
-		ks_flag = CMP_UI1_KEYSAMPLE_FLAG_m13;  // == -128 (non-overflow range: -127 to +127)
-	}
+	
+	CMP_derivative_window_m13(pos_derivs, &low_d, &high_d, &ks_flag);
 	memset(count, 0, CMP_RED_MAX_STATS_BINS_m13 * sizeof(ui4));
 	
 	key_p = (ui1 *) cps->params.keysample_buffer;
@@ -28436,7 +28843,12 @@ tern	CMP_RED2_encode_m13(CPS_m13 *cps)
 
 	RED_header = (CMP_RED_MODEL_FIXED_HDR_m13 *) cps->params.model_region;
 	n_samps = bh->number_of_samples;
-	RED_header->flags = (ui1) 0;
+	RED_header->flags = (ui2) 0;
+	// pad is WRITTEN TO THE FILE, so it must be deterministic. model_region is a reused CPS buffer &
+	// nothing anywhere assigns pad, so it otherwise carries bytes left by whatever block used the buffer
+	// before: byte-identical re-encoding is impossible, & arbitrary heap contents land in a WORM archive.
+	// (These are also the bytes a per-block derivative offset would live in - see the offset design.)
+	memset(RED_header->pad, 0, sizeof(RED_header->pad));
 
 	// zero or one or samples
 	if (n_samps <= 1) {
@@ -28468,14 +28880,12 @@ tern	CMP_RED2_encode_m13(CPS_m13 *cps)
 
 	// set model parameters
 	RED_header->derivative_level = n_derivs;
-	// Selected by DIRECTIVE (a caller promise), never inferred from the data - see CPS_DF_POSITIVE_DERIVATIVES_m13
-	// in medlib_m13.h for why the old "minimum_difference_value > 0" sniff was removed 2026-08-02.
-	if (n_derivs && (cps->direcs.flags & CPS_DF_POSITIVE_DERIVATIVES_m13)) {
-		pos_derivs = TRUE_m13;
-		RED_header->flags |= CMP_RED_FLAGS_POSITIVE_DERIVATIVES_m13;
-	} else {
-		pos_derivs = FALSE_m13;
-	}
+	// RETIRED 2026-08-06: the all-positive model is no longer emitted. The per-block derivative offset covers
+	// the same ground (it places the 255-value window where the data is, instead of assuming 128) and covers
+	// more of it, so its last caller - VDS times - now relies on the offset. DECODERS still honour the flag:
+	// files in the wild may carry it, because before 2026-08-02 it was set by an auto-detect sniff that fired
+	// on ordinary sample data. ⚠️ Do NOT reuse bit 1 (see CMP_RED_FLAGS_POSITIVE_DERIVATIVES_m13).
+	pos_derivs = FALSE_m13;
 	if (cps->direcs.flags & CPS_DF_NO_ZERO_COUNTS_m13) {
 		no_zero_counts = TRUE_m13;
 		RED_header->flags |= CMP_RED_FLAGS_NO_ZERO_COUNTS_m13;
@@ -28485,13 +28895,8 @@ tern	CMP_RED2_encode_m13(CPS_m13 *cps)
 	overflow_bytes = CMP_get_overflow_bytes_m13(cps, CMP_COMPRESSION_MODE_m13, CMP_RED_COMPRESSION_m13);
 
 	// generate count & build keysample array
-	if (pos_derivs == TRUE_m13) {
-		low_d = 1; high_d = 255;
-		ks_flag = CMP_POS_DERIV_KEYSAMPLE_FLAG_m13;  // == 0 (non-overflow range: 1 to 255)
-	} else {
-		low_d = -127; high_d = 127;
-		ks_flag = CMP_UI1_KEYSAMPLE_FLAG_m13;  // == -128 (non-overflow range: -127 to +127)
-	}
+	
+	CMP_derivative_window_m13(pos_derivs, &low_d, &high_d, &ks_flag);
 	memset(count, 0, CMP_RED_MAX_STATS_BINS_m13 * sizeof(ui4));
 	
 	key_p = (ui1 *) cps->params.keysample_buffer;
@@ -28738,7 +29143,7 @@ sf8	CMP_RED_estimate_bytes_m13(ui4 *cnts, si8 n_bins)
 	const sf8	*LT;
 
 	LT = globals_m13->tables->CMP_log_table;
-	if (LT == NULL) {  // lazy table init (as in CMP_normality_score_m13() etc.)
+	if (LT == NULL) {  // lazy table init (as in CMP_KS_score_m13() etc.)
 		CMP_init_tables_m13();
 		LT = globals_m13->tables->CMP_log_table;
 	}
@@ -28867,68 +29272,6 @@ si4	CMP_round_si4_m13(sf8 val)
 }
 
 
-tern	CMP_scale_amplitude_si4_m13(si4 *input_buffer, si4 *output_buffer, si8 len, sf8 scale_factor, CPS_m13 *cps)
-{
-	si4	*si4_p1, *si4_p2;
-	sf4	sf4_scale;
-	sf8	inv_scale_factor;
-	
-#ifdef FT_DEBUG_m13
-	G_push_function_m13();
-#endif
-
-	// scale from input_buffer to output_buffer
-	// if input_buffer == output_buffer scaling will be done in place
-	
-	// store scale in block parameter region
-	// NOTE: block parameter region must be setup first
-	if (cps) {
-		// demote precision
-		sf4_scale = (sf4) scale_factor;
-		// store
-		*((sf4 *) cps->block_parameters + cps->params.block_parameter_map[CMP_PF_AMPLITUDE_SCALE_IDX_m13]) = scale_factor;
-		// promote back to sf8 (having only sf4 precision)
-		scale_factor = (sf8) sf4_scale;
-	}
-	
-	si4_p1 = input_buffer;
-	si4_p2 = output_buffer;
-	inv_scale_factor = (sf8) 1.0 / scale_factor;  // multiplication faster than division on most systems
-	while (len--)
-		*si4_p2++ = CMP_round_si4_m13((sf8) *si4_p1++ * inv_scale_factor);
-
-	return_m13(TRUE_m13);
-}
-
-
-tern	CMP_scale_frequency_si4_m13(si4 *input_buffer, si4 *output_buffer, si8 len, sf8 scale_factor, CPS_m13 *cps)
-{
-	sf4	sf4_scale;
-	
-#ifdef FT_DEBUG_m13
-	G_push_function_m13();
-#endif
-
-	// scale from input_buffer to output_buffer
-	// if input_buffer == output_buffer scaling will be done in place
-	
-	// store scale in block parameter region
-	// NOTE: block parameter region must be setup first
-	if (cps) {
-		// demote precision
-		sf4_scale = (sf4) scale_factor;
-		// store
-		*((sf4 *) cps->block_parameters + cps->params.block_parameter_map[CMP_PF_FREQUENCY_SCALE_IDX_m13]) = scale_factor;
-		// promote back to sf8 (having only sf4 precision)
-		scale_factor = (sf8) sf4_scale;
-	}
-	
-	// actual frequency scaling not written yet
-	
-	return_m13(TRUE_m13);
-}
-
-
 tern	CMP_set_variable_region_m13(CPS_m13 *cps)
 {
 	ui1			*var_reg_ptr;
@@ -28961,17 +29304,7 @@ tern	CMP_set_variable_region_m13(CPS_m13 *cps)
 	else
 		bh->parameter_flags &= ~(CMP_PF_INTERCEPT_m13 | CMP_PF_GRADIENT_m13);
 	
-	if (cps->direcs.flags & CPS_DF_SET_AMPLITUDE_SCALE_m13 || cps->direcs.flags & CPS_DF_FIND_AMPLITUDE_SCALE_m13)
-		bh->parameter_flags |= CMP_PF_AMPLITUDE_SCALE_m13;
-	else
-		bh->parameter_flags &= ~CMP_PF_AMPLITUDE_SCALE_m13;
-	
-	if (cps->direcs.flags & CPS_DF_SET_FREQUENCY_SCALE_m13 || cps->direcs.flags & CPS_DF_FIND_FREQUENCY_SCALE_m13)
-		bh->parameter_flags |= CMP_PF_FREQUENCY_SCALE_m13;
-	else
-		bh->parameter_flags &= ~CMP_PF_FREQUENCY_SCALE_m13;
-	
-	if (cps->direcs.flags & CPS_DF_INCLUDE_NOISE_SCORES_m13)
+	if (cps->direcs.flags & CPS_DF_ALL_NOISE_SCORES_m13)
 		bh->parameter_flags |= CMP_PF_NOISE_SCORES_m13;
 	else
 		bh->parameter_flags &= ~CMP_PF_NOISE_SCORES_m13;
@@ -29320,7 +29653,7 @@ tern	CMP_show_block_model_m13(CPS_m13 *cps, tern recursed_call)
 		case CMP_BF_SRRED_ENCODING_m13:
 			SRRED_model_region = cps->params.model_region;
 			SRRED_header = (CMP_SRRED_MODEL_FIXED_HDR_m13 *) SRRED_model_region;
-			algorithm = SRRED_header->flags & CMP_SRRED_SCALED_ALGORITHMS_MASK_m13;
+			algorithm = SRRED_header->flags & CMP_SRRED_FLAGS_SCALED_ALGORITHMS_MASK_m13;
 			switch (algorithm) {
 				case CMP_SRRED_FLAGS_SCALED_PRED_m13:
 					scaled_alg = "PRED";
@@ -29331,7 +29664,7 @@ tern	CMP_show_block_model_m13(CPS_m13 *cps, tern recursed_call)
 					scaled_alg_flag = CMP_BF_MBE_ENCODING_m13;
 					break;
 			}
-			algorithm = SRRED_header->flags & CMP_SRRED_RESIDUALS_ALGORITHMS_MASK_m13;
+			algorithm = SRRED_header->flags & CMP_SRRED_FLAGS_RESIDUALS_ALGORITHMS_MASK_m13;
 			switch (algorithm) {
 				case CMP_SRRED_FLAGS_RESIDUALS_RED_m13:
 					resid_alg = "RED";
@@ -29435,7 +29768,7 @@ tern	CMP_show_block_model_m13(CPS_m13 *cps, tern recursed_call)
 					time_alg_flag = CMP_BF_MBE_ENCODING_m13;
 					break;
 			}
-			printf_m13("Model: Vectorized Data Stream (VDS)\n");
+			printf_m13("Model: Variably Decimated Stream (VDS)\n");
 			printf_m13("Number of VDS Samples: %u\n", VDS_header->n_VDS_samples);
 			printf_m13("Amplitude Block Total Bytes: %u\n", VDS_header->amplitude_block_total_bytes);
 			printf_m13("Amplitude Block Model: %s\n", amp_alg);
@@ -29773,7 +30106,7 @@ tern	CMP_SRRED_decode_m13(CPS_m13 *cps)
 	cps->params.model_region = (ui1 *) bh + (si8) SRRED_total_header_bytes;
 	bh->total_header_bytes = SRRED_total_header_bytes + SRRED_header->scaled_block_model_bytes;
 	bh->model_region_bytes = SRRED_header->scaled_block_model_bytes;
-	algorithm = SRRED_header->flags & CMP_SRRED_SCALED_ALGORITHMS_MASK_m13;
+	algorithm = SRRED_header->flags & CMP_SRRED_FLAGS_SCALED_ALGORITHMS_MASK_m13;
 	switch (algorithm) {
 		case CMP_SRRED_FLAGS_SCALED_PRED_m13:  // retained for robustness; encoder now uses RED for the scaled stream
 			CMP_PRED2_decode_m13(cps);  // decoders build their models locally from the block; no RED/PRED buffer swap needed
@@ -29797,7 +30130,7 @@ tern	CMP_SRRED_decode_m13(CPS_m13 *cps)
 	bh->total_header_bytes = SRRED_total_header_bytes + SRRED_header->scaled_block_total_bytes + SRRED_header->residuals_block_model_bytes;
 	cps->params.model_region = (ui1 *) bh + (si8) SRRED_total_header_bytes + (si8) SRRED_header->scaled_block_total_bytes;
 	bh->model_region_bytes = SRRED_header->residuals_block_model_bytes;
-	algorithm = SRRED_header->flags & CMP_SRRED_RESIDUALS_ALGORITHMS_MASK_m13;
+	algorithm = SRRED_header->flags & CMP_SRRED_FLAGS_RESIDUALS_ALGORITHMS_MASK_m13;
 	switch (algorithm) {
 		case CMP_SRRED_FLAGS_RESIDUALS_RED_m13:
 			CMP_RED2_decode_m13(cps);
@@ -29858,6 +30191,11 @@ tern	CMP_SRRED_encode_m13(CPS_m13 *cps)
 	bh = cps->block_header;
 	SRRED_model_region = cps->params.model_region;
 	SRRED_header = (CMP_SRRED_MODEL_FIXED_HDR_m13 *) SRRED_model_region;
+	// SRRED's flags were never initialised - the two sites below only clear the bits they own
+	// (&= ~SCALED_MASK, &= ~RESIDUALS_MASK), so bits 4-15 carried whatever the reused model buffer held
+	// & any flag bit added later would read as randomly set. Same reason pad must be deterministic.
+	SRRED_header->flags = (ui2) 0;
+	SRRED_header->pad = (ui1) 0;
 	
 	// Find the scale & derivative level for this block. The windowed tracker in CMP_SRRED_find_parameters_m13() is
 	// count-domain & cheap, so it runs EVERY block - tracking the optimal scale block-to-block, with the first block &
@@ -29978,7 +30316,7 @@ tern	CMP_SRRED_encode_m13(CPS_m13 *cps)
 	// set SRRED header values
 	SRRED_header->scaled_block_total_bytes = bh->total_block_bytes - SRRED_total_header_bytes; // at this point bh->total_block_bytes == CMP block header + SRRED header + scaled RED block
 	SRRED_header->scaled_block_model_bytes = bh->model_region_bytes;  // from CMP_PRED2_encode_m13()
-	SRRED_header->flags &= ~CMP_SRRED_SCALED_ALGORITHMS_MASK_m13;
+	SRRED_header->flags &= ~CMP_SRRED_FLAGS_SCALED_ALGORITHMS_MASK_m13;
 	algorithm = bh->block_flags & CMP_BF_ALGORITHMS_MASK_m13;
 	switch (algorithm) {
 		case CMP_BF_PRED2_ENCODING_m13:
@@ -30007,7 +30345,7 @@ tern	CMP_SRRED_encode_m13(CPS_m13 *cps)
 	cps->params.minimum_difference_value = block_diff_min;
 	cps->params.maximum_difference_value = block_diff_max;
 	SRRED_header->residuals_block_model_bytes = bh->model_region_bytes;  // from CMP_RED2_encode_m13()
-	SRRED_header->flags &= ~CMP_SRRED_RESIDUALS_ALGORITHMS_MASK_m13;
+	SRRED_header->flags &= ~CMP_SRRED_FLAGS_RESIDUALS_ALGORITHMS_MASK_m13;
 	algorithm = bh->block_flags & CMP_BF_ALGORITHMS_MASK_m13;
 	switch (algorithm) {
 		case CMP_BF_RED2_ENCODING_m13:
@@ -30536,7 +30874,12 @@ tern    CMP_SSE_encode_m13(CPS_m13 *cps)
 
 	SSE_header = (CMP_SSE_MODEL_FIXED_HDR_m13 *) cps->params.model_region;
 	n_samps = bh->number_of_samples;
-	SSE_header->flags = (ui1) 0;
+	SSE_header->flags = (ui2) 0;
+	// pad is WRITTEN TO THE FILE, so it must be deterministic. model_region is a reused CPS buffer &
+	// nothing anywhere assigns pad, so it otherwise carries bytes left by whatever block used the buffer
+	// before: byte-identical re-encoding is impossible, & arbitrary heap contents land in a WORM archive.
+	// (These are also the bytes a per-block derivative offset would live in - see the offset design.)
+	memset(SSE_header->pad, 0, sizeof(SSE_header->pad));
 
 	// zero or one or samples
 	if (n_samps <= 1) {
@@ -30754,6 +31097,18 @@ tern	CMP_swap_RED_PRED_m13(CPS_m13 *cps, tern RED_to_PRED)
 	// RED->PRED direction further down. Such a CPS is simply already in RED state: it falls to the "count is
 	// allocated" branch. Reachable from CMP_get_counts_m13(), which calls this unconditionally, so a RED2 encode
 	// with the FIND_DERIVATIVE_LEVEL directive set used to SIGSEGV here.
+	// NEITHER allocated must be caught FIRST. It is a legal, common state - decompression mode sets
+	// PRED_base_count = count = NULL for the whole PRED family (decode reads its model out of the block, so it
+	// needs no count buffers), and an MBE-allocated CPS has neither in either mode. Without this test the
+	// "count == PRED_base_count" below is satisfied by NULL == NULL and the state reads as "currently PRED";
+	// a PRED->RED request then walks past the RED_to_PRED guard (which only covers a missing DESTINATION) and
+	// dereferences NULL at "count = *((void **) PRED_base_count)". Failing cleanly here costs nothing & the
+	// caller gets the error the other two impossible-state branches already give.
+	if (cps->params.count == NULL && cps->params.PRED_base_count == NULL) {
+		G_set_error_m13(E_CMP_m13, "neither RED nor PRED buffers are allocated");
+		return_m13(FALSE_m13);
+	}
+
 	if (cps->params.count == cps->params.PRED_base_count) {
 		RED_current = FALSE_m13;
 	} else if (cps->params.PRED_base_count != NULL && cps->params.count == *((void **) cps->params.PRED_base_count)) {
@@ -30952,49 +31307,6 @@ tern	CMP_unlock_buffers_m13(CMP_BUFFERS_m13 *buffers)
 }
 
 
-tern	CMP_unscale_amplitude_sf8_m13(sf8 *input_buffer, sf8 *output_buffer, si8 len, sf8 scale_factor)
-{
-#ifdef FT_DEBUG_m13
-	G_push_function_m13();
-#endif
-
-	// unscale from input_buffer to output_buffer
-	// if input_buffer == output_buffer unscaling will be done in place
-	
-	while (len--)
-		*output_buffer++ = *input_buffer++ * scale_factor;
-
-	return_m13(TRUE_m13);
-}
-
-
-tern	CMP_unscale_amplitude_si4_m13(si4 *input_buffer, si4 *output_buffer, si8 len, sf8 scale_factor)
-{
-#ifdef FT_DEBUG_m13
-	G_push_function_m13();
-#endif
-
-	// unscale from input_buffer to output_buffer
-	// if input_buffer == output_buffer unscaling will be done in place
-	
-	while (len--)
-		*output_buffer++ = CMP_round_si4_m13((sf8) *input_buffer++ * scale_factor);
-
-	return_m13(TRUE_m13);
-}
-
-
-tern	CMP_unscale_frequency_si4_m13(si4 *input_buffer, si4 *output_buffer, si8 len, sf8 scale_factor)
-{
-#ifdef FT_DEBUG_m13
-	G_push_function_m13();
-#endif
-
-	// not written yet
-	return_m13(TRUE_m13);
-}
-
-
 CMP_FIXED_BH_m13	*CMP_update_CPS_pointers_m13(FPS_m13 *fps, ui1 flags)
 {
 	CMP_FIXED_BH_m13	*bh;
@@ -31047,9 +31359,8 @@ tern	CMP_VDS_decode_m13(CPS_m13 *cps)
 	ui4				VDS_total_header_bytes, n_samples, algorithm;
 	ui4				start_sample;
 	si4				*si4_p;
-	sf4				*sf4_p;
-	si8				i, *si8_p, offset, *in_x;
-	sf8				amplitude_scale, *in_y, *out_x, *out_y, *sf8_p, val;
+	si8				i, *si8_p, *in_x;
+	sf8				*in_y, *out_x, *out_y, *sf8_p, val;
 	void				*saved_cumulative_count_p, *saved_minimum_range_p;
 	tern				vds_borrowed;
 	CMP_FIXED_BH_m13		*bh;
@@ -31125,14 +31436,6 @@ tern	CMP_VDS_decode_m13(CPS_m13 *cps)
 
 	// copy amplitudes to sf8 buffer
 	CMP_si4_to_sf8_m13(cps->decompressed_ptr, in_y, (si8) VDS_header->n_VDS_samples);
-
-	// apply amplitude scaling (if applied) here (b/c fewer samples)
-	if (bh->parameter_flags & CMP_PF_AMPLITUDE_SCALE_m13) {
-		sf4_p = (sf4 *) cps->block_parameters;
-		offset = (si8) cps->params.block_parameter_map[CMP_PF_AMPLITUDE_SCALE_IDX_m13];
-		amplitude_scale = (sf8) *(sf4_p + offset);
-		CMP_unscale_amplitude_sf8_m13(in_y, in_y, (si8) VDS_header->n_VDS_samples, amplitude_scale);
-	}
 
 	// decode time data
 	bh->total_header_bytes = VDS_total_header_bytes + VDS_header->amplitude_block_total_bytes + VDS_header->time_block_model_bytes;
@@ -31240,9 +31543,8 @@ tern	CMP_VDS_encode_m13(CPS_m13 *cps)
 	ui1				saved_goal_deriv_level;
 	ui8				saved_deriv_flags;
 	si4				*si4_p, rounds, maximum_rounds;
-	sf4				*sf4_p;
-	si8				i, j, k, new_in_len, block_samps, poles, pad_samps, in_len, offset;
-	si8				*in_x, *new_in_x, *si8_p1, *si8_p2, scale;
+	si8				i, j, k, new_in_len, block_samps, poles, pad_samps, in_len;
+	si8				*in_x, *new_in_x, *si8_p1, *si8_p2;
 	si8				n_dirty, n_add, iv, lo_i, hi_i, *dlo, *dhi;  // VDS refine: local re-interpolation bookkeeping
 	si8				n_cand, n_def, n_raw, max_cand, *defS, *accI, *iraw;   // VDS refine: "defer" strategy bookkeeping
 	CMP_VDS_CAND_m13		*cand;
@@ -31261,11 +31563,19 @@ tern	CMP_VDS_encode_m13(CPS_m13 *cps)
 	// 	VDS_in_bufs[CMP_MAK_IN_X_BUF] == VDS_in_bufs[1]: mak() in_x
 	// 	VDS_in_bufs[8]:	template
 
- 	// redirect to PRED for lossless encoding
+ 	// redirect to PRED for lossless encoding. Restore the VDS directive afterwards, exactly as the
+	// could-not-reach-fidelity redirect below does: the CPS is reused block to block, & an application may
+	// toggle VDS_threshold between 0 (lossless) & nonzero DURING a recording - without the restore, every
+	// block after the first lossless one silently encoded PRED2 forever (found by vds_roundtrip_test.c)
 	if (cps->params.VDS_threshold == (sf8) 0.0) {
+		tern	redirect_r_val;
+
 		cps->direcs.flags &= ~CPS_DF_ALGORITHM_MASK_m13;
 		cps->direcs.flags |= CPS_DF_PRED2_ALGORITHM_m13;
-		return_m13(CMP_PRED2_encode_m13(cps));
+		redirect_r_val = CMP_PRED2_encode_m13(cps);
+		cps->direcs.flags &= ~CPS_DF_ALGORITHM_MASK_m13;
+		cps->direcs.flags |= CPS_DF_VDS_ALGORITHM_m13;
+		return_m13(redirect_r_val);
 	}
 
 	// convert user to algorithm threshold
@@ -31364,7 +31674,7 @@ tern	CMP_VDS_encode_m13(CPS_m13 *cps)
 	resids = (sf8 *) VDS_out_bufs->buffer[2];
 	dlo = (si8 *) VDS_in_bufs->buffer[CMP_VDS_DIRTY_LO_BUF_m13];
 	dhi = (si8 *) VDS_in_bufs->buffer[CMP_VDS_DIRTY_HI_BUF_m13];
-	maximum_rounds = cps->params.maximum_goal_attempts;
+	maximum_rounds = cps->params.VDS_goal_attempts;
 
 	// round 0: full interpolation establishes out_y & residuals for the whole block
 	sf8_p1 = in_y;
@@ -31437,7 +31747,7 @@ tern	CMP_VDS_encode_m13(CPS_m13 *cps)
 			change_made = TRUE_m13;
 			++rounds;
 			// NB: no round-count bail here. Defer reaches the same fidelity as local but over more (cheaper)
-			// rounds -- capping at maximum_goal_attempts would spuriously redirect fittable blocks to PRED.
+			// rounds -- capping at VDS_goal_attempts would spuriously redirect fittable blocks to PRED.
 			// Termination is guaranteed: each round accepts >=1 anchor so in_len strictly grows, bounded by the
 			// max_cand guard above (which bails a pathological block to PRED). Convergence is n_cand == 0.
 
@@ -31691,18 +32001,9 @@ tern	CMP_VDS_encode_m13(CPS_m13 *cps)
 	//     argues for not distinguishing features below B, not for adding B/2 of error to a spike at 100B.
 	// It also did not deliver: in the reference set (read_MED/compression_comparison.medd) the _SB channels are
 	// LARGER than their unscaled counterparts (632 vs 624 KB, 924 vs 864 KB) against an rc note claiming ~30%
-	// better compression. CPS_DF_VDS_SCALE_BY_BASELINE_m13 is now INERT - apps may still set it, harmlessly - and
-	// the "VDS Scale by Baseline" rc field should be retired at the next pass over the app rc files.
+	// better compression. CPS_DF_VDS_SCALE_BY_BASELINE_m13 was left INERT at the time & is now DELETED
+	// (2026-08-07); the "VDS Scale by Baseline" rc field should go at the next pass over the app rc files.
 	// If more compression is wanted, raise the threshold: that is one accountable knob with a stated bound.
-	if (cps->direcs.flags & CPS_DF_SET_AMPLITUDE_SCALE_m13) {
-		sf4_p = (sf4 *) cps->block_parameters;
-		offset = (si8) cps->params.block_parameter_map[CMP_PF_AMPLITUDE_SCALE_IDX_m13];
-		*(sf4_p + offset) = cps->params.amplitude_scale;
-		scale = (sf8) cps->params.amplitude_scale;
-		sf8_p1 = in_y;
-		for (i = in_len; i--;)
-			*sf8_p1++ /= scale;
-	}
 	
 	// copy data to input buffer
 	cps->input_buffer = (si4 *) VDS_in_bufs->buffer[8];  // use VDS template buffer (finished with template for this round)
@@ -31770,15 +32071,16 @@ tern	CMP_VDS_encode_m13(CPS_m13 *cps)
 	
 	VDS_time_model_region = (ui1 *) bh + VDS_total_block_bytes;
 	cps->params.model_region = VDS_time_model_region;
-	// Times are strictly increasing by construction, so promise RED the positive-derivative model: range 1..255
-	// instead of -127..127 doubles the overflow ceiling, and VDS time gaps are routinely large enough for that to
-	// decide whether a gap costs one symbol or a keysample flag + 2-4 raw bytes. This is the ONLY caller entitled
-	// to the directive (see CPS_DF_POSITIVE_DERIVATIVES_m13); cleared again below so it cannot leak to amplitudes.
-	cps->direcs.flags |= CPS_DF_POSITIVE_DERIVATIVES_m13;
+	// Times are strictly increasing by construction, so their derivatives sit entirely on the positive side.
+	// That used to be handled by promising RED the legacy all-positive model (window 1..255 instead of
+	// -127..127); this was its last caller. Retired 2026-08-06 with the model itself - MEASURED cost to VDS:
+	// 8-40 bytes per ~100 KB, because the time gaps that exceed 127 are rare (0.01-0.02% of values on real
+	// data), and in the lossy regime where they are not rare, 91-100% of time sub-blocks have already fallen
+	// through to MBE, which codes fixed bits/sample & does not consult the window at all.
 	cps->direcs.flags &= ~CPS_DF_ALGORITHM_MASK_m13;  // sub-encode under RED2, not VDS (see the amplitude encode above)
 	cps->direcs.flags |= CPS_DF_RED2_ALGORITHM_m13;
 	CMP_RED2_encode_m13(cps); // start with RED2 for times - may fall through
-	cps->direcs.flags &= ~(CPS_DF_POSITIVE_DERIVATIVES_m13 | CPS_DF_ALGORITHM_MASK_m13);
+	cps->direcs.flags &= ~CPS_DF_ALGORITHM_MASK_m13;
 	cps->direcs.flags |= CPS_DF_VDS_ALGORITHM_m13;
 	// restore the caller's derivative-level directives (pinned to 1 for both sub-blocks above)
 	cps->direcs.flags &= ~(CPS_DF_FIND_DERIVATIVE_LEVEL_m13 | CPS_DF_SET_DERIVATIVE_LEVEL_m13);
@@ -31887,7 +32189,7 @@ tern	CMP_VDS_generate_template_m13(CPS_m13 *cps, si8 data_len)
 	// 	VDS_in_bufs[7]: quantval scratch
 	// 	VDS_in_bufs[8]: template (out)
 
-	samp_freq = cps->params.VDS_sampling_frequency;
+	samp_freq = cps->params.sampling_frequency;
 	LFP_high_fc = cps->params.VDS_LFP_high_fc;
 	y = (sf8 *) cps->params.VDS_input_buffers->buffer[0];
 	template = (sf8 *) cps->params.VDS_input_buffers->buffer[8];
@@ -31981,6 +32283,20 @@ tern	CMP_VDS_generate_template_m13(CPS_m13 *cps, si8 data_len)
 	// the fidelity bound is a property of this line, not of any detection step succeeding.
 	for (i = 0; i < data_len; ++i)
 		template[i] = (mark[i] != (sf8) 0.0) ? y[i] : qy[i];
+
+	// (7) BLOCK ENDPOINTS ARE VERBATIM, always. VDS anchors carry TEMPLATE values (the fit in
+	// CMP_VDS_encode_m13() runs against this array, not against y), and in_x always contains 0 & data_len - 1,
+	// so pinning the template here is what makes the first & last reconstructed sample of every block EXACT.
+	// That is what keeps interpolation well behaved at a joint - block boundary or discontinuity - where the
+	// neighbouring block's fit cannot be consulted because blocks decode independently.
+	// ⭐ Belt & braces: FILT_quantfilt_m13()'s TRUNCATE edges already return x[0] & x[len-1] verbatim, so these
+	// two lines are currently redundant. They are here deliberately. Until 2026-08-06 the quantfilt HEAD was
+	// wrong for EVEN spans (VDS's span is round(samp_freq / fc) == 12 at 1 kHz), which silently cost every
+	// block its first anchor while the last stayed right - invisible until an E2E test asserted the property.
+	// Stating the requirement HERE, where it is needed, means a future change to the filter's edge handling
+	// cannot quietly take it away again. Zero cost: it can only reduce |template - y|, never increase it.
+	template[0] = y[0];
+	template[data_len - 1] = y[data_len - 1];
 
 	// Exit Buffer Map:
 	// 	VDS_in_bufs[0]: y (not touched)
@@ -32211,7 +32527,7 @@ tern	CRC_init_tables_m13(void)
 	dim2_bytes = CRC_TABLE_ENTRIES_m13 * sizeof(crc4);
 	content_bytes = CRC_TABLES_m13 * dim2_bytes;
 	len = dim1_bytes + content_bytes;
-	crc_tables = (crc4 **) malloc(len);
+	crc_tables = (crc4 **) G_guarded_table_alloc_m13(len);  // sealed read-only below, once filled
 	if (crc_tables == NULL) {
 		pthread_mutex_unlock_m13(&tables->mutex);
 		return(FALSE_m13);
@@ -32239,7 +32555,9 @@ tern	CRC_init_tables_m13(void)
 	}
 	
 	tables->CRC_tables = (const crc4 **) crc_tables;
-	
+
+	G_guarded_table_seal_m13((void *) crc_tables, len);  // read-only from here: a wild write now faults at the store
+
 	pthread_mutex_unlock_m13(&tables->mutex);
 
 	return(TRUE_m13);
@@ -32284,6 +32602,71 @@ crc4	CRC_matrix_times_m13(const crc4 *mat, crc4 vec)
 	}
 	
 	return(sum);
+}
+
+
+crc4	CRC_remove_m13(crc4 crc, const ui1 *tail_ptr, si8 tail_bytes)
+{
+	const crc4	**crc_tables, *t0;
+	crc4		c, e;
+	ui4		idx;
+	si8		i;
+	ui1		rev[CRC_TABLE_ENTRIES_m13];
+
+#ifdef FT_DEBUG_m13
+	G_push_function_m13();
+#endif
+
+	// INVERSE of appending a known tail: given CRC(prefix || tail) & the tail bytes, returns CRC(prefix).
+	// Costs O(tail_bytes) & never touches the prefix, so a trailing region can be removed from a file's CRC
+	// without re-reading the body - the complement of CRC_combine_m13(), which appends.
+	//
+	// HOW: the library's CRC is the standard reflected CRC-32 (polynomial CRC_POLYNOMIAL_m13, start value 0,
+	// complemented in & out), whose per-byte step is
+	//     c_out = t0[(c_in ^ b) & 0xff] ^ (c_in >> 8)
+	// (c_in >> 8) has a zero top byte, so c_out & t0[i] share theirs. For this polynomial t0[i] >> 24 is a
+	// BIJECTION over i, so the table index is recoverable from the output state alone:
+	//     i = rev[c_out >> 24],  c_in = ((c_out ^ t0[i]) << 8) | (i ^ b)
+	// Walk the tail backwards & the state unwinds exactly. No approximation, no polynomial inverse needed.
+	//
+	// The reverse map is built per call (256 iterations) rather than kept in GLOBAL_TABLES_m13: it keeps this
+	// function free of shared state & of the init/teardown ordering the other tables carry. Measured cost is
+	// ~0.04 us fixed + ~3.5 ns/byte of tail, vs ~0.63 ns/byte to recompute the prefix (CRC_calculate_m13()
+	// uses the wide slice tables; this must go a byte at a time). So this wins hugely for a small tail
+	// (13,000x on 4 bytes off 1 MiB) but the lines CROSS when the tail exceeds roughly 15% of the whole -
+	// past that, just recompute the prefix.
+
+	if (tail_bytes < 0) {
+		G_set_error_m13(E_GEN_m13, "negative tail_bytes");
+		return_m13(crc);
+	}
+	if (tail_bytes == 0)  // nothing to remove
+		return_m13(crc);
+	if (tail_ptr == NULL) {
+		G_set_error_m13(E_GEN_m13, "tail_ptr is NULL");
+		return_m13(crc);
+	}
+
+	crc_tables = globals_m13->tables->CRC_tables;
+	if (crc_tables == NULL) {
+		CRC_init_tables_m13();
+		crc_tables = globals_m13->tables->CRC_tables;
+		if (crc_tables == NULL)
+			return_m13(crc);
+	}
+	t0 = crc_tables[0];
+
+	for (i = 0; i < (si8) CRC_TABLE_ENTRIES_m13; ++i)
+		rev[t0[i] >> 24] = (ui1) i;
+
+	c = ~crc;
+	for (i = tail_bytes; i--;) {
+		idx = (ui4) rev[c >> 24];
+		e = t0[idx];
+		c = ((c ^ e) << 8) | (crc4) ((idx ^ (ui4) tail_ptr[i]) & 0xff);
+	}
+
+	return_m13(~c);
 }
 
 
@@ -36602,10 +36985,10 @@ sf8	FILT_line_noise_m13(sf8 *y, sf8 *fy, si8 len, sf8 samp_freq, sf8 line_freq, 
 	FILTPS_m13	*filtps;
 	FILT_NODE_m13	*qf_nodes;
 	CMP_BUFFERS_m13	*up_bufs;
-	si8		i, j, k, int_samps_per_cycle, n_templates, template_trace_len, U, up_len, pad;
+	si8		i, j, k, int_samps_per_cycle, n_templates, template_trace_len, mtx_len, U, up_len, pad;
 	sf8		samps_per_cycle, min_y, max_y, *sf8_p1, *sf8_p2, *sf8_p3;
 	sf8		*low_y, *high_y, *template_data, *template_trace, *template_buf, *up_y, *up_fy, up_freq;
-	sf8		amp_y, amp_n, high_f, max_high_f, sum, offset, score;
+	sf8		amp_y, amp_n, high_f, max_high_f, sum, offset, score, null_floor;
 	
 #ifdef FT_DEBUG_m13
 	G_push_function_m13();
@@ -36623,11 +37006,18 @@ sf8	FILT_line_noise_m13(sf8 *y, sf8 *fy, si8 len, sf8 samp_freq, sf8 line_freq, 
 		cycles_per_template = (si4) round(line_freq);
 	samps_per_cycle = samp_freq / line_freq;
 	int_samps_per_cycle = (si8) round(samps_per_cycle);
-	n_templates = len / int_samps_per_cycle;
-	if (n_templates < cycles_per_template) {
+	// count cycles with the TRUE (fractional) cycle length, as the phase-locked reshape does - integer
+	// division by the ROUNDED length loses a cycle whenever it rounds up, & a 1 s block holds exactly
+	// duration * line_freq cycles with no slack, so that bookkeeping loss alone made 1 s blocks unscorable
+	// at most clinical rates (250-4000 Hz). The information unit here is CYCLES, not samples: sampling
+	// frequency does not appear in the template math at all
+	n_templates = (si8) ((sf8) len / samps_per_cycle);
+	if (n_templates < FILT_LINE_NOISE_MIN_CYCLES_m13) {  // too few cycles for a meaningful template (see the macro note)
 		memcpy(fy, y, (size_t) (len << 3));
 		return_m13((sf8) -1.0);  // no score
 	}
+	if (cycles_per_template > n_templates)  // short block: static template over all its cycles - fidelity
+		cycles_per_template = n_templates;  // degrades as 1/sqrt(cycles) & the null-floor rescale below compensates the bias
 
 	// LOW SAMPLE RATE: too few samples per line cycle to build a clean template (& the fs/5 smoothing cap below would
 	// cut real harmonics). Upsample by a small integer factor for resolution, extract the line template on the finer
@@ -36688,7 +37078,13 @@ sf8	FILT_line_noise_m13(sf8 *y, sf8 *fy, si8 len, sf8 samp_freq, sf8 line_freq, 
 		return_m13(score);  // (main-path buffers were never allocated on this branch)
 	}
 
-	lnf_buffers = CMP_allocate_buffers_m13(lnf_buffers, 4, len + (6 * filt_order), sizeof(sf8), FALSE_m13, FALSE_m13);  // also reallocates
+	// buffer length: the template matrix (int_samps_per_cycle * n_templates, built flat in buffer[2]) can
+	// slightly EXCEED len when the rounded cycle length rounds up (cycle-true counting above) - the old
+	// integer-division count guaranteed the fit as a side effect; size for whichever is larger
+	mtx_len = int_samps_per_cycle * n_templates;
+	if (mtx_len < len)
+		mtx_len = len;
+	lnf_buffers = CMP_allocate_buffers_m13(lnf_buffers, 4, mtx_len + (6 * filt_order), sizeof(sf8), FALSE_m13, FALSE_m13);  // also reallocates
 
 	// get min & max of input trace
 	sf8_p1 = y;
@@ -36803,7 +37199,17 @@ sf8	FILT_line_noise_m13(sf8 *y, sf8 *fy, si8 len, sf8 samp_freq, sf8 line_freq, 
 		// amp_n/amp_y is the true 0-1 proportion (shown to the user as 0-100%). Clamp handles the rare case where
 		// median-abs non-additivity (signal & noise partially cancelling in high_y) pushes the ratio slightly > 1.
 		score = (amp_y > (sf8) 0.0) ? (amp_n / amp_y) : (sf8) 0.0;
-		if (score > (sf8) 1.0)
+
+		// Subtract the NULL FLOOR so clean data reads ~0. The per-cycle median leaves its own sampling residual
+		// in the template even when there is no mains component at all, & that residual is
+		// FILT_LINE_NOISE_NULL_COEF_m13 / sqrt(cycles_per_template) - see the note at that macro. Rescaled rather
+		// than simply subtracted so a fully mains-dominated block still reaches 1.
+		null_floor = (sf8) FILT_LINE_NOISE_NULL_COEF_m13 / sqrt((sf8) cycles_per_template);
+		if (null_floor < (sf8) 1.0)
+			score = (score - null_floor) / ((sf8) 1.0 - null_floor);
+		if (score < (sf8) 0.0)
+			score = (sf8) 0.0;
+		else if (score > (sf8) 1.0)
 			score = (sf8) 1.0;
 	} else {
 		score = NAN;
@@ -36824,8 +37230,107 @@ sf8	FILT_line_noise_m13(sf8 *y, sf8 *fy, si8 len, sf8 samp_freq, sf8 line_freq, 
 	// clean up
 	if (free_buffers == TRUE_m13)
 		CMP_free_buffers_m13(&lnf_buffers);
-	
+
 	return_m13(score);
+}
+
+
+sf8	FILT_line_noise_estimate_m13(si4 *data, si8 len, sf8 samp_freq, sf8 line_freq, CMP_BUFFERS_m13 *est_buffers)
+{
+	tern	free_buffers;
+	si8	i, k, best_k, lag, q, n_cycles;
+	sf8	samps_per_cycle, a, p0, p1, err, best_err, num, den, r_full, r_lo, r_hi, est, *hp;
+
+#ifdef FT_DEBUG_m13
+	G_push_function_m13();
+#endif
+
+	// FAST ESTIMATE of the line-noise score - the same 0-1 quantity FILT_line_noise_m13() returns with
+	// calculate_score, at ~1/45th the cost (one recursive pass + three lag dot products; no filtfilt, no
+	// template, no upsampling). See the FILT_LINE_NOISE_EST_* macro note for the method & its systematics.
+	// Returns -1 when the block holds too few mains cycles to estimate (same minimum as the true score).
+
+	if (data == NULL || len < 3 || samp_freq <= (sf8) 0.0 || line_freq <= (sf8) 0.0) {
+		G_set_error_m13(E_GEN_m13, "invalid line-noise estimate arguments");
+		return_m13((sf8) -1.0);
+	}
+	samps_per_cycle = samp_freq / line_freq;
+	n_cycles = (si8) ((sf8) len / samps_per_cycle);
+	if (n_cycles < FILT_LINE_NOISE_MIN_CYCLES_m13)
+		return_m13((sf8) -1.0);  // no estimate (not an error): same cycle minimum as the true score
+
+	// measurement lag: whole cycles, k chosen to minimize fractional-lag error (harmonic phase error scales
+	// with the fraction times the harmonic number, so a nearly integer multiple matters more than a small k)
+	best_k = 1;
+	best_err = (sf8) 1e30;
+	for (k = 1; k <= FILT_LINE_NOISE_EST_MAX_CYCLE_MULT_m13 && k <= (n_cycles >> 1); ++k) {
+		err = fabs(((sf8) k * samps_per_cycle) - round((sf8) k * samps_per_cycle));
+		if (err < best_err) {
+			best_err = err;
+			best_k = k;
+		}
+	}
+	lag = (si8) round((sf8) best_k * samps_per_cycle);
+	q = (si8) round(samps_per_cycle / (sf8) 4.0);
+	if (q < 1)
+		q = 1;
+
+	free_buffers = FALSE_m13;
+	if (est_buffers == NULL)
+		free_buffers = TRUE_m13;
+	est_buffers = CMP_allocate_buffers_m13(est_buffers, 1, len, sizeof(sf8), FALSE_m13, FALSE_m13);  // also reallocates
+	if (est_buffers == NULL)
+		return_m13((sf8) -1.0);
+	hp = (sf8 *) est_buffers->buffer[0];
+
+	// two-pole high-pass at line_freq / 2 (cascaded one-poles, 12 dB/oct; zero-phase is irrelevant for a
+	// power ratio, so no filtfilt is needed). Two poles matter: a single pole's 6 dB/oct skirt lets enough
+	// 1/f background into the power-ratio denominator on real physiological data that the calibration
+	// absorbed background spectrum instead of just the amplitude-convention curvature.
+	a = exp((sf8) -2.0 * (sf8) M_PI * (line_freq / (sf8) 2.0) / samp_freq);
+	p1 = hp[0] = (sf8) 0.0;
+	for (i = 1; i < len; ++i) {
+		p0 = a * (p1 + (sf8) (data[i] - data[i - 1]));
+		hp[i] = a * (hp[i - 1] + p0 - p1);
+		p1 = p0;
+	}
+
+	// autocorrelation at the whole-cycle lag & a quarter cycle either side (background estimate)
+	num = den = (sf8) 0.0;
+	for (i = lag; i < len; ++i) {
+		num += hp[i] * hp[i - lag];
+		den += hp[i] * hp[i];
+	}
+	r_full = (den > (sf8) 0.0) ? (num / den) : (sf8) 0.0;
+	num = den = (sf8) 0.0;
+	for (i = lag - q; i < len; ++i) {
+		num += hp[i] * hp[i - (lag - q)];
+		den += hp[i] * hp[i];
+	}
+	r_lo = (den > (sf8) 0.0) ? (num / den) : (sf8) 0.0;
+	num = den = (sf8) 0.0;
+	for (i = lag + q; i < len; ++i) {
+		num += hp[i] * hp[i - (lag + q)];
+		den += hp[i] * hp[i];
+	}
+	r_hi = (den > (sf8) 0.0) ? (num / den) : (sf8) 0.0;
+
+	// mains power fraction -> amplitude convention -> calibration map to the true score's scale
+	// (floor/gain/gamma fitted on real data - see the FILT_LINE_NOISE_EST_* macro note)
+	est = (r_full - ((r_lo + r_hi) / (sf8) 2.0)) / (sf8) FILT_LINE_NOISE_EST_COMB_FACTOR_m13;
+	est = (est > (sf8) 0.0) ? sqrt(est) : (sf8) 0.0;
+	est = (est - (sf8) FILT_LINE_NOISE_EST_NULL_FLOOR_m13) / ((sf8) 1.0 - (sf8) FILT_LINE_NOISE_EST_NULL_FLOOR_m13);
+	if (est <= (sf8) 0.0)
+		est = (sf8) 0.0;
+	else
+		est = (sf8) FILT_LINE_NOISE_EST_GAIN_m13 * pow(est, (sf8) FILT_LINE_NOISE_EST_GAMMA_m13);
+	if (est > (sf8) 1.0)
+		est = (sf8) 1.0;
+
+	if (free_buffers == TRUE_m13)
+		CMP_free_buffers_m13(&est_buffers);
+
+	return_m13(est);
 }
 
 
@@ -37190,7 +37695,10 @@ QUANTFILT_DATA_m13	*FILT_quantfilt_head_m13(QUANTFILT_DATA_m13 *qd, const sf8 *x
 		low_q_node = head->next;
 		low_q_val = low_q_node->val;
 		high_q_val = (low_q_node->next)->val;
-		qx[out_idx++] = (((sf8) 1.0 - quantile) * low_q_val) + (quantile * high_q_val);
+		// FIRST OUTPUT IS THE FIRST SAMPLE - see the identical fix & rationale in FILT_quantfilt_m13().
+		// This form documents "edge semantics == FILT_TRUNCATE_m13", so the two MUST agree: before this the
+		// even-span branch emitted the quantile of {x[0], x[1]} in both. Fixed together 2026-08-06.
+		qx[out_idx++] = x[0];
 		curr_node = low_q_node;  // seed: with span == 2 the fill loop never runs & the preamble below reads it
 		prev_new_node = new_node++;
 		prev_new_val = new_val;
@@ -37380,7 +37888,16 @@ sf8	*FILT_quantfilt_m13(sf8 *x, sf8 *qx, si8 len, sf8 quantile, si8 span, si4 ta
 		low_q_node = head.next;
 		low_q_val = low_q_node->val;
 		high_q_val = (low_q_node->next)->val;
-		qx[out_idx++] = (((sf8) 1.0 - quantile) * low_q_val) + (quantile * high_q_val);
+		// ⭐ FIRST OUTPUT IS THE FIRST SAMPLE, mirroring the trailing edge's `qx[len - 1] = x[len - 1]`.
+		// TRUNCATE's edge windows expand from a single sample & contract back to one, so qx[0] == x[0] and
+		// qx[len-1] == x[len-1] at EVERY span. The odd-span branch above gets this for free (its seed IS a
+		// 1-sample window); the even branch used to emit the quantile of {x[0], x[1]} instead - for the median
+		// their AVERAGE, which is not even a sample value. Fixed 2026-08-06.
+		// Found through VDS: its median span is round(samp_freq / fc) == 12 at 1 kHz, so every VDS block took
+		// the even path & every block's FIRST reconstructed sample was wrong (the template inherits qy[0],
+		// & VDS anchors carry template values). The trailing edge was right all along, which is exactly why
+		// it looked like a VDS bug. See dev/claude_tests/quantfilt_edge_test.c.
+		qx[out_idx++] = x[0];
 		curr_node = low_q_node;  // seed curr_node: with span == 2 the fill loop never runs & the slide preamble reads it
 		low_val_q = (sf8) 1.0 - quantile;  // seed slide weights for span == 2 (same reason; the fill loop overwrites them for larger spans)
 		high_val_q = quantile;
@@ -38147,36 +38664,18 @@ FPS_m13	*FPS_clone_m13(FPS_m13 *proto_fps, const si1 *path, si8 n_bytes, si8 cop
 	G_generate_UID_m13(&uh->file_UID);
 	uh->provenance_UID = uh->file_UID;  // if not originating file, change provenance_UID to file_UID of originating file
 
-	// ENCRYPTION MAP: the header was byte-copied from the prototype, so it still describes the PROTOTYPE's
-	// regions. Which encryptable regions a file contains is a per-file fact - like type_code, the CRCs & the
-	// entry counts reset just above - so entries this file's type cannot hold are set to "no entry" rather than
-	// left asserting something about a region that is not here. (Observed 2026-08-04: a live session carries
-	// video_data_encryption == -1 on every .tdat/.tidx/.rdat/.ridx, inherited this way from one decrypted video
-	// header. Inert, since nothing reads that entry for those types, but it is not true either.)
-	// ⚠️ The entry the file DOES own is left exactly as inherited - that inheritance is load-bearing: it is how
-	// a writer propagates "encrypt this region at level N" from a prototype to every file cloned from it, and a
-	// decrypted transient there is legitimate in memory (it tells the write path the content still needs
-	// re-encrypting). ENCRYPTION_NO_ENTRY_m13 is used rather than NO_ENCRYPTION_m13 because a clone cannot
-	// truthfully assert "not encrypted" about a region it does not contain.
-	switch (uh->type_code) {
-		case TS_METADATA_TYPE_CODE_m13:
-		case VID_METADATA_TYPE_CODE_m13:  // owns sections 2 & 3
-			uh->time_series_data_encryption = uh->video_data_encryption = ENCRYPTION_NO_ENTRY_m13;
-			break;
-		case TS_DATA_TYPE_CODE_m13:  // owns the time series entry
-			uh->metadata_section_2_encryption = uh->metadata_section_3_encryption = ENCRYPTION_NO_ENTRY_m13;
-			uh->video_data_encryption = ENCRYPTION_NO_ENTRY_m13;
-			break;
-		case VID_DATA_TYPE_CODE_m13:  // owns the video entry
-			uh->metadata_section_2_encryption = uh->metadata_section_3_encryption = ENCRYPTION_NO_ENTRY_m13;
-			uh->time_series_data_encryption = ENCRYPTION_NO_ENTRY_m13;
-			break;
-		default:  // indices & records own no map entry (records carry per-record levels in their record headers)
-			uh->metadata_section_2_encryption = uh->metadata_section_3_encryption = ENCRYPTION_NO_ENTRY_m13;
-			uh->time_series_data_encryption = uh->video_data_encryption = ENCRYPTION_NO_ENTRY_m13;
-			break;
-	}
-	
+	// ENCRYPTION MAP: inherited from the prototype in full, deliberately. The universal header now carries map
+	// information for ALL file types, so a clone has no business blanking entries: the inheritance IS how a
+	// writer propagates "encrypt this region at level N" from one prototype to every file cloned from it, and
+	// the clone chain that builds a session runs THROUGH metadata-typed prototypes (G_alloc_session_m13() ->
+	// G_alloc_channel_m13() -> G_alloc_segment_m13()). Blanking per type therefore stripped the time series
+	// entry on the way to every .tdat, which arrived as ENCRYPTION_NO_ENTRY_m13 no matter what the writer asked
+	// for - and the write & read paths disagreed about that value (write encrypted, read did not decrypt), so
+	// every block was written as ciphertext that no reader would ever decrypt (found 2026-08-05 by
+	// dev/claude_tests/codec_file_test.c, the first test to write a MED file & read it back).
+	// A stale entry for a region this file's type cannot hold is inert - nothing reads it - and
+	// G_validate_encryption_map_m13() checks only the entry that governs the file's own contents.
+
 	// set type specific fields
 	switch (type_code) {
 		case TS_INDS_TYPE_CODE_m13:
@@ -38299,7 +38798,7 @@ si8	FPS_flen_m13(FPS_m13 *fps, const si1 *path)
 
 	// returns file data length including header, but excluding any pcrc data if present
 	// returns FALSE_m13 on failure
-	// see FPS_flen_m13() for FILE_m13 pointer version
+	// see flen_m13() for FILE_m13 pointer version
 	
 	// use FPS, if possible
 	if (fps) {
@@ -39261,8 +39760,6 @@ FPS_m13	*FPS_read_m13(FPS_m13 *fps, si8 offset, si8 n_bytes, si8 n_items, ...)  
 	}
 
 	// read in universal header
-	pg = G_proc_globs_m13(fps);
-	pwd = &pg->password_data;
 	uh = fps->uh;
 	if (read_header == TRUE_m13) {
 
@@ -39290,7 +39787,19 @@ FPS_m13	*FPS_read_m13(FPS_m13 *fps, si8 offset, si8 n_bytes, si8 n_items, ...)  
 			bytes_read = fread_m13(uh, sizeof(ui1), bytes_to_read, fps->params.fp);
 		if (bytes_read != bytes_to_read)
 			goto FPS_READ_FAIL_m13;
-		
+
+		// Resolve the process globals HERE, not before the read. G_proc_globs_m13() has three strategies -
+		// linkage, session UID, thread ancestry - and the second cannot fire until the universal header
+		// exists (its own comment: "uh = ((FPS_m13 *) lh)->uh; // may not be read yet"). Called earlier, a
+		// session's FIRST file had no linkage & no readable UID, so ancestry answered with the CALLING
+		// THREAD's session: the second G_open_session_m13() in a process reused the first session's globals &
+		// its already-established password, and never established its own. MEASURED: whichever session was
+		// opened second failed with "Section 2 of the metadata is encrypted at level 1 => cannot decrypt".
+		// See dev/claude_tests/two_session_test.c. Nothing between here and the read used pg or pwd, & the
+		// no-header path needs neither, so this is a move rather than an extra lookup.
+		pg = G_proc_globs_m13(fps);
+		pwd = &pg->password_data;
+
 		// process password (establish once, race-safe).  G_read_channel_m13()/G_read_segment_m13() can be entered
 		// directly from multiple threads with no single-threaded G_read_session_m13() phase to establish the shared
 		// password_data first - so those threads would otherwise all pass this gate and concurrently memset+rewrite
@@ -39316,11 +39825,11 @@ FPS_m13	*FPS_read_m13(FPS_m13 *fps, si8 offset, si8 n_bytes, si8 n_items, ...)  
 		}
 
 		// current session directory globals
-		if (pg->current_session.UID != uh->session_UID) {
-			if (pg->current_session.UID)  // != 0 => new session, need new proc_globs (in same thread)
-				pg = G_proc_globs_new_m13(fps);
+		// two triggers: empty path = a pg created this read (UID may already be stamped, so a UID test alone
+		// cannot detect it); UID mismatch = a UID-less pg adopted by ancestry that already has a path from
+		// another role (e.g. this process WROTE the session & the writer's pg carries the path but no UID)
+		if (pg->current_session.UID != uh->session_UID || *pg->current_session.path == 0)
 			G_session_directory_m13(fps);
-		}
 		
 		// live or abnormally terminated file
 		if (uh->n_entries == 0)
@@ -39370,6 +39879,10 @@ FPS_m13	*FPS_read_m13(FPS_m13 *fps, si8 offset, si8 n_bytes, si8 n_items, ...)  
 
 	// validate CRCs
 	if (globals_m13->miscellaneous.CRC_mode & CRC_VALIDATE_m13) {
+		// The universal header is validated on EVERY pass, including data reads that did not re-read it: the
+		// in-memory header must always match its own stored CRC. It briefly did not - FPS_realloc_m13() flagged
+		// raw_data as a level header, so the allocator wrote TRUE_m13 into offset 5, inside body_CRC. That was
+		// fixed at the source rather than by skipping the check here, which would have cost real detection.
 		CRC_valid = CRC_validate_m13(fps->params.raw_data + UH_HEADER_CRC_START_OFFSET_m13, UH_BYTES_m13 - UH_HEADER_CRC_START_OFFSET_m13, uh->header_CRC);
 		if (CRC_valid == FALSE_m13)
 			G_warning_message_m13("%s(): universal header CRC invalid for \"%s\"\n", __FUNCTION__, fps->path);
@@ -39488,11 +40001,32 @@ tern	FPS_realloc_m13(FPS_m13 *fps, si8 n_bytes)
 
 	if (n_bytes <= fps->params.raw_data_bytes)
 		return_m13(TRUE_m13);
-	
+
+	// a CALLER-OWNED compressed buffer is never freed & never moved, so a needed growth cannot be satisfied.
+	// Only time series data files carry a CPS, so record & index files never reach this.
+	if (fps->type_code == TS_DATA_TYPE_CODE_m13) {
+		cps = fps->params.cps;
+		if (cps) {
+			if (cps->direcs.flags & CPS_DF_CALLER_OWNS_COMPRESSED_m13) {
+				G_set_error_m13(E_CMP_m13, "caller-owned compressed buffer holds %ld bytes but %ld are needed", fps->params.raw_data_bytes, n_bytes);
+				return_m13(FALSE_m13);
+			}
+		}
+	}
+
+	// ⚠️ NOT flagged as a level header. raw_data is the FILE BUFFER - its first UH_BYTES_m13 are the universal
+	// header - and the level-header flag makes the allocator write TRUE_m13 into ((LH_m13 *) block)->allocated,
+	// which sits at offset 5: inside body_CRC (offset 4, ui4). On the FIRST allocation that is harmless (the
+	// header read overwrites it), but this function is called AGAIN once the size is known - e.g.
+	// CMP_allocate_CPS_m13() growing a .tdat buffer - and that second call clobbers a body_CRC already read
+	// from disk. Symptom: "universal header CRC invalid" on intact files, because body_CRC lies inside the
+	// region header_CRC covers. Worse, a read-then-write path would then persist the corrupted body_CRC.
+	// Nothing consults ->allocated on raw_data (it is freed with a plain free_m13()), so the flag was pure
+	// misuse. Fixed 2026-08-06 - found via dev/claude_tests/discontinuity_test.c on example_data.medd.
 	if (fps->params.raw_data)
-		raw_data = recalloc_m13(fps->params.raw_data, (size_t) fps->params.raw_data_bytes, (size_t) n_bytes, -sizeof(ui1));  // flag as level header
+		raw_data = recalloc_m13(fps->params.raw_data, (size_t) fps->params.raw_data_bytes, (size_t) n_bytes, sizeof(ui1));
 	else
-		raw_data = calloc_m13((size_t) n_bytes, -sizeof(ui1));  // flag as level header
+		raw_data = calloc_m13((size_t) n_bytes, sizeof(ui1));
 	if (raw_data == NULL)
 		return_m13(FALSE_m13);
 
@@ -52271,7 +52805,7 @@ const si1	*STR_tern_m13(tern val, tern colored)
 }
 
 
-void	*STR_time_m13(void *level_header, si8 uutc, void *time_str_ptr, tern fixed_width, tern relative_days, si4 colored_text, ...)  // time_str buffer sould be of length TIME_STRING_BYTES_m13
+void	*STR_time_m13(void *level_header, si8 uutc, void *time_str_ptr, tern fixed_width, tern relative_days, si4 colored_text, ...)  // varargs(colored_text == TRUE_m13): si1 *date_color, si1 *time_color e.g. TC_BLUE_m12, TC_GREEN_m13; Note: time_str buffer sould be of length TIME_STRING_BYTES_m13
 {
 	si1			*time_str;
 	pstr			*ops;
@@ -56219,12 +56753,15 @@ void	*aligned_alloc_m13(si8 alignment, si8 n_bytes)  // (alignment == -1): align
 	if (u_len & am1)
 		alloc_size += (ui8) alignment;
 
-	// allocate
+	// allocate (use ALIGNMENT, not the page_size static: on the explicit-alignment path the page branch
+	// above is skipped & page_size may still be 0 - aligned_alloc(0, n) fails EINVAL. When alignment == -1
+	// was passed, alignment now HOLDS the page size, so this is correct on every path. Found 2026-08-09,
+	// first explicit-alignment caller.)
 	#if defined MACOS_m13 || defined LINUX_m13
-	ptr = aligned_alloc(page_size, alloc_size);
+	ptr = aligned_alloc((size_t) alignment, alloc_size);
 	#endif
 	#ifdef WINDOWS_m13  // NOTE: this pointer must be freed with aligned_free_m13() in Windows
-	ptr = _aligned_malloc(u_len, page_size);  // Windows does not require multiple of page size
+	ptr = _aligned_malloc(u_len, (size_t) alignment);  // Windows does not require multiple of page size
 	#endif
 	if (ptr == NULL) {
 		G_set_error_m13(E_ALLOC_m13, NULL);
@@ -60464,6 +61001,96 @@ tern	mlock_m13(void *addr, si8 len)  // (len < 0): len = -len, lock regardless o
 }
 
 
+// Guarded table allocation (2026-08-09 hardening #2): page-aligned data region with PROT_NONE guard
+// pages either side, sealed PROT_READ after filling. For COMPUTED read-forever tables (CRC_tables,
+// CMP_log_table) - the static const masters already live in .rodata & need nothing. A wild write into a
+// sealed table (or a linear overrun crossing a guard) faults AT THE CORRUPTING STORE - the diagnostic a
+// debugger gives, in production, for free (one mprotect per table per process; reads untouched).
+// The (ptr, bytes) pair passed to seal/free must match the alloc call - sizes are compile-time constants
+// at every current call site. free RESTORES read/write before releasing (the allocator writes bookkeeping
+// into freed blocks).
+// page size for the guarded-table helpers: LOCK-FREE by design. The natural source (HW_params via
+// HW_get_memory_info_m13()) takes tables->mutex - which both table-init callers HOLD while allocating -
+// & aligned_alloc_m13(-1, ...) reaches the same lock for the same reason. Direct syscall, static cache
+// (concurrent first calls write the same value: benign).
+static ui8	G_guarded_table_page_size_m13(void)
+{
+	static ui8	pg = 0;
+
+	if (pg == 0) {
+		#if defined MACOS_m13 || defined LINUX_m13
+		pg = (ui8) sysconf(_SC_PAGESIZE);
+		#endif
+		#ifdef WINDOWS_m13
+		SYSTEM_INFO	sys_info;
+
+		GetSystemInfo(&sys_info);
+		pg = (ui8) sys_info.dwPageSize;
+		#endif
+	}
+
+	return(pg);
+}
+
+
+void	*G_guarded_table_alloc_m13(size_t bytes)
+{
+	ui1	*base;
+	ui8	pg, total;
+
+#ifdef FT_DEBUG_m13
+	G_push_function_m13();
+#endif
+
+	pg = G_guarded_table_page_size_m13();
+	total = (((((ui8) bytes) + pg - 1) / pg) + 2) * pg;  // data pages + 2 guards
+	base = (ui1 *) aligned_alloc_m13((si8) pg, (si8) total);  // explicit alignment: the -1 (page) path would take tables->mutex (see above)
+	if (base == NULL)
+		return_m13(NULL);
+	mprotect_m13(base, (size_t) pg, PROT_NONE);  // leading guard
+	mprotect_m13(base + total - pg, (size_t) pg, PROT_NONE);  // trailing guard
+
+	return_m13(base + pg);
+}
+
+
+tern	G_guarded_table_seal_m13(void *table, size_t bytes)
+{
+	ui8	pg;
+
+#ifdef FT_DEBUG_m13
+	G_push_function_m13();
+#endif
+
+	pg = G_guarded_table_page_size_m13();
+	if (mprotect_m13(table, (size_t) ((((ui8) bytes + pg - 1) / pg) * pg), PROT_READ))
+		return_m13(FALSE_m13);
+
+	return_m13(TRUE_m13);
+}
+
+
+tern	G_guarded_table_free_m13(void *table, size_t bytes)
+{
+	ui1	*base;
+	ui8	pg, total;
+
+#ifdef FT_DEBUG_m13
+	G_push_function_m13();
+#endif
+
+	if (table == NULL)
+		return_m13(TRUE_m13);
+	pg = G_guarded_table_page_size_m13();
+	total = (((((ui8) bytes) + pg - 1) / pg) + 2) * pg;
+	base = ((ui1 *) table) - pg;
+	mprotect_m13(base, (size_t) total, PROT_READ | PROT_WRITE);  // guards & seal off: allocator must be able to write
+	aligned_free_m13(base);
+
+	return_m13(TRUE_m13);
+}
+
+
 si4	mprotect_m13(void *address, size_t len, si4 protection)
 {
 	si4	r_val, err;
@@ -60478,7 +61105,7 @@ si4	mprotect_m13(void *address, size_t len, si4 protection)
 	// PROT_WRITE: allow block to be written
 	// PROT_EXEC: allow block to be executed
 	// The passed protection mode can be ored: e.g read/write access == (PROT_READ | PROT_WRITE)
-	// This function will replace the existing protection on the block with the passed value; it will or the passed value with the existing value
+	// This function REPLACES the existing protection on the block with the passed value
 	
 	// returns zero on success or:
 	// EACCES: requested protection conflicts with the access permissions of the process on the specified address range
@@ -60523,7 +61150,11 @@ si4	mprotect_m13(void *address, size_t len, si4 protection)
 			return_m13(ENOTSUP);
 	}
 
-	err = (si4) VirtualProtect(address, len, (DWORD) protection, NULL);
+	{
+	DWORD	old_protection;  // lpflOldProtect is REQUIRED non-NULL: passing NULL makes VirtualProtect fail unconditionally (found in review 2026-08-09, Windows leg still unexercised)
+
+	err = (si4) VirtualProtect(address, len, (DWORD) protection, &old_protection);
+	}
 	
 	if (err == 0) {
 		r_val = errno_m13();
@@ -60913,10 +61544,15 @@ si4	printf_m13(const si1 *fmt, ...)
 
 si4	pthread_equal_m13(pthread_t_m13 t1, pthread_t_m13 t2)
 {
-	// NOTE: this function returns one (1) if t1 & t2 correspond to the same thread, zero (0) if not  (Posix standard)
-	
+	// Returns exactly one (1) if t1 & t2 are the same thread, zero (0) if not.
+	// ⚠️ POSIX guarantees only NON-ZERO for equal, not the value 1. This function NARROWS that to exactly 1,
+	// which is safe for every POSIX-idiomatic caller (they test non-zero, & 1 is non-zero) & makes the three
+	// platforms agree: the Windows branch below has always returned a literal 1, so without this the same
+	// wrapper answered "equal" with different values depending on the platform. Normalized 2026-08-06; before
+	// that the comment claimed 1 while this branch passed the platform's value straight through.
+
 #if defined MACOS_m13 || defined LINUX_m13
-	return(pthread_equal(t1, t2));
+	return(pthread_equal(t1, t2) ? 1 : 0);
 #endif
 	
 #ifdef WINDOWS_m13
