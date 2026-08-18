@@ -3,7 +3,7 @@
 #define MEDLIB_IN_m13
 
 //**********************************************************************************//
-//********************************* MED 1.1.3 C Library ****************************//
+// MARK: MED 1.1.3 C Library
 //**********************************************************************************//
 
 
@@ -98,7 +98,7 @@
 
 
 //**********************************************************************************//
-//*********************************** Library Includes *****************************//
+// MARK: Library Includes
 //**********************************************************************************//
 
 #include "targets_m13.h"
@@ -146,6 +146,7 @@
 	#include <winsock.h>
 	#include <ws2ipdef.h>
 	#include <iphlpapi.h>
+	#include <netioapi.h> // GetIfEntry2 / MIB_IF_ROW2 (duplex state - native NET backends)
 	#include <ws2tcpip.h>
 	#include <process.h>
 	#include <processthreadsapi.h>
@@ -173,6 +174,8 @@
 	#include <netinet/in.h>
 	#include <ifaddrs.h>
 	#include <netdb.h>
+	#include <net/if.h> // struct ifreq, IFF_* flags & if_nametoindex() (native NET backends)
+	#include <sys/ioctl.h> // interface ioctls (SIOCGIFMTU et al - native NET backends)
 	#include <sys/param.h>
 	#include <sys/mount.h>
 	#include <termios.h>
@@ -183,8 +186,13 @@
 #ifdef MACOS_m13
 	#include <malloc/malloc.h>
 	#include <sys/sysctl.h>
+	#include <sys/sockio.h> // SIOC* ioctl codes (native NET backends)
+	#include <net/if_dl.h> // sockaddr_dl / LLADDR (MAC address via getifaddrs)
+	#include <net/if_media.h> // SIOCGIFMEDIA (duplex)
+	#include <net/if_var.h> // struct if_data (link speed via ifa_data ifi_baudrate)
 	#include <util.h>
 	#include <mach/thread_act.h>
+	#include <mach/mach_host.h>  // HW_cpu_monitor / HW_memory_usage (host_processor_info, host_statistics64)
 	#if SKC_BACKEND_m13 == SKC_BACKEND_KEYCHAIN_m13
 		#include <Security/Security.h>  // session key cache OS backend (link: -framework Security -framework CoreFoundation)
 	#endif
@@ -197,6 +205,9 @@
 	#include <utmp.h>
 	#include <sys/syscall.h>   // add_key()/keyctl() syscalls (session key cache)
 	#include <linux/keyctl.h>  // KEYCTL_* ops (session key cache)
+	#include <netpacket/packet.h> // sockaddr_ll (MAC address via getifaddrs)
+	#include <linux/ethtool.h> // ETHTOOL_GSET (link speed & duplex without the ethtool binary)
+	#include <linux/sockios.h> // SIOCETHTOOL
 #endif // LINUX_m13
 #if defined LINUX_m13 || defined WINDOWS_m13
 	#include <malloc.h>
@@ -247,7 +258,7 @@
 
 
 //**********************************************************************************//
-//******************************** Elemental Typedefs ******************************//
+// MARK: Elemental Typedefs
 //**********************************************************************************//
 
 #ifndef MED_PRIMITIVES_IN_m13
@@ -367,7 +378,7 @@ typedef long double	sf16;
 
 
 //**********************************************************************************//
-//***************************** Pascal Strings (pstr) ******************************//
+// MARK: Pascal Strings (pstr)
 //**********************************************************************************//
 
 // Enhanced Pascal strings
@@ -422,13 +433,13 @@ void		*PSTR_free_m13(void *ptr);  // pass pstr *, or address of pstr * to also n
 void		PSTR_set_counts_m13(pstr *ps);  // set bytes & chars from string content (single pass; use after writing into str directly)
 
 //**********************************************************************************//
-//***************** Record Structures Integral to the MED Library ******************//
+// MARK: Record Structures Integral to the MED Library
 //*************** (prototypes & constants declared in medrec_m13.h) ****************//
 //**********************************************************************************//
 
 
 //*********************************************************************************//
-//******************************* Sgmt: Segment Record ****************************//
+// MARK: Sgmt: Segment Record
 //*********************************************************************************//
 
 // A segment record is entered at the Session and or Channel Level for each new segment
@@ -484,7 +495,7 @@ typedef struct {
 
 
 //*************************************************************************************//
-//******************************* Stat: Statistics Record *****************************//
+// MARK: Stat: Statistics Record
 //*************************************************************************************//
 
 typedef struct {
@@ -501,7 +512,7 @@ typedef struct {
 
 
 //*************************************************************************************//
-//*********************** CMP Structures required in MED section **********************//
+// MARK: CMP Structures required in MED section
 //*************************************************************************************//
 
 #define CMP_FIXED_BH_BYTES_m13	56
@@ -536,7 +547,7 @@ typedef struct {
 
 
 //**********************************************************************************//
-//*********************************** Encryption ***********************************//
+// MARK: Encryption
 //**********************************************************************************//
 
 // Encryption & Password Constants
@@ -689,7 +700,7 @@ typedef struct {
 
 
 //**********************************************************************************//
-//********************************* MED Constants **********************************//
+// MARK: MED Constants
 //**********************************************************************************//
 
 // Versioning Constants
@@ -1474,7 +1485,7 @@ typedef struct {
 
 
 //**********************************************************************************//
-//************************** File Functions (FILE & FLOCK) *************************//
+// MARK: File Functions (FILE & FLOCK)
 //**********************************************************************************//
 
 // FILE_m13 is an enhanced FILE pointer for use in medlib functions
@@ -1642,7 +1653,7 @@ void		FILE_update_m13(void *fp);
 
 
 //**********************************************************************************//
-//********************************* Processes (PROC) *******************************//
+// MARK: Processes (PROC)
 //**********************************************************************************//
 
 // Thread Management Constants
@@ -1780,6 +1791,8 @@ tern			PROC_adjust_open_file_limit_m13(si4 new_limit, tern verbose_flag);
 tern			PROC_change_affinity_m13(pthread_t_m13 *thread_p, pthread_attr_t_m13 *attributes, cpu_set_t_m13 *cpu_set_p);
 sf8			PROC_cpu_time_m13(void); // process cpu time (user + system, all threads), in seconds
 tern			PROC_default_threading_m13(void *lh); // lh is an LH_m13 *
+#define PROC_ENCODE_SET_BYTES_m13	((si4) 4096) // worst-case encode-set string (alternating singles on very-many-core parts)
+tern			PROC_encode_cpu_set_m13(const si1 *reserved_str, si1 *encode_str, si4 *n_workers);  // encode set = logicals whose PHYSICAL core hosts no reserved logical (topology-derived; hybrid-safe)
 cpu_set_t_m13		*PROC_generate_cpu_set_m13(const si1 *affinity_str, cpu_set_t_m13 *cpu_set_p);
 pid_t_m13		PROC_id_for_thread_m13(pthread_t_m13 *thread_p);
 tern			PROC_increase_process_priority_m13(tern verbose_flag, si4 sudo_prompt_flag, ...); // varargs (sudo_prompt_flag == TRUE_m13): const si1 *exec_name, sf8 timeout_secs
@@ -1798,7 +1811,7 @@ pid_t_m13		PROC_thread_parent_id_m13(pid_t_m13 _id);
 
 
 //**********************************************************************************//
-//********************************* Parallel Functions (PAR) *********************************//
+// MARK: Parallel Functions (PAR)
 //**********************************************************************************//
 
 // The PAR functions run other library functions in threads, without requiring the caller to know
@@ -1896,7 +1909,7 @@ tern			PAR_wait_all_m13(PAR_INFO_m13 **par_infos, si4 n_infos, const si1 *interv
 
 
 //**********************************************************************************//
-//********************************** Parity (PRTY) *********************************//
+// MARK: Parity (PRTY)
 //**********************************************************************************//
 
 // NOTE: names beginning with "parity" are RESERVED - they identify parity files & directories (PRTY_is_parity_m13())
@@ -2111,7 +2124,7 @@ tern	PRTY_write_m13(const si1 *sess_path, ui4 flags, si4 segment_number);  // (r
 
 
 //**********************************************************************************//
-//********************** Runtime Configuration (RC) **********************//
+// MARK: Runtime Configuration (RC)
 //**********************************************************************************//
 
 // Constants
@@ -2165,7 +2178,7 @@ si4	RC_read_field_2_m13(const si1 *field_name, si1 **buffer, tern update_buffer_
 
 
 //**********************************************************************************//
-//******************************** Networking (NET) ********************************//
+// MARK: Networking (NET)
 //**********************************************************************************//
 
 // Constants
@@ -2250,7 +2263,7 @@ tern		NET_trim_address_m13(si1 *addr_str);
 
 
 //**********************************************************************************//
-//************************************ MED Errors **********************************//
+// MARK: MED Errors
 //**********************************************************************************//
 
 
@@ -2365,7 +2378,7 @@ typedef struct {
 
 
 //**********************************************************************************//
-//************************************ MED Macros **********************************//
+// MARK: MED Macros
 //**********************************************************************************//
 
 #define METADATA_CODE_m13(x)			( (((x) == TS_METADATA_TYPE_CODE_m13) || ((x) == VID_METADATA_TYPE_CODE_m13)) ? TRUE_m13 : FALSE_m13 )
@@ -2394,7 +2407,7 @@ typedef struct {
 
 
 //**********************************************************************************//
-//********************************** Hardware (HW) *********************************//
+// MARK: Hardware (HW)
 //**********************************************************************************//
 
 // Structures
@@ -2405,12 +2418,16 @@ typedef struct {
 	sf8	nsecs_per_integer_division; // test mimics RED/PRED in operand length, other tests may yield somewhat different results
 } HW_PERFORMANCE_SPECS_m13;
 
+#define HW_MAX_LOGICAL_CORES_m13	((si4) 256) // sizes the per-logical topology maps below
+
 typedef struct {
 	ui1				endianness;
 	si4				physical_cores;
 	si4				logical_cores; // written once at G_init_medlib_m13() (main thread, before any worker threads exist) => plain reads are safe
 	si4				performance_cores; // heterogeneous CPUs (e.g. Apple silicon): high performance ("P") cores; == physical_cores in uniform CPUs
 	si4				efficiency_cores; // heterogeneous CPUs: low power ("E") cores; == 0 in uniform CPUs
+	si1				core_types[HW_MAX_LOGICAL_CORES_m13 + 1]; // per-LOGICAL type map, indexed by logical cpu number: 'P' or 'E' (all 'P' on uniform parts). Zero-terminated => prints directly ("PPPPPPPPPPPPPPPPEEEEEEEEEEEEEEEE" on an i9-13900K). Empty string == unknown (topology source unavailable)
+	si4				physical_core_ids[HW_MAX_LOGICAL_CORES_m13]; // DENSE physical-core index of each logical cpu (SMT siblings share an index; assignment order = first-logical order); -1 == unknown. THE topology map for affinity work (PROC_encode_cpu_set_m13() consumes it)
 	tern				hyperthreading;
 	tern				AES_accel; // hardware AES instructions present (x86 AES-NI / ARMv8 AES); UNKNOWN_m13 until detected
 	tern				SHA256_accel; // hardware SHA-256 instructions present (x86 SHA extensions / ARMv8 SHA-2); UNKNOWN_m13 until detected
@@ -2421,6 +2438,10 @@ typedef struct {
 	HW_PERFORMANCE_SPECS_m13	performance_specs;
 	ui8				system_memory_size; // system physical RAM (in bytes)
 	ui4				system_page_size; // memory page (in bytes)
+	ui4				map_granularity; // mapping PLACEMENT granularity (bytes): == page size on Unix; Windows
+							 // dwAllocationGranularity (64 KB - MapViewOfFileEx placement & mapping
+							 // offsets align to THIS, not the page). Page-aligned ALLOCATION (guarded
+							 // tables, mprotect bounds) uses system_page_size - do not conflate.
 	ui8				heap_base_address;
 	ui8				heap_max_address;
 	si1				cpu_manufacturer[64];
@@ -2435,6 +2456,32 @@ tern	HW_get_core_info_m13(void);
 tern	HW_get_crypto_accel_m13(void); // AES_accel & SHA256_accel (encryption/hash routines read these to select hardware vs table paths)
 tern	HW_get_endianness_m13(void);
 tern	HW_get_info_m13(void); // fill whole HW_PARAMS_m13 structure
+
+// D31: live CPU monitor - kernel-direct per-core loads & temperatures (Linux /proc/stat + hwmon
+// sysfs; macOS Mach host ticks, temps NAN; Windows not yet). No forked utilities: a fork+exec
+// perturbs the cores being measured & drags in sysstat/lm-sensors dependencies. Loads are BUSY
+// fractions (non-idle, INCLUDING kernel/softirq time) as deltas between successive reads on the
+// same monitor. Open one monitor per consumer (GUI thread, throttle controller, ...).
+typedef struct {
+	si4	n_logical; // loads[] length (logical cores)
+	si4	n_physical; // temps[] length (physical cores)
+	sf8	*loads; // [n_logical] busy fraction [0,1] since the previous read
+	sf8	load; // machine mean busy fraction
+	sf8	*temps; // [n_physical] degrees Celsius; NAN == no sensor
+	sf8	temp; // package temperature (or mean of core temps); NAN == unavailable
+	sf8	temp_max; // TjMax: the chip's own critical temperature (hwmon temp*_crit, fallback temp*_max), degrees C;
+			  // NAN == unknown. Thermal policy should be expressed as a FRACTION of this, not against a
+			  // hard-coded band - TjMax is 100 on many desktop parts, 105 on mobile, ~85 on some server parts
+	// internals
+	ui8	*prev_busy;
+	ui8	*prev_total;
+	void	*temp_paths; // platform temperature source state
+} HW_CPU_MONITOR_m13;
+
+HW_CPU_MONITOR_m13	*HW_cpu_monitor_open_m13(void);
+tern	HW_cpu_monitor_read_m13(HW_CPU_MONITOR_m13 *mon);
+void	HW_cpu_monitor_close_m13(HW_CPU_MONITOR_m13 **mon);
+tern	HW_memory_usage_m13(sf8 *system_used_fraction, ui8 *process_rss_bytes); // stateless; either arg may be NULL; system fraction uses MemAvailable semantics, process figure is RSS
 tern	HW_get_machine_code_m13(void);
 tern	HW_get_machine_serial_m13(void);
 tern	HW_get_performance_specs_m13(tern get_current);
@@ -2447,7 +2494,7 @@ tern	HW_show_info_m13(void);
 
 
 //**********************************************************************************//
-//************************************ General MED *********************************//
+// MARK: General MED
 //**********************************************************************************//
 
 // Daylight Change code
@@ -2927,6 +2974,7 @@ typedef struct {
 	si4				session_key_cache_timeout; // cached session key lifetime, seconds (hard-capped at GLOBALS_SESSION_KEY_CACHE_TIMEOUT_MAX_m13 == 2 h)
 	tern				increase_priority; // increase process priority if PROC_increase_priority_m13() is called
 	tern				background_processing; // run distributed jobs (PROC_jobs_distribute_m13()/PAR_distribute_m13()) at low priority (default NO == full speed; overrides per-job priorities when YES)
+	_Atomic si4			distribute_calls; // concurrently active job distributions (PROC & PAR): adaptive jobs_per_core trusts utilization measurements only when a distribution runs alone
 	ui1				new_password_required_classes; // OPT-IN creation-time composition rule (bitmask of PW_CLASS_*_m13); 0 == none (default). Length policy is unconditional; this is extra. Reads never consult it.
 	ui1				new_password_min_classes; // OPT-IN: require at least N of the 4 categories present (0 == off). The generally-deployed standard (Active Directory: 3 of 4). Independent of, & AND-ed with, new_password_required_classes.
 	TEST_BYTE_m13			test_byte;
@@ -3349,7 +3397,7 @@ LAYOUT_FIELD_m13(VID_IDX_m13, vid_file_num, VID_IDX_VIDEO_FILE_NUMBER_OFFSET_m13
 
 
 //**********************************************************************************//
-//**************************** File Processing Struct (FPS) ************************//
+// MARK: File Processing Struct (FPS)
 //**********************************************************************************//
 
 // Constants
@@ -3556,7 +3604,7 @@ tern		FPS_write_m13(FPS_m13 *fps, si8 offset, si8 n_bytes, si8 n_items, ...); //
 
 
 //**********************************************************************************//
-//********************************** MED Structures ********************************//
+// MARK: MED Structures
 //**********************************************************************************//
 
 typedef union {
@@ -3866,7 +3914,7 @@ typedef struct {
 
 
 //**********************************************************************************//
-//**************************** GENERAL MED Functions (G) ***************************//
+// MARK: GENERAL MED Functions (G)
 //**********************************************************************************//
 
 // Prototypes
@@ -3903,11 +3951,11 @@ si4			G_estimate_password_bits_m13(const si1 *password); // conservative entropy
 ui1			G_clamp_kdf_exponent_m13(si4 exponent, tern lib_generated_password); // enforces the non-overridable floors & ceiling; the single point of policy
 ui1			G_suggest_kdf_exponent_m13(const si1 *password, tern lib_generated_password); // constant-attack-cost suggestion: clamp(target - haircut(estimate))
 sf8			G_kdf_open_time_estimate_m13(ui1 exponent, sf8 *slow_machine_secs); // seconds per password per session open ON THIS MACHINE (calibrated, not tabulated)
-si4			G_first_open_segment_m13(void *level_header);  // index of first open (non-NULL) segment on the reference channel; (si4) FALSE_m13 if none
+tern			G_password_info_m13(const si1 *path, const si1 *password, PASSWORD_INFO_m13 *info); // read one header (+ §1 hints); password NULL = info only (no KDF); else validate & set info->access_level. No open, no side effects, no record scan.
 void			G_clear_error_m13(void);
 tern			G_clear_terminal_m13(void);
 si4			G_compare_acq_nums_m13(const void *a, const void *b);
-si4 			G_compare_record_index_times(const void *a, const void *b);
+si4 			G_compare_record_index_times_m13(const void *a, const void *b);
 tern			G_condition_password_m13(const si1 *password, si1 *password_bytes, ui1 crypto_schema); // schema >= 1: raw UTF-8 bytes, REJECT if > 16 bytes; legacy: terminal-byte reduction (read-only compatibility)
 tern			G_condition_slice_m13(void *level_header, SLICE_m13 *slice);
 tern			G_condition_timezone_info_m13(TIMEZONE_INFO_m13 *tz_info);
@@ -3943,9 +3991,10 @@ FILE_TIMES_m13		*G_file_times_m13(FILE_m13 *fp, const si1 *path, FILE_TIMES_m13 
 tern			G_fill_empty_password_bytes_m13(si1 *password_bytes);
 CONTIGUON_m13		*G_find_discontinuities_m13(void *level_header, si8 *n_contigua);
 si8			G_find_index_m13(SEG_m13 *seg, si8 target, ui4 mode);
-si1			*G_find_timezone_acronym_m13(si1 *timezone_acronym, si4 standard_UTC_offset, si4 DST_offset);
 si1			*G_find_metadata_file_m13(const si1 *path, si1 *md_path);
 si8			G_find_record_index_m13(FPS_m13 *rec_inds_fps, si8 target_time, ui4 mode, si8 low_idx);
+si1			*G_find_timezone_acronym_m13(si1 *timezone_acronym, si4 standard_UTC_offset, si4 DST_offset);
+si4			G_first_open_segment_m13(void *level_header);  // index of first open (non-NULL) segment on the reference channel; (si4) FALSE_m13 if none
 si8			G_flen_m13(FILE_m13 *fp, const si1 *path);
 //si8 			G_frame_number_for_uutc_m13(void *level_header, si8 target_uutc, ui4 mode, ...); // varargs (level_header == NULL): si8 ref_frame_number, si8 ref_uutc, sf8 frame_rate
 tern			G_free_channel_m13(void *ptr);
@@ -3958,10 +4007,13 @@ tern			G_full_path_m13(const si1 *path, si1 *full_path);
 FUNCTION_STACK_m13	*G_function_stack_m13(pid_t_m13 _id);
 si1			**G_generate_numbered_names_m13(si1 **names, const si1 *prefix, si4 n_names);
 tern			G_generate_password_data_m13(FPS_m13 *fps, const si1 *L1_pw, const si1 *L2_pw, const si1 *L3_pw, const si1 *L1_pw_hint, const si1 *L2_pw_hint, ui1 lib_generated_mask, tern check_policy); // lib_generated_mask: per-level bit (bit0=L1, bit1=L2, bit2=L3) set when that level's pw came from G_generate_password_m13 (=> lower per-level KDF floor). check_policy: run G_check_new_password (FALSE for a re-key of legacy passwords, which are accepted as-is)
-si8			G_generate_recording_time_offset_m13(si8 recording_start_time_uutc);
 tern			G_generate_password_m13(si1 *password, si4 n_chars, ui1 *suggested_kdf_exponent); // machine password: keyboard-ASCII, CSPRNG; n_chars<=0 => PASSWORD_BYTES; returns a LOW suggested KDF exponent (entropy is in the password)
+si8			G_generate_recording_time_offset_m13(void *level_header, si8 recording_start_time_uutc); // level resolves the pg whose constants are set (writer-side, 2026-08-10); NULL => current thread
 si1			*G_generate_segment_name_m13(si1 *segment_name, FPS_m13 *fps);
 ui8			G_generate_UID_m13(ui8 *uid);
+void		*G_guarded_table_alloc_m13(size_t bytes);  // page-aligned, PROT_NONE guard pages either side; for computed read-forever tables
+tern		G_guarded_table_seal_m13(void *table, size_t bytes);  // PROT_READ after filling: wild writes fault at the store
+tern		G_guarded_table_free_m13(void *table, size_t bytes);  // restores RW & frees; (ptr, bytes) must match the alloc
 si8			G_header_offset_m13(FILE_m13 *fp, const si1 *path);
 tern			G_include_record_m13(ui4 type_code, si4 *record_filters);
 si8			G_index_for_time_m13(void *level_header, si8 target_time, ui4 mode, ...);  // varargs(lh == NULL): si8 ref_index, si8 ref_time, sf8 rate
@@ -3969,12 +4021,14 @@ tern			G_init_global_tables_m13(tern init_all_tables);
 tern			G_init_globals_m13(tern init_all_tables, const si1 *app_path, ...); // varargs(app_path): ui4 version_major, ui4 version_minor
 tern			G_init_medlib_m13(tern init_all_tables, const si1 *app_path, ...); // varargs(app_path): ui4 version_major, ui4 version_minor;
 tern			G_init_metadata_m13(FPS_m13 *fps, tern init_for_update);
+tern			G_init_metadata_struct_m13(METADATA_m13 *md, ui4 type_code, tern init_for_update, PROC_GLOBS_m13 *pg); // bare-struct initializer (sections 2 & 3; section 1 untouched); NULL pg => current thread
 SLICE_m13		*G_init_slice_m13(SLICE_m13 *slice);
 tern			G_init_timezone_tables_m13(void);
 tern			G_init_universal_header_m13(FPS_m13 *fps, ui4 type_code, tern generate_file_UID, tern originating_file);
 tern			G_is_level_header_m13(void *ptr);
 tern			G_is_video_data_m13(const si1 *path);
 ui4			G_level_m13(const si1 *full_file_name, ui4 *input_type_code);
+tern			G_local_timezone_m13(TIMEZONE_INFO_m13 *timezone_info); // fill from the machine's OWN timezone configuration (no network, no shell): acronyms/names + standard UTC offset for G_set_time_constants_m13()'s cascade; FALSE => could not determine (callers fall back to G_location_info_m13())
 tern			G_location_info_m13(LOCATION_INFO_m13 *loc_info, const si1 *ip_str, const si1 *ipinfo_token, tern set_timezone_globals, tern prompt);
 tern			G_MED_file_m13(ui4 type_code);
 ui4			G_MED_path_components_m13(const si1 *path, si1 *MED_dir, si1* MED_name); // passed path must exist (accepts a file within a MED directory)
@@ -3995,6 +4049,11 @@ SEG_m13			*G_open_segment_m13(SEG_m13 *seg, SLICE_m13 *slice, const si1 *seg_pat
 pthread_rval_m13	G_open_segment_thread_m13(void *ptr);
 SESS_m13		*G_open_session_m13(SESS_m13 *sess, SLICE_m13 *slice, void *file_list, si4 list_len, ui8 flags, const si1 *password, const si1 *index_channel_name);
 si8			G_pad_m13(ui1 *buffer, si8 content_len, ui4 alignment);
+ui4			G_page_size_m13(void); // system memory page size: HW_params' known value; direct query fallback (lock-free: usable from allocation primitives)
+ui4			G_map_granularity_m13(void); // mapping-placement granularity: page size on Unix, allocation granularity (64 KB) on Windows; same lock-free contract
+// NOTE: applications needing the process-wide tables (HW_params, NET_params, ...) declare
+// "extern GLOBALS_m13 *globals_m13;" & read globals_m13->tables-> directly (external linkage in
+// non-MATLAB builds; under MATLAB_m13 the mex sees the statics, so no accessor is needed there either)
 tern			G_path_parts_m13(const si1 *file_name, si1 *path, si1 *name, si1 *extension);
 void			G_pop_behavior_exec_m13(const si1 *function, const si4 line);
 void			G_pop_function_exec_m13(const si1 *function, const si4 line);
@@ -4008,8 +4067,6 @@ PROC_GLOBS_m13		*G_proc_globs_find_m13(void *level_header); // as G_proc_globs_m
 tern			G_proc_globs_init_m13(PROC_GLOBS_m13 *pg);
 PROC_GLOBS_m13		*G_proc_globs_new_m13(void *level_header);
 tern			G_process_password_data_m13(FPS_m13 *fps, const si1 *unspecified_pw);
-tern			G_password_info_m13(const si1 *path, const si1 *password, PASSWORD_INFO_m13 *info); // read one header (+ §1 hints); password NULL = info only (no KDF); else validate & set info->access_level. No open, no side effects, no record scan.
-tern			G_set_encryption_map_m13(UH_m13 *uh, si1 metadata_section_2, si1 metadata_section_3, si1 time_series_data, si1 video_data, si1 maximum_record_encryption_level); // stamp the session-wide encryption levels into a UH at creation (call on every UH); pass ENCRYPTION_LEVEL_NO_ENTRY_m13 for maximum_record_encryption_level unless the creator knows it (0 = no passwords / all readable, or a fixed policy)
 tern			G_propagate_flags_m13(void *level_header, ui8 new_flags);
 void			G_push_behavior_exec_m13(const si1 *function, const si4 line, ui4 code);
 void			G_push_function_exec_m13(const si1 *function, const si4 line);
@@ -4033,8 +4090,8 @@ void			G_remove_behavior_exec_m13(const si1 *function, const si4 line, ui4 code)
 void			G_remove_recording_time_offset_m13(si8 *time, si8 recording_time_offset);
 tern			G_reset_metadata_for_update_m13(FPS_m13 *fps);
 si4			G_search_mode_m13(SLICE_m13 *slice);
-void			G_secure_erase_m13(void *buffer, size_t n_bytes); // volatile zeroing of key material (plain memset before return/free is legally elided by optimizers)
 si4			G_search_Sgmt_records_m13(Sgmt_REC_m13 *Sgmt_records, si4 n_segs, SLICE_m13 *slice, ui4 search_mode);
+void			G_secure_erase_m13(void *buffer, size_t n_bytes); // volatile zeroing of key material (plain memset before return/free is legally elided by optimizers)
 si4			G_segment_for_index_m13(void *level_header, si8 target_index);
 si4			G_segment_for_path_m13(const si1 *path);
 si4			G_segment_for_time_m13(void *level_header, si8 target_time);
@@ -4044,11 +4101,12 @@ tern			G_sendgrid_email_m13(const si1 *sendgrid_key, const si1 *to_email, const 
 tern			G_session_directory_m13(FPS_m13 *fps);
 si1			*G_session_path_for_path_m13(const si1 *path, si1 *sess_path);
 si8			G_session_samples_m13(void *level_header, sf8 rate);
-void			G_set_error_exec_m13(const si1 *function, si4 line, si4 code, const si1 *message, ...); // vararg(code == E_SIG_m13): si4 sig_num (followed by optional formatting string values)
 tern			G_set_anchor_public_key_m13(const ui1 *public_key, ui1 key_ID); // configure the type 2 recovery anchor for subsequent session creation (NULL clears; process-wide, set once at startup)
+tern			G_set_encryption_map_m13(UH_m13 *uh, si1 metadata_section_2, si1 metadata_section_3, si1 time_series_data, si1 video_data, si1 maximum_record_encryption_level); // stamp the session-wide encryption levels into a UH at creation (call on every UH); pass ENCRYPTION_LEVEL_NO_ENTRY_m13 for maximum_record_encryption_level unless the creator knows it (0 = no passwords / all readable, or a fixed policy)
+void			G_set_error_exec_m13(const si1 *function, si4 line, si4 code, const si1 *message, ...); // vararg(code == E_SIG_m13): si4 sig_num (followed by optional formatting string values)
 tern			G_set_session_globals_m13(void *level_header, const si1 *MED_path, const si1 *password);
 void			G_set_signal_traps_m13(tern set);
-tern			G_set_time_constants_m13(TIMEZONE_INFO_m13 *timezone_info, si8 session_start_time, tern prompt);
+tern			G_set_time_constants_m13(void *level_header, TIMEZONE_INFO_m13 *timezone_info, si8 session_start_time, tern prompt); // level resolves the pg whose constants are set; NULL => current thread (the single-session case; multiple per-pg constant sets are new in m13)
 Sgmt_REC_m13		*G_Sgmt_records_m13(void *level_header, si4 search_mode);
 ui4			G_Sgmt_records_source_m13(void *level_header, Sgmt_REC_m13 *Sgmt_recs);
 tern			G_show_behavior_m13(ui4 behavior_code);
@@ -4106,7 +4164,7 @@ void			G_write_medlibrc_m13(const si1 *path);
 
 
 //**********************************************************************************//
-//************************** Windows Specific Functions (WN) ***********************//
+// MARK: Windows Specific Functions (WN)
 //**********************************************************************************//
 
 #ifdef WINDOWS_m13
@@ -4230,13 +4288,13 @@ typedef HRESULT (CALLBACK* ZWSETTIMERRESTYPE)(ULONG, BOOLEAN, ULONG *);
 typedef HRESULT (CALLBACK* NTDELAYEXECTYPE)(BOOLEAN, LARGE_INTEGER *);
 
 // Prototypes
-FILETIME	WN_uutc_to_win_time_m13(si8 uutc);
 tern		WN_cleanup_m13(void);
 tern		WN_clear_m13(void);
 si8		WN_date_to_uutc_m13(sf8 date);
+si8		WN_filetime_to_uutc_m13(ui1 *win_filetime); // for conversion of windows file time to uutc on any platform
+tern		WN_init_terminal_m13(void);
 si4 		WN_ls_1d_to_buf_m13(const si1 **dir_strs, si4 n_dirs, tern full_path, si1 **buffer);
 si4		WN_ls_1d_to_tmp_m13(const si1 **dir_strs, si4 n_dirs, tern full_path, si1 *temp_file);
-tern		WN_init_terminal_m13(void);
 void		WN_nap_m13(ui8 ns);  // total nanoseconds (no timespec: UCRT tv_nsec is 4 bytes)
 void		*WN_query_information_file_m13(void *fp, si4 info_class, void *fi);
 tern		WN_reset_terminal_m13(void);
@@ -4244,15 +4302,15 @@ tern		WN_socket_startup_m13(void);
 si4		WN_system_m13(const si1 *command);
 si8		WN_time_to_uutc_m13(FILETIME win_time);
 sf8		WN_uutc_to_date_m13(si8 uutc);
+FILETIME	WN_uutc_to_win_time_m13(si8 uutc);
 tern		WN_windify_file_paths_m13(si1 *target, const si1 *source);
 si1		*WN_windify_format_string_m13(const si1 *fmt);
 #endif // WINDOWS_m13
-si8		WN_filetime_to_uutc_m13(ui1 *win_filetime); // for conversion of windows file time to uutc on any platform
 
 
 
 //**********************************************************************************//
-//*************************** MED Alignmment Checking (ALCK) ***********************//
+// MARK: MED Alignment Checking (ALCK)
 //**********************************************************************************//
 
 // Prototypes
@@ -4260,7 +4318,7 @@ si8		WN_filetime_to_uutc_m13(ui1 *win_filetime); // for conversion of windows fi
 
 
 //**********************************************************************************//
-//****************************** Allocation Tracking (AT) **************************//
+// MARK: Allocation Tracking (AT)
 //**********************************************************************************//
 
 #ifdef AT_DEBUG_m13
@@ -4313,7 +4371,7 @@ void	**AT_recalloc_2D_m13(const si1 *function, si4 line, void **ptr, size_t curr
 
 
 //**********************************************************************************//
-//*********************************** Strings (STR) ********************************//
+// MARK: Strings (STR)
 //**********************************************************************************//
 
 // Prototypes
@@ -4355,7 +4413,7 @@ void		*STR_wchar2char_m13(void *target, const wchar_t *source);
 
 
 //**********************************************************************************//
-//************************** Compression & Computation (CMP) ***********************//
+// MARK: Compression & Computation (CMP)
 //**********************************************************************************//
 
 // CMP: Miscellaneous Constants
@@ -4391,6 +4449,7 @@ void		*STR_wchar2char_m13(void *target, const wchar_t *source);
 // slower); the thorough end is estimator-bound, so it is exactly what the log table (CMP_log_table) accelerates.
 #define CMP_SRRED_SCALE_WINDOW_DEFAULT_m13		((si4) 100) // windowed-tracker half-width in scale steps (0 => full anchor scan every block). Edge-expands if the min lands on a boundary; empirically within +/-0.1% of the full-scan optimum.
 #define CMP_SRRED_SCALE_REFRESH_DEFAULT_m13		((si8) 128) // blocks between forced full-range anchor scans (catches drift/jumps the local window misses)
+#define CMP_SRRED_OVF_HIST_MAX_SPAN_m13			((si8) 1 << 20) // widest overflow value range the scan's per-block value histogram will cover (4 MB of ui4 bins); wider-range blocks fall back to the raw overflow walk
 #define CMP_SRRED_SCALE_BAILOUT_MULT_DEFAULT_m13	((sf8) 2.5) // anchor-scan early-exit: keep scanning until scale exceeds this x the best-so-far, then bail (0.0 => no bailout, true full scan). 2.5: ~22-25x faster than full scan for <=0.02% size cost, with margin above the loss cliff near 1.5-2.0
 #define CMP_SRRED_SCALE_BAILOUT_SPAN_m13		((sf8) 0.05) // minimum ABSOLUTE span past the best-so-far before bailing: exit = max(mult x scale, scale + span). A multiplicative window alone is very narrow at small scales (2.5 x 0.01 spans just 0.025), so a shallow shelf of local minima at low scale can arm the bailout & exit before the true optimum is ever reached (measured: 0.8% on real data). 0.05 = 2x the largest shelf-to-optimum-basin bridge observed across the 8 development datasets (0.027)
 // preset sets (assign all three fields together):
@@ -4765,7 +4824,7 @@ void		*STR_wchar2char_m13(void *target, const wchar_t *source);
 // REMOVED" (recomputing on filtered data is ~0 by construction - scorer & filter share the template
 // estimator - so the pre-filter score is deposited instead: it records how much the data was manipulated).
 #define CPS_DF_LINE_NOISE_FILTERED_m13		((ui8) 1 << 16)
-#define CPS_DF_ENTROPY_DEFICIT_SCORE_m13		((ui8) 1 << 25)
+#define CPS_DF_ENTROPY_DEFICIT_SCORE_m13	((ui8) 1 << 25)
 #define CPS_DF_NON_NORMALITY_SCORE_m13		((ui8) 1 << 26)
 #define CPS_DF_LLP_SCORE_m13			((ui8) 1 << 27)
 #define CPS_DF_ALL_NOISE_SCORES_m13		( CPS_DF_LINE_NOISE_SCORE_m13 | CPS_DF_ENTROPY_DEFICIT_SCORE_m13 | \
@@ -5273,8 +5332,11 @@ typedef struct {
 	si8	SRRED_scale_refresh; // blocks between forced full-range anchor scans. Smaller => more frequent full scans. Default CMP_SRRED_SCALE_REFRESH_DEFAULT_m13.
 	sf8	SRRED_scale_bailout_mult; // anchor-scan adaptive-bailout multiple (0.0 => no bailout, true full scan). Default CMP_SRRED_SCALE_BAILOUT_MULT_DEFAULT_m13.
 	si8	SRRED_overflow_samples; // number of samples in the overflow buffer
-	sf8	SRRED_scale_center; // scale-search windowed tracker: previous block's optimal scale (< 0.0 => no anchor yet, do a full anchor scan); tracks the optimum block-to-block so most blocks scan only a small window (see CMP_SRRED_find_parameters_m13)
+	sf8	SRRED_scale_center; // scale-search windowed tracker: previous block's optimal scale (< 0.0 => no anchor yet, do a full anchor scan; == 0.0 => NO-SCALE state: last full scan concluded nothing beats unscaled - skip the ladder & redirect to RED2 until the refresh re-checks); tracks the optimum block-to-block so most blocks scan only a small window (see CMP_SRRED_find_parameters_m13)
 	si8	SRRED_scale_refresh_ctr; // blocks since the last full anchor scan; forces a periodic re-anchor (params.SRRED_scale_refresh) to catch drift the window missed
+	CMP_BUFFERS_m13	*SRRED_scan_buffers; // overflow-VALUE histogram for the scale scan (built once per block by CMP_SRRED_find_parameters_m13(); each scale step then iterates distinct values, not raw samples - the overflow re-processing was the scan's dominant cost on wide data). Freed by CMP_free_CPS_m13()
+	si4	SRRED_ovf_hist_base; // value of histogram bin 0 (the block's minimum overflow value)
+	si4	SRRED_ovf_hist_span; // number of bins; 0 => histogram absent (estimator walks the raw overflow array)
 	tern	SRRED_sub_encode; // TRUE only while CMP_SRRED_encode_m13() runs a sub-stream through a sub-encoder. Gates MBE raw mode in CMP_MBE_estimate_bytes_m13(): raw keeps input_buffer, which holds the OUTER block's samples, never the sub-stream => raw would silently encode the wrong data. Whole-block MBE (incl. the scale-search seed & every standalone encoder) keeps raw pricing.
 	si8	n_stats_entries; // number of bins in the counts array (also used in find derivative level)
 
@@ -5299,8 +5361,21 @@ typedef struct {
 	
 	// compression arrays
 	si1			*keysample_buffer; // passed in both compression & decompression
-	si4			*derivative_buffer; // used if needed in compression & decompression, size of maximum block differences
-	si4			*next_derivative_buffer; // used in find_derivative_level option & SRRED
+	// ⚠️ derivative_buffer & next_derivative_buffer are RETASKABLE VIEWS, NOT ownership. Codecs take only the
+	// CPS, so params.derivative_buffer IS a codec's input channel & pointing it elsewhere is USING that
+	// interface: CMP_differentiate_m13()'s search swaps the pair on every winning level (so a losing candidate
+	// costs nothing to abandon - the prior derivative is never recalculated), & SRRED aims it at
+	// residuals_buffer for its residual sub-encode (the two sub-encodes are sequential, so the derivative array
+	// is not live then). Ownership therefore lives in derivative_bufs[], which NOTHING retasks, & only
+	// CMP_free_CPS_m13() / CMP_realloc_CPS_m13() touch it.
+	// ⭐⭐ Welding the free() handle onto a field DESIGNED to move is what double-freed this pair (2026-08-14):
+	// ownership correctness became a property of every exit path of the search, & two of them did not restore.
+	// Same class as "never put ownership in the size field" - here, never put ROLE in the OWNERSHIP pointer.
+	si4			*derivative_bufs[2]; // OWNS the pair. Deliberately two separate allocations, NOT one carved
+					// bundle: adjacency would turn an overrun into a silent write into the neighbour
+					// instead of a redzone hit (Matt: an overrun reveals a defect - do not mask it)
+	si4			*derivative_buffer; // VIEW: current derivative stream (also the codec input channel). Never freed through this field
+	si4			*next_derivative_buffer; // VIEW: the search's candidate scratch. Never freed through this field
 	si4			*overflows_buffer; // used in SRRED: separated overflows for the count-domain scale search (compression)
 	si4			*residuals_buffer; // used in SRRED: residual stream (both modes - decode reads it). Distinct from the two above: SRRED needs derivatives, residuals & overflows live simultaneously, so these cannot share storage
 	si4			*detrended_buffer; // used if needed in compression, size of decompressed block
@@ -5462,7 +5537,7 @@ tern	CMP_zero_buffers_m13(CMP_BUFFERS_m13 *buffers);
 
 
 //**********************************************************************************//
-//*************************** Cyclic Redundancy Check (CRC) ************************//
+// MARK: Cyclic Redundancy Check (CRC)
 //**********************************************************************************//
 
 // ATTRIBUTION
@@ -5512,7 +5587,7 @@ tern	CRC_validate_m13(const ui1 *block_ptr, si8 block_bytes, crc4 crc_to_validat
 
 
 //**********************************************************************************//
-//****************** Unicode Transformation Format: 8-bit (UTF8) *******************//
+// MARK: Unicode Transformation Format: 8-bit (UTF8)
 //**********************************************************************************//
 
 // Prototypes
@@ -5529,7 +5604,7 @@ tern		UTF8_valid_str_m13(const si1 *s);
 
 
 //**********************************************************************************//
-//****************** American Encryption Standard: 128 bit (AES) *******************//
+// MARK: American Encryption Standard: 128 bit (AES)
 //**********************************************************************************//
 
 // ATRIBUTION
@@ -5651,7 +5726,7 @@ void	AES_sub_bytes_m13(ui1 state[][4]);
 
 
 //***********************************************************************//
-//***************** Secure Hash Algorithm: 256 bit (SHA) ****************//
+// MARK: Secure Hash Algorithm: 256 bit (SHA)
 //***********************************************************************//
 
 // ATTRIBUTION:
@@ -5712,17 +5787,25 @@ void	SHA_init_m13(SHA_CTX_m13 *ctx);
 tern	SHA_init_tables_m13(void);
 ui1	*SHA_pbkdf2_m13(const ui1 *pw, si4 pw_bytes, const ui1 *salt, si4 salt_bytes, ui4 iterations, ui1 *dk);
 ui1	*SHA_pbkdf2_resume_m13(const ui1 *pw, si4 pw_bytes, const ui1 *salt, si4 salt_bytes, ui4 from_iter, ui4 to_iter, ui1 *u, ui1 *dk); // resumable PBKDF2: advance (u,dk) state from_iter->to_iter; dk snapshot at any to_iter == PBKDF2(that count). from_iter 0 initializes.
-void	SKC_id_m13(UH_m13 *uh, ui1 *cache_id);					// cache_id = SHA-256(KDF salt || kdf_exponent)[0:SESSION_KEY_CACHE_ID_BYTES_m13]
-tern	SKC_get_m13(const ui1 *cache_id, ui1 *master, ui1 *fp_out);		// TRUE = hit (master filled, unexpired; fp_out (may be NULL) gets the stored password fingerprint); FALSE = miss/expired/unavailable
-tern	SKC_put_m13(const ui1 *cache_id, const ui1 *master, const ui1 *fp, si4 timeout_sec);	// store/refresh (resets expiry); fp = password fingerprint (NULL => zeros); timeout clamped to GLOBALS_SESSION_KEY_CACHE_TIMEOUT_MAX_m13
-tern	SKC_evict_m13(const ui1 *cache_id);
 void	SHA_transform_m13(SHA_CTX_m13 *ctx, const ui1 *data);
 void	SHA_update_m13(SHA_CTX_m13 *ctx, const ui1 *data, si8 len);
 
 
 
 //***********************************************************************//
-//************ X25519 Elliptic Curve Diffie-Hellman (XEC) ***************//
+// MARK: Session Key Cache (SKC)
+//***********************************************************************//
+
+// Prototypes (backend selection & GLOBALS_SESSION_KEY_CACHE_* constants are defined near the
+// top of this file - the SKC_BACKEND_m13 value must exist before any code is parsed)
+tern	SKC_evict_m13(const ui1 *cache_id);
+tern	SKC_get_m13(const ui1 *cache_id, ui1 *master, ui1 *fp_out);		// TRUE = hit (master filled, unexpired; fp_out (may be NULL) gets the stored password fingerprint); FALSE = miss/expired/unavailable
+void	SKC_id_m13(UH_m13 *uh, ui1 *cache_id);					// cache_id = SHA-256(KDF salt || kdf_exponent)[0:SESSION_KEY_CACHE_ID_BYTES_m13]
+tern	SKC_put_m13(const ui1 *cache_id, const ui1 *master, const ui1 *fp, si4 timeout_sec);	// store/refresh (resets expiry); fp = password fingerprint (NULL => zeros); timeout clamped to GLOBALS_SESSION_KEY_CACHE_TIMEOUT_MAX_m13
+
+
+//***********************************************************************//
+// MARK: X25519 Elliptic Curve Diffie-Hellman (XEC)
 //***********************************************************************//
 
 // X25519 scalar multiplication on Curve25519 per RFC 7748, used ONLY for the recovery-anchor sealed box
@@ -5752,7 +5835,7 @@ tern	XEC_unseal_m13(ui1 *plaintext_block, const ui1 *sealed_box, const ui1 *reci
 
 
 //**********************************************************************************//
-//*************************  DGST: Canonical File Digests  ************************//
+// MARK: DGST: Canonical File Digests
 //**********************************************************************************//
 
 // The canonical MED digest covers: data region first, universal header last, pcrc regions excluded
@@ -5813,7 +5896,7 @@ void	DGST_update_m13(FILE_m13 *fp, const void *ptr, si8 n_bytes, si8 offset); //
 
 
 //**********************************************************************************//
-//**********************  VID: Video Container Keyframe Walk  *********************//
+// MARK: VID: Video Container Keyframe Walk
 //**********************************************************************************//
 
 // Enumerates the keyframes (sync samples) of a video container from the container's own tables,
@@ -5873,7 +5956,7 @@ void		VID_walk_free_m13(VID_WALK_m13 **walk);
 
 
 //**********************************************************************************//
-//********************************** Filter (FILT) *********************************//
+// MARK: Filter (FILT)
 //**********************************************************************************//
 
 // ATTRIBUTION
@@ -6103,7 +6186,7 @@ tern	FILT_unsymmeig_m13(sf8 **a, si4 poles, FILT_COMPLEX_m13 *eigs);
 
 
 //**********************************************************************************//
-//******************************** Data Matrix (DM) ********************************//
+// MARK: Data Matrix (DM)
 //**********************************************************************************//
 
 //	Extent Mode (EXTMD) Flags:
@@ -6200,63 +6283,6 @@ tern	FILT_unsymmeig_m13(sf8 **a, si4 poles, FILT_COMPLEX_m13 *eigs);
 #define DM_MAXIMUM_INPUT_FREQUENCY_m13		((sf8) -3.0) // value chosen to distinguish from FREQUENCY_NO_ENTRY_m13 (-1.0) & RATE_VARIABLE_m13 (-2.0)
 #define DM_MAXIMUM_INPUT_COUNT_m13		((si8) -3) // value chosen to parallel DM_MAXIMUM_INPUT_FREQUENCY_m13 & not conflict with NUMBER_OF_SAMPLES_NO_ENTRY_m13 (-1)
 
-// ---------------- DM matrix-fill code generation macros ----------------
-
-// Fast path: copy a channel's decompressed si4 samples straight into the caller's matrix, converting to
-// TYPE via CONV (a round function for integers, a cast for floats). One pattern per element type; channel-
-// vs sample-major layout is handled inside. Expands inside G_DM_channel_thread_m13 & CAPTURES ITS LOCALS:
-//   dm, chan, slice, seg_idx, pt_base, chan_offset, samp_offset, chan_idx, i, j, k
-// Defined here rather than in the .c only to keep #defines out of the .c - it is not a general-use macro.
-#define DM_PASSTHRU_m13(TYPE, CONV) \
-		do { \
-			if (dm->flags & DM_FMT_CHANNEL_MAJOR_m13) {  /* contiguous per channel */ \
-				TYPE *_d = (TYPE *) pt_base + chan_offset; \
-				for (i = 0, j = seg_idx; i < slice->n_segs; ++i, ++j) { \
-					si4 *_s = chan->segs[j]->ts_data_fps->params.cps->decompressed_data; \
-					for (k = SLICE_IDX_COUNT_S_m13(chan->segs[j]->slice); k--;) *_d++ = CONV((sf8) *_s++); \
-				} \
-			} else {  /* DM_FMT_SAMPLE_MAJOR_m13: stride by channel_count */ \
-				TYPE *_d = ((TYPE *) pt_base + chan_idx) - samp_offset; \
-				for (i = 0, j = seg_idx; i < slice->n_segs; ++i, ++j) { \
-					si4 *_s = chan->segs[j]->ts_data_fps->params.cps->decompressed_data; \
-					for (k = SLICE_IDX_COUNT_S_m13(chan->segs[j]->slice); k--;) *(_d += samp_offset) = CONV((sf8) *_s++); \
-				} \
-			} \
-		} while (0)
-
-// Store out_buf (+ optional trace min/max) into the caller's matrix in the requested element type & layout.
-// One pattern per type; channel- vs sample-major and trace-ranges are handled inside. CONV converts sf8 ->
-// TYPE (a round function for integers, a cast for floats). sf8 channel-major was written straight into
-// dm->data during interpolation, so it is the one case that needs no copy. Expands inside the DM matrix
-// build & CAPTURES ITS LOCALS:
-//   dm, data_base, min_base, max_base, chan_offset, samp_offset, chan_idx, out_buf, out_mins, out_maxs,
-//   trace_ranges, i
-// Defined here rather than in the .c only to keep #defines out of the .c - it is not a general-use macro.
-#define DM_STORE_m13(TYPE, CONV) \
-	do { \
-		sf8 *_o = out_buf; \
-		if (dm->flags & DM_FMT_CHANNEL_MAJOR_m13) {  /* contiguous per channel */ \
-			TYPE *_d = (TYPE *) data_base + chan_offset; \
-			if (trace_ranges == TRUE_m13) { \
-				sf8 *_omn = out_mins, *_omx = out_maxs; \
-				TYPE *_dmn = (TYPE *) min_base + chan_offset, *_dmx = (TYPE *) max_base + chan_offset; \
-				for (i = dm->valid_sample_count; i--;) { *_d++ = CONV(*_o++); *_dmn++ = CONV(*_omn++); *_dmx++ = CONV(*_omx++); } \
-			} else { \
-				for (i = dm->valid_sample_count; i--;) *_d++ = CONV(*_o++); \
-			} \
-		} else {  /* DM_FMT_SAMPLE_MAJOR_m13: stride by channel_count */ \
-			TYPE *_d = ((TYPE *) data_base + chan_idx) - samp_offset; \
-			if (trace_ranges == TRUE_m13) { \
-				sf8 *_omn = out_mins, *_omx = out_maxs; \
-				TYPE *_dmn = ((TYPE *) min_base + chan_idx) - samp_offset, *_dmx = ((TYPE *) max_base + chan_idx) - samp_offset; \
-				for (i = dm->valid_sample_count; i--;) { *(_d += samp_offset) = CONV(*_o++); *(_dmn += samp_offset) = CONV(*_omn++); *(_dmx += samp_offset) = CONV(*_omx++); } \
-			} else { \
-				for (i = dm->valid_sample_count; i--;) *(_d += samp_offset) = CONV(*_o++); \
-			} \
-		} \
-	} while (0)
-
-
 
 // Note: if arrays are allocted as 2D arrays, array[0] is beginning of one dimensional array containing (channel_count * sample_count) values of specfified type
 typedef struct {
@@ -6316,7 +6342,7 @@ tern			DM_transpose_out_of_place_m13(DATA_MATRIX_m13 *in_matrix, DATA_MATRIX_m13
 
 
 //**********************************************************************************//
-//********************************* Transmission (TR) ******************************//
+// MARK: Transmission (TR)
 //**********************************************************************************//
 
 // Transmission Header Types
@@ -6535,7 +6561,7 @@ si1		*TR_strerror_m13(si4 err_num);
 
 
 //**********************************************************************************//
-//********************************** Time Zone (TZ) ********************************//
+// MARK: Time Zone (TZ)
 //**********************************************************************************//
 
 // Notes:
@@ -6982,7 +7008,7 @@ si1		*TR_strerror_m13(si4 err_num);
 
 
 //**********************************************************************************//
-//*********************************** Database (DB) ********************************//
+// MARK: Database (DB)
 //**********************************************************************************//
 
 // Currently only PostGres databases are supported.
@@ -7001,7 +7027,7 @@ PGresult	*DB_execute_command_m13(PGconn *conn, const si1 *command, si4 *rows, si
 
 
 //***********************************************************************//
-//*************** MED Versions of Standard Posix Functions **************//
+// MARK: MED Versions of Standard Posix Functions
 //***********************************************************************//
 
 // the calling interfaces to these function are generally those defined by Posix
@@ -7070,25 +7096,23 @@ tern		md_m13(const si1 *dir); // synonym for mkdir()
 void		*memalign_m13(void *addr, si4 alignment);  // (alignment == -1): page align
 void		*memset_m13(void *ptr, si4 val, si8 n_members, ...);  // vargargs(n_members < 0): const void *el_val (val == el_size)
 tern		mkdir_m13(const si1 *dir); // make directory
-tern		mlock_m13(void *addr, si8 len);  // (len < 0): len = -len, lock regardless of page alignment
 void		*memcpy_m13(void *target, const void *source, size_t n_bytes);
 void		*memmove_m13(void *target, const void *source, size_t n_bytes);  // uses memcpy() if regions do not overlap
-void		*G_guarded_table_alloc_m13(size_t bytes);  // page-aligned, PROT_NONE guard pages either side; for computed read-forever tables
-tern		G_guarded_table_seal_m13(void *table, size_t bytes);  // PROT_READ after filling: wild writes fault at the store
-tern		G_guarded_table_free_m13(void *table, size_t bytes);  // restores RW & frees; (ptr, bytes) must match the alloc
+tern		mlock_m13(void *addr, si8 len);  // (len < 0): len = -len, lock regardless of page alignment
 si4		mprotect_m13(void *address, size_t len, si4 protection);
 si1		mreadable_m13(void *addr, size_t len, tern full_range);  // checks if memory is readable, & returns alignment
-si1		mwritable_m13(void *addr, size_t len, tern full_range);  // checks if memory is writable, & returns alignment
 tern		munlock_m13(void *addr, size_t len);
+si1		mwritable_m13(void *addr, size_t len, tern full_range);  // checks if memory is writable, & returns alignment
 tern		mv_m13(const si1 *path, const si1 *new_path);  // move, rename
 void		nanosleep_m13(struct timespec *tv);
 void		nap_m13(const si1 *nap_str);  // sleep with duration set by string
 struct timespec	*nap_timespec_m13(const si1 *nap_str, struct timespec *nap);
+si4		printf_m13(const si1 *fmt, ...) FMT_ATTR_m13(1, 2);
+si4		pthread_create_m13(pthread_t_m13 *thread, pthread_attr_t_m13 *attributes, pthread_fn_m13 start_routine, void *arg); // new thread inherits spawner's current behavior (snapshot) as its base stack entry
 si4		pthread_equal_m13(pthread_t_m13 thread_1, pthread_t_m13 thread_2);  // returns exactly 1 if same thread, 0 if not (POSIX guarantees only non-zero; narrowed so all platforms agree)
 void		pthread_exit_m13(void *ptr);
 si1		*pthread_getname_m13(pthread_t_m13 thread, si1 *thread_name, size_t name_len);
 si1		*pthread_getname_id_m13(pid_t_m13 _id, si1 *thread_name, size_t name_len);  // get thread name by thread id
-si4		pthread_create_m13(pthread_t_m13 *thread, pthread_attr_t_m13 *attributes, pthread_fn_m13 start_routine, void *arg); // new thread inherits spawner's current behavior (snapshot) as its base stack entry
 si4		pthread_join_m13(pthread_t_m13 thread, void **value_ptr);
 si4		pthread_kill_m13(pthread_t_m13 thread, si4 signal);
 si4		pthread_mutex_destroy_m13(pthread_mutex_t_m13 *mutex_p);
@@ -7097,17 +7121,16 @@ si4		pthread_mutex_lock_m13(pthread_mutex_t_m13 *mutex_p);
 si4		pthread_mutex_trylock_m13(pthread_mutex_t_m13 *mutex_p);
 si4		pthread_mutex_unlock_m13(pthread_mutex_t_m13 *mutex_p);
 pthread_t_m13	pthread_self_m13(void);
-si4		printf_m13(const si1 *fmt, ...) FMT_ATTR_m13(1, 2);
 si4		putc_m13(si4 c, void *fp);
 si4		putch_m13(si4 c);
 si4		putchar_m13(si4 c);
-si4		random_m13(void); // 31-bit random number using system generator (posix standard)
 ui4		rand32_m13(void); // 32-bit random number using system generator
 ui4		rand32_med_m13(void); // 32-bit random number using medlib generator (replicable sequences across platforms)
 ui4		rand32_med_wz_m13(volatile ui4 *w, volatile ui4 *z); // faster, less convenient, version of rand32_med_m13()
 ui8		rand64_m13(void); // 64-bit random number using system random number generator
 ui8		rand64_med_m13(void); // 64-bit random number using medlib generator (replicable sequences across platforms)
 ui8		rand64_med_wz_m13(volatile ui4 *w, volatile ui4 *z); // faster, less convenient, version of rand64_med_m13()
+si4		random_m13(void); // 31-bit random number using system generator (posix standard)
 tern		rm_m13(const si1 *arg1, ...);  // remove (Unix rm/rmdir parallel): "rm_m13(path)" or, recursively, "rm_m13(\"-R\", path)" - the option LEADS, as in the shell (see cp_m13()); a non-empty directory is only removed with "-R"
 si4		scanf_m13(const si1 *fmt, ...);
 si4		sem_init_m13(sem_t_m13 *sem, si4 shared, ui4 init_val);
@@ -7115,8 +7138,8 @@ sem_t_m13	*sem_open_m13(const si1 *name, si4 o_flags, ...);  // (MacOS only) var
 si4		sem_post_m13(sem_t_m13 *sem);
 si4		sem_trywait_m13(sem_t_m13 *sem);
 si4		sem_wait_m13(sem_t_m13 *sem);
-si4		sprintf_m13(si1 *target, const si1 *fmt, ...) FMT_ATTR_m13(2, 3);
 si4		snprintf_m13(si1 *target, si4 target_field_bytes, const si1 *fmt, ...) FMT_ATTR_m13(3, 4);
+si4		sprintf_m13(si1 *target, const si1 *fmt, ...) FMT_ATTR_m13(2, 3);
 void		srand_med_m13(ui4 seed); // seed medlib random number generator
 void		srand_med_wz_m13(ui4 seed, volatile ui4 *w, volatile ui4 *z); // faster, less convenient, version of srand_med_m13()
 void		srandom_m13(ui4 seed); // seed system random number generator
@@ -7179,7 +7202,7 @@ void	**recalloc_2D_m13(void **ptr, size_t curr_dim1, size_t new_dim1, size_t cur
 
 
 //**********************************************************************************//
-//********************************* Password Tables ********************************//
+// MARK: Password Tables
 //**********************************************************************************//
 
 // GENERATED by dev/gen_pw_tables.py -- edit the generator, not this block.
@@ -7417,6 +7440,567 @@ void	**recalloc_2D_m13(void **ptr, size_t curr_dim1, size_t new_dim1, size_t cur
 
 //**********************************************************************************//
 //*********************************** MED Records **********************************//
+
+
+//**********************************************************************************//
+// MARK: Write API (WRT)
+//**********************************************************************************//
+
+// Write API (merged from the medwrt development module 2026-08-11; started 2026-08-09, Matt & Claude). A general-purpose, shallow-user write API for
+// MED sessions - the target callers are Python/MATLAB bindings & simple C programs. Everything needed
+// already exists in medlib; this module packages the MANUAL apparatus (DHN_Acq's MED_setup() + block
+// processor were the reference) so a caller cannot produce a subtly broken session by forgetting
+// bookkeeping (index entries, section-2 running aggregates, UH settling at close).
+//
+// ⭐ THE 90% PATH (Matt, 2026-08-09: "user just has arrays of samples by channel at some sampling rate &
+// just wants them compressed into MED & nothing fancy - that will be 90% of uses"):
+//
+//     WRT_session_m13("/data/my_sess", samples, n_chans, n_samps, 30000.0, NULL, NULL, NULL);
+//
+// Arrays in, MED session out. NULLs mean: channel names generated via G_generate_numbered_names_m13()
+// (the library's existing facility - D16 reuse), all-default options
+// (PRED2 + fall-through, 10 s blocks, one segment, no encryption, no filtering), all-default metadata
+// with times as PURE oUTC from zero - no wall time claimed (RESOLVED, Matt 2026-08-10: the pure-oUTC
+// case must be EASY & the library handles it here - claiming the conversion moment as recording time
+// would be false; zero-based oUTC claims nothing). Sampling frequency is the ONE datum beyond the
+// arrays the library cannot invent, so it is a
+// direct argument. Everything fancier is a filled field away.
+//
+// TWO TIERS above the existing deep API:
+//   Tier 1 - one-shot: an in-memory channels x samples array + the two structs below -> session on disk.
+//            (The likely actual request for Python/MATLAB users.)
+//   Tier 2 - streaming handle: create / add_channel / write_samples (ANY length - the library blocks &
+//            buffers) / mark_discontinuity / write_record / close. For converters, acquisition & big data.
+//
+// STRUCT PHILOSOPHY (Matt, 2026-08-09; revised 2026-08-10, D19): two separate structures -
+//   METADATA_m13           - WHAT this recording is: THE LIBRARY'S OWN metadata structure, used as a
+//                            template (no parallel "write metadata" struct - it was a costume over
+//                            real section 1/2/3 fields). Per-channel overrides at add_channel.
+//   WRT_OPTIONS_m13  - HOW to write it: ONLY what has no MED-field counterpart (codec, filters,
+//                            passwords, blocking, segmenting, durability, time mode). An option's
+//                            CONSEQUENCE may land in real metadata - e.g. decimation_frequency, once
+//                            encoded, simply IS tmd2->sampling_frequency.
+// Both have _defaults_ initializers; a zero-filled struct from a binding means "all defaults". The
+// shallow path is: session name, sampling_frequency, maybe passwords - everything else defaults.
+//
+// OPEN DESIGN DECISIONS (numbered for annotation):
+//   D1. RESOLVED (Matt, 2026-08-09): metadata & options are PER-CHANNEL - some channels decimated
+//       (different fs), some filtered, different codecs. The session-level structs passed to create are
+//       the DEFAULTS TEMPLATE; add_channel takes optional per-channel structs merged FIELD-WISE: any
+//       field left at its NO_ENTRY/empty default inherits the session value, any field set wins. (So a
+//       channel overriding only fs specifies only fs.) The handle stores one merged pair per channel.
+//   D2. RESOLVED (Matt, 2026-08-09). Three realities, one model:
+//       - OFFLINE (the common case): continuous flow from session_start_time by sample count.
+//       - ONLINE: the caller passes start_time on write_samples calls - its best estimate of actual
+//         wall time for those samples - & the library derives block start times from the most recent
+//         caller estimate plus sample flow since. (start_time = TIME_NO_ENTRY_m13 => continuous flow.)
+//       - NO IDEA OF TRUE TIME (expected to be COMMON): times used as PURE oUTC - callers may simply
+//         start their times at zero. metadata.time_mode says which world we are in.
+//       THE LIBRARY SETS UP THE RECORDING TIME OFFSET (RTO) FOR THE CALLER in every mode: uutc mode
+//       generates the RTO per the library's privacy conventions (true time recoverable by those with
+//       access); oUTC mode records that no true wall time is claimed & times pass through as offsets.
+//       No shallow user should ever compute an RTO.
+//   D3. RESOLVED (Matt, 2026-08-09): segmenting is a MODE - options.segmenting_mode:
+//       NONE: whole session is one segment (default).
+//       AUTO: duration-based rollover (options.auto_segment_hours).
+//       MANUAL: the writing code calls WRT_new_segment_m13() whenever it wants.
+//       (Midnight-alignment & the rest of DHN_Acq's scheduling stay app-side.)
+//   D10. Filtering internals (Matt, 2026-08-09): do NOT model this module's filtering on DHN_Acq's
+//       current per-block filtfilt + pad/replication apparatus - DHN_Acq is migrating its filtering to
+//       the HEAD/MID/TAIL streaming mechanism. medwrt's antialias & LNF should target that mechanism
+//       (filter state carried across blocks; head = warm-up, mid = steady state, tail = flush at
+//       discontinuities/close), so the two converge instead of forking.
+//   D4. Records (Note etc.) in v1: prototyped below; body formats limited to Note initially.
+//   D5. Threading: v1 serial; options.threaded reserved for a library-internal per-channel encode pool.
+//   D6. RESOLVED (Matt, 2026-08-10): the engine ALWAYS writes each block as it completes (& settles at
+//       close) - one well-defined behavior, no library buffering mechanism. Durability management
+//       beyond that (fsync policy, batching) is a DISTINCT concern & stays app-side; the OS page cache
+//       already buffers for throughput. (The write_through option was removed.)
+//   D8. Decimation (Matt, 2026-08-09: "this is going to be wanted"): modeled on DHN_Acq - per-channel
+//       decimation_frequency, antialias filtfilt before resample, fractional-step LINEAR-INTERPOLATION
+//       resampler with cross-block phase continuity (next-output-index phase carried across blocks;
+//       boundary samples interpolated from the previous block's last value; block start time adjusted by
+//       the fractional offset so timestamps stay honest; integer-step fast path = pure picking;
+//       discontinuities reset the phase). Lives as an internal of this module first; candidate for
+//       promotion into medlib proper so DHN_Acq itself can eventually call it (dedupe).
+//   D11. RESOLVED (Matt, 2026-08-10): ONE ENGINE, TWO SKINS. The streaming handle IS the engine - it
+//       owns every bookkeeping invariant (indices, aggregates, UH settling, Sgmt records, rollover,
+//       RTO, discontinuities, filtering, decimation) - & the one-shot is a thin veneer over it. DEEP
+//       APPS (DHN_Acq, converters) use the SAME engine: no duplication, bugs fixed once. What the
+//       engine adds for them: (a) THREADING CONTRACT - see D5; (b) ESCAPE HATCHES - accessors to the
+//       per-channel CPS/FPS for knobs the options struct does not cover, under the rule that the
+//       library still owns the bookkeeping invariants regardless of what the caller touches. Hatch
+//       shape RESOLVED (Matt, 2026-08-10): RAW ACCESS - "strong open source philosophy", no
+//       public/private ceremony; accessors exist for binding convenience, not as a boundary; (c) a POST-BLOCK
+//       CALLBACK (chan, start time, samples, bytes, algorithm, noise-score bytes, discontinuity) for
+//       display taps / stats / alerts (DHN_Acq's line-noise alert = byte 0 of the scores).
+//   D5. RESOLVED (2026-08-10, follows from D11): a threading CONTRACT now, a pool later. Per-channel
+//       operations are independent - write_samples(chan) may be called concurrently from different
+//       threads for DIFFERENT channels (each channel owns its CPS/staging/FPSes); the same channel is
+//       caller-serialized; session-level operations (segment roll, records, close) are internally
+//       protected; rollover fixes the roll TIME once under the session lock & each channel rolls
+//       lazily as its writes cross it. options.threaded stays reserved for an optional INTERNAL pool
+//       for single-threaded bindings - later, not v1.
+//   D4. RESOLVED (2026-08-10, follows from D11): records are the GENERIC path from v1 -
+//       write_record(type_code, time, body) through the medrec machinery; converters carry arbitrary
+//       source annotation types, so a Note-only special case would just be re-widened.
+//   D12. REVISED (Matt, 2026-08-10): MECHANISM in the engine, spreading POLICY in the app. The engine
+//       gives every channel TWO block-size fields (the DHN_Acq initial-vs-target pattern):
+//         initial_block_samples - the target for the first block after any SESSION-WIDE discontinuity
+//                                 (session start included: same machinery, Matt's first-sample
+//                                 principle) - so phase offsets re-establish after gaps for free;
+//         target/block samples  - the steady-state size (options.block_duration/block_samples).
+//       EQUAL BY DEFAULT (no stagger; correct for offline). An app wanting spread completions (e.g.
+//       DHN_Acq keeping encode CPU even) computes its own policy & sets per-channel initials - the
+//       group-proportional fraction it uses today is offered as an optional convenience helper
+//       (WRT_spread_block_phases_m13()), not baked in. Pure mechanism, policy-free.
+//   D13. RESOLVED (Matt, 2026-08-10; unifies the float-input question with the buffer design): the
+//       channel staging buffers are "MAGIC" RING BUFFERS OF sf8 (VM double-mapped: the ring is always
+//       linear, no wrap copies) - the filters want sf8 anyway, & head/mid/tail filtfilt & line-noise
+//       machinery ALREADY EXIST in medlib (so D8 decimation has NO missing dependency). Conversion to
+//       si4 happens ONLY AT ENCODE, quantized by amplitude_units_conversion_factor (stored_int *
+//       factor = physical units). Callers may write si4 OR sf8 (write_samples / write_samples_sf8);
+//       si4 input converts up on entry. Tier 1 accepts sf8 arrays & AUTO-RANGES the conversion factor
+//       (whole array in hand); the streaming engine requires the factor up front for sf8 input
+//       (default 1.0 = round to integer units).
+//   D14. acquisition_channel_number (Matt, 2026-08-10): per-channel metadata - a PHYSICAL reality,
+//       useful for archaeology & matching clinical recordings. When the caller does not set it, the
+//       library AUTO-SETS to the add order (1-based) - documented as ORDINAL, corresponding to nothing
+//       physical unless the caller says so. [Recommendation pending Matt's nod: add-order default; if
+//       synthetic-vs-real ever needs to be distinguishable in-file, a discretionary-region marker is
+//       the place - not a special number scheme.]
+//   D15. SCOPE decisions recorded (Matt, 2026-08-10): VIDEO channels are a LOT - stubbed
+//       (WRT_add_vid_channel_m13() exists & fails cleanly; add at the end if still a good idea).
+//       APPEND/RESUME into an existing session: deliberately out (WORM philosophy; exists_behavior =
+//       fail/overwrite/rename only). Tier-1 one-shot is UNIFORM rate & length by design - anything
+//       else is the engine. FLUSH: WRT_flush_m13() exists - library handles closing/flushing normally;
+//       an explicit flush is the deep-user case & they should know what they are doing (partials
+//       written as short blocks WITHOUT a discontinuity mark).
+//   D16. REVISED (Matt, 2026-08-10): THE HANDLE'S INTERNALS *ARE* THE MED HIERARCHY. A write channel
+//       CONTAINS the real library structures (its metadata FPS with the full METADATA_m13; the session
+//       handle owns a real SESS_m13 with real CHAN_m13/SEG_m13/FPS children) - not shadows of them.
+//       Consequences: encryption is the EXISTING machinery on the struct it was built for; Sgmt
+//       records come from the existing builders walking the same hierarchy; READ & WRITE paths share
+//       one set of structures (close-time verification re-walks what a reader will walk); deep apps
+//       navigate the hierarchy they already know - the escape hatch is just the hierarchy itself.
+//       The curated WRT_METADATA/OPTIONS structs are INPUT CONVENIENCES (zero-fillable,
+//       binding-friendly) APPLIED ONTO the real structures at create/add-channel - appliers, not
+//       storage; the hierarchy is the single source of truth. ⭐AND: the library's existing write-side
+//       code is CLUMSY WITH INCONSISTENT INTERFACES & is UP FOR REVISION (Matt) - implementation
+//       posture is "fix medlib where medlib is the right fix", not "wrap the warts". (This module is
+//       separate from medlib only for navigation convenience during development; it becomes regular
+//       public library functions.)
+//   D25. VIDEO ADOPTION (Matt, 2026-08-11): WRT_video_m13() takes a chronological list of native
+//       video files (caller's order is the contract; optional per-file start times - NULL derives
+//       contiguously from the walk durations) & makes them MED citizens in the current segment:
+//       renamed to <seg>_n%04d.<NATIVE EXT> (players still play them), optional AES-256-CTR
+//       encryption (video_data_encryption_level; nonce = file_UID; container bytes only - identity,
+//       parity & repair need no keys), MED universal header appended as a FOOTER (identity for
+//       parity/restore), PCRC after it (self-checking immediately; the parity build refreshes it),
+//       .vidx built per keyframe via the container walk (VID_walk_m13), video metadata settled at
+//       close from the walk facts, & video parity classes added to the segment-closure masks.
+//       A file the walker cannot parse is adopted OPAQUELY (renamed + footer + pcrc, no index
+//       entries) with a warning - the bytes are preserved either way. v1: video with segmenting
+//       NONE (multi-segment video rides the same slot-reuse machinery later).
+//   D24. MID-RECORDING FILTER TOGGLES (Matt, 2026-08-10): LNF may be switched on/off during a
+//       recording (the 2026-08-09 block-flag semantics were built for this) - & the ANTIALIAS filter
+//       needs a toggle too: some labs use the sharpness of stimulation artifacts as a trigger, so
+//       they want antialiasing OFF during stimulation stretches of a decimated recording (aliasing
+//       accepted - their data, their call). Both toggles share ONE boundary procedure: full chain
+//       drain (every stage's tail) + the current partial block emitted SHORT - so no block ever
+//       mixes filtered & unfiltered samples & the per-block flag stays truthful - then the stage
+//       flips & head-restarts. The decimator's phase carry SURVIVES the boundary: indices stay
+//       locked to time through any number of toggles. Toggling a stage on that was off at start is
+//       supported (machinery configured up front where cheap [AA filtps whenever decimating], or
+//       lazily [LNF scratch]); a chainless channel engages the chain at first toggle-on. D12 stagger
+//       re-arms at the boundary (same lockstep-refill argument as discontinuities).
+//   D23. FILTER CHAIN & MAGIC RINGS (Matt, 2026-08-10, "the fun part"): filtered data flows as sf8
+//       through a VM double-mapped ("magic") ring - any window <= ring length is a LINEAR view, so
+//       filter code never sees the wrap. One ring per filtered channel; STAGES are cursors on it:
+//       each stage owns finished_idx (ABSOLUTE sample index - the decimator's anti-slip discipline;
+//       ring position = idx % len) & processes up to the previous stage's pointer minus its own
+//       lookahead lag. The LAST stage's pointer gates block emission. Stage order is configuration
+//       (antialias -> LNF per Matt's sketch); a rate-changing stage (decimation) is TERMINAL: it
+//       drains the ring into the existing si4 staging, leaving the emit machinery untouched.
+//       ⭐The si4-direct-to-compression path is PRESERVED (Matt: "probably a real path for some") -
+//       the chain engages only when a filter stage is enabled. SIZING: ingest chunks through free
+//       space, so the ring needn't fit a whole call: default = 2 x (sum of stage lags + input
+//       samples per block), page-rounded; options override for tuning.
+//   D22. HUMAN-READABLE START TIME (Matt, 2026-08-10: "Perhaps we should allow a human readable
+//       start time field or fields?"): options.session_start_string, "YYYY-MM-DD HH:MM:SS[.ffffff]"
+//       (space or 'T' separator), interpreted as LOCAL time at the recording site & translated to
+//       uutc against the RESOLVED time constants (the NRD2MED/CSC2MED pattern: timegm() minus
+//       standard_UTC_offset). Parsed at create AFTER timezone resolution, so create's step 1 is now
+//       constants-then-parse-then-RTO. Used only when session_start_time was not set explicitly.
+//       WRT_parse_time_string_m13() is the public helper (level-resolved constants).
+//   D21. IMPLEMENTATION CORRECTIONS to D19 (2026-08-10, from the m13 structs themselves): password
+//       HINTS & the anonymized subject ID are REAL METADATA SECTION-1 FIELDS in MED 1.1 (anonymized
+//       ID moved there from the UH) -> they live in the METADATA template, & the hint fields leave
+//       options. Encryption LEVELS however are NOT metadata fields in m13 (that was m12 section 1):
+//       they are UNIVERSAL-HEADER fields stamped by G_set_encryption_map_m13() on every UH at
+//       creation -> all four levels (section 2, section 3, data, records) are OPTIONS. Also per Matt:
+//       "Geotag Data" is a STANDARD rc field (DHN_Acq will adopt it), & G_location_info_m13()
+//       (ipinfo.io via curl, 5 s timeout, clean FALSE offline - air-gap safe because optional)
+//       implements WRT_acquire_geotag_m13() for real.
+//   D20. RESOLVED (Matt, 2026-08-10): TIME/LOCATION CONTEXT IS STEP ZERO of a write - "I usually set
+//       up the time/location context first when starting a write." Sequence (the DHN_Acq pattern,
+//       m13-ized): (a) claim the WRITER'S pg FIRST - G_set_time_constants_m13() writes into the
+//       current thread's pg (G_proc_globs_m13(NULL)), so the D7 pg step must precede it; this is the
+//       "new" usage of G_proc_globs_new_m13() (m12 had one global set; m13 constants are per-pg).
+//       (b) fill TIMEZONE_INFO_m13 from the template's section-3 country/territory/timezone-acronym
+//       fields & call G_set_time_constants_m13(&tz, start_time, FALSE) - ⭐prompt MUST be FALSE here
+//       (the ambiguity prompt is scanf: would hang a mex/binding); the library already collapses
+//       multiple table rows with identical constants without prompting, so a REAL ambiguity becomes a
+//       clean error telling the caller which section-3 field to add. Passing a nonzero start_time
+//       also generates the RTO (G_generate_recording_time_offset_m13); pass 0 when the RTO is not
+//       wanted (OUTC mode / apply_recording_time_offset FALSE - follow lib conventions there).
+//       (c) the payoff: the matched table row's resolved country/territory/UTC offsets/DST codes are
+//       retained in pg->time_constants, & G_init_metadata_m13() SEEDS SECTION 3 from them (calculated
+//       values written into metadata); the caller's explicit template values still win. All existing
+//       machinery - medwrt orchestrates, adds nothing.
+//   D19. RESOLVED (Matt, 2026-08-10): "WRT_METADATA looks like it should just be a library
+//       METADATA structure" - CORRECT & REMOVED. Callers, the RC/CS loaders (D18) & the binding
+//       structures fill a METADATA_m13 template directly; WRT_metadata_defaults_m13()
+//       initializes one to library defaults/NO_ENTRYs; per-channel overrides are templates too,
+//       merged field-wise against the sections' NO_ENTRY conventions (D1). Field relocations:
+//       encryption LEVELS are real section-1 fields -> set in the template (negative level = encrypt
+//       on write, the existing convention); PASSWORDS are not fields -> stay in options; time_mode /
+//       session_start_time are write-time decisions, not MED fields -> move to options; the lat/lon
+//       convenience fields go with the costume - WRT_format_geotag_m13() writes straight into the
+//       template's section-3 geotag fields (bindings may sugar this). Options keeps only what has no
+//       MED-field counterpart; where an option has a metadata CONSEQUENCE the engine records it
+//       (decimation_frequency -> recorded section-2 sampling_frequency; template states INPUT rate).
+//   D17. RC REVIEW (Matt, 2026-08-10: "the RC is a summary of decisions that have to be made in
+//       writing but don't end up as explicit fields in the data"). ABSORBED into the surface:
+//       segment_description (+ per-segment update via WRT_new_segment_m13's optional description),
+//       time-base units factor/description, apply_recording_time_offset (UUTC mode may store TRUE
+//       times - RTO application is a choice, not an inevitability), record_encryption_level (data &
+//       section levels alone were not enough; per-record-TYPE levels - DHN_Acq has four - via the
+//       hierarchy per D16), the FOUR record-structure toggles matching G_alloc_session_m13's
+//       signature (session records / segmented session records / channel records / segment records),
+//       & parity (NONE / ALL FILES / ALL DATA FILES). Convention kept: VDS_LFP_high_fc == NO_ENTRY =>
+//       falls back to the high-frequency-filter setting (the RC's "USE HIGH FREQUENCY FILTER SETTING").
+//       DELIBERATELY APP-SIDE (acquisition/deployment concerns): channel-spec files, data directories
+//       & cloud archiving pipeline, packet buffers, alert thresholds & remote notifications (the
+//       post-block callback carries the facts), watchdog, all Neuralynx networking & port-record
+//       specifics (generic write_record covers the record type), auto-segment TIME-OF-DAY anchoring
+//       (MANUAL segmenting covers it; interval AUTO is in).
+//   D18. CONFIG LOADERS (Matt, 2026-08-10): the C structs are the SINGLE DEFINITION - the MATLAB/
+//       Python binding structures mirror them field-for-field (string enums translated at the
+//       binding; ⭐RULE: no field name is shared between the metadata & options structs, so flat
+//       name-value/kwargs auto-route). In mex & in our own apps the fields COME FROM RC & CS FILES,
+//       so medwrt provides the loaders (reusing RC_read_field_m13 & the DHN_Acq RC field VOCABULARY
+//       for compatibility): WRT_config_read_m13() fills both structs from an RC file (absent
+//       fields keep defaults; unknown fields ignored - app-specific ones live in the same file);
+//       WRT_cs_read_m13() fills channel names + per-channel override structs from a CS file
+//       (unspecified entries = NO_ENTRY = inherit via the D1 merge). A mex/binding may thus accept
+//       an rc_file/cs_file argument in place of - or merged under - explicit structures.
+//   D9. RESOLVED (Matt, 2026-08-09): discontinuity handling is a MODE - options.discontinuity_mode:
+//       EXPLICIT: only WRT_mark_discontinuity_m13() creates gaps; an online start_time beyond tolerance
+//                 is an ERROR (catches caller time bugs). The offline default.
+//       IMPLICIT: an online start_time beyond tolerance AUTO-MARKS a discontinuity (dropout streams
+//                 just work); within tolerance it only refines block timing (jitter absorption).
+//       Either way the explicit call always works, & the library's own implicit marks (session & segment
+//       first blocks) apply in both modes.
+//   D7. Writer-side proc-globs: WRT_create_session_m13() calls G_proc_globs_new_m13() itself when the
+//       calling thread's pg is already bound to a live session - the "second write session in one
+//       thread" hazard is resolved inside the API where no shallow user ever sees it.
+//
+// LINKED INTO libmed_m13 (mklibs.sh) but implementation is STUBBED until the design settles - every
+// entry point exists & compiles; unimplemented ones set an error & fail cleanly.
+
+
+
+//**********************************************************************************//
+// MARK: WRT Structures
+//**********************************************************************************//
+
+// WHAT this recording is -> the library's own METADATA_m13, used as a TEMPLATE (D19): section 1
+// (encryption levels; negative = encrypt on write), section 2 (sampling_frequency [REQUIRED - the rate
+// of the samples the caller provides], filter settings, power_line_frequency, units, descriptions,
+// acquisition_channel_number [NO_ENTRY => auto-set to add order, D14]...), section 3 (subject,
+// recording location, geotag, UTC offsets / timezone). WRT_metadata_defaults_m13() initializes a
+// template; per-channel overrides are templates too, merged field-wise against the sections' NO_ENTRY
+// conventions (D1). Geotag: RECOMMENDED FORMAT ISO 6709 (international standard since 1983, current ed.
+// 2022): compact ASCII, sign-explicit, optional altitude, explicit CRS, e.g.
+// "+40.68941-074.04478+0025.0CRSWGS_84/"; datum WGS 84 (what GPS emits; what GeoJSON/RFC 7946
+// mandates). MED's geotag_format field lets other formats coexist later, so this locks nothing in.
+// WRT_format_geotag_m13() fills the template's geotag fields from lat/lon/alt.
+
+// HOW to write -> CPS directives/parameters, filters, security, structure & behavior
+typedef struct {
+	// compression
+	ui8	codec;				// a CPS_DF_*_ALGORITHM_m13 flag; default CPS_DF_PRED2_ALGORITHM_m13
+	tern	fall_through_to_best;		// default TRUE
+	sf8	VDS_threshold;			// codec-specific knobs; NO_ENTRY when unused
+	sf8	VDS_LFP_high_fc;		// NO_ENTRY => falls back to high_frequency_filter_setting (D17, RC convention)
+	// time (D2/D19: write-time decisions, not MED fields)
+	si1	time_mode;			// WRT_TIME_* below (D2)
+	si8	session_start_time;		// uutc (or CURRENT_TIME_m13) in UUTC mode; first-sample offset in OUTC mode (typically 0)
+	si1	session_start_string[64];	// D22: human-readable alternative, "YYYY-MM-DD HH:MM:SS[.ffffff]", LOCAL time at the
+						// recording site (translated against the resolved timezone); used when session_start_time is unset
+	// security (D21): passwords are never stored anywhere; HINTS & the anonymized subject ID are real
+	// section-1 fields -> METADATA template. Encryption LEVELS are UH fields in m13 (stamped on every
+	// UH by G_set_encryption_map_m13() at creation) -> all four are options
+	si1	level_1_password[MAX_PASSWORD_STRING_BYTES_m13];
+	si1	level_2_password[MAX_PASSWORD_STRING_BYTES_m13];
+	si1	level_3_password[MAX_PASSWORD_STRING_BYTES_m13];
+	si1	section_2_encryption_level;
+	si1	section_3_encryption_level;
+	si1	data_encryption_level;
+	si1	video_data_encryption_level;	// D25: native container bytes, AES-256-CTR (footer & pcrc excluded); DHN default preference is 2 (video is subject-identifying)
+	si4	encode_workers;		// D26: worker-pool size for distributor mode (0 = caller-thread encode; WRT_packets_m13 required when > 0)
+	si1	record_encryption_level;	// D17: all records; per-record-TYPE levels via the hierarchy (D16)
+	tern	apply_recording_time_offset;	// D17: UUTC mode may store TRUE times (FALSE); default TRUE (privacy offset)
+	// library-applied processing (2026-08-09 semantics: filtered bit + deposited/estimated byte 0)
+	tern	line_noise_filter;		// template LNF on the way in; sets CPS_DF_LINE_NOISE_FILTERED_m13
+	si1	worker_affinity[64];		// D31d pool worker cpu set, e.g. "4-15"; EMPTY = all cores set EXPLICITLY
+						// (pthread_create inherits the spawning thread's mask - the pool spawns on the
+						// first WRT_packets caller, which DHN_Acq pins to "2-3": 12 workers on 2 cores)
+	ui8	noise_scores;			// mask of CPS_DF_*_SCORE_m13 directives; 0 = none
+	// decimation (D8; per-channel by nature - THE per-channel motivator). The METADATA template's
+	// section-2 sampling_frequency is the rate of the samples the CALLER PROVIDES; when decimation_frequency is set the library antialias-
+	// filters (unless antialias_filter == FALSE_m13; auto-disabled for full-rate VDS, which antialiases
+	// intrinsically - but still REQUIRED when decimating), then resamples by fractional-step linear
+	// interpolation with cross-block phase continuity (the DHN_Acq decimate() algorithm), & the RECORDED
+	// section-2 sampling_frequency is the OUTPUT rate. block_duration is in OUTPUT time.
+	sf8	decimation_frequency;		// output rate; NO_ENTRY = no decimation
+	// amplitude quantum (2026-08-14): the CALLER's samples may carry resolution finer than one unit
+	// of the recorded amplitude units - acquisition hardware commonly delivers counts whose LSBs sit
+	// below the units the file declares (Neuralynx: 1 uV at bit 6, so 24-bit counts hold 18 valid
+	// bits). The chain must filter at the NATIVE resolution & round to the coarser grid AFTERWARD:
+	// rounding first discards what the filter needs, & not rounding at all pays full entropy for
+	// detail below the noise floor (measured: +6.0 bits/sample on 40 kHz neural data, 5.55 -> 11.18).
+	// This is the terminal quantizer m12's apps applied themselves before CMP_encode; the library
+	// owns the seam now. Value = caller units per recorded unit (Neuralynx: 64.0). NOT a library
+	// constant - no width, shift or hardware is assumed here; 1.0 (the default) is a no-op.
+	sf8	amplitude_quantum;		// caller sample units per recorded unit; 1.0 = no requantization
+	tern	antialias_filter;		// default UNKNOWN = automatic (on when decimating, VDS rule above)
+	ui4	initial_block_samples;		// D12: first-block target after any session-wide discontinuity (incl. start); 0 = equal to the steady-state block size (no stagger). Per-channel via D1 merge; apps set spreading policy themselves (or use WRT_spread_block_phases_m13())
+	// discontinuities (D9)
+	si1	discontinuity_mode;		// WRT_DISCONT_* below
+	sf8	discontinuity_tolerance;	// in sample periods; online start_time deviation beyond this = gap (default 1.5)
+	// structure & behavior
+	sf8	block_duration;			// seconds; XOR with block_samples (other = NO_ENTRY)
+	ui4	block_samples;
+	si1	segmenting_mode;		// WRT_SEG_* below (D3)
+	sf8	auto_segment_hours;		// AUTO mode rollover interval
+	// record structure & file-set toggles (D17; match G_alloc_session_m13's signature)
+	tern	session_records;		// session-level record files
+	tern	seg_session_records;		// segmented session records (SSR, .recd)
+	tern	channel_records;		// channel-level record files
+	tern	segment_records;		// segment-level record files
+	si1	parity;				// WRT_PARITY_* below (D17)
+	si1	exists_behavior;		// WRT_EXISTS_* below
+	tern	threaded;			// reserved (D5); v1 ignores
+} WRT_OPTIONS_m13;
+
+// time_mode (D2)
+#define WRT_TIME_UUTC_m13		((si1) 0) // true wall time known: session_start_time is uutc (or CURRENT_TIME_m13); library generates the RTO & converts that ONE time to oUTC
+#define WRT_TIME_OUTC_m13		((si1) 1) // no true wall time claimed: session_start_time is a pure offset (zero is typical); no RTO generated
+// NOTE (both modes): ALL ongoing time arguments (WRT_packets/WRT_samples start_time, WRT_mark_discontinuity, record
+// start times, session_sf8 file starts) are oUTC - the library uses oUTC universally; RTO is added back only for
+// display (when apply_RTO is unset, RTO is zero & oUTC == full uutc)
+
+// segmenting_mode (D3)
+#define WRT_SEG_NONE_m13		((si1) 0) // whole session is one segment (default)
+#define WRT_SEG_AUTO_m13		((si1) 1) // duration-based rollover (auto_segment_hours)
+#define WRT_SEG_MANUAL_m13	((si1) 2) // caller segments via WRT_new_segment_m13()
+
+// discontinuity_mode (D9)
+#define WRT_DISCONT_EXPLICIT_m13	((si1) 0) // only WRT_mark_discontinuity_m13() creates gaps; out-of-tolerance online start_time = ERROR (default)
+#define WRT_DISCONT_IMPLICIT_m13	((si1) 1) // out-of-tolerance online start_time AUTO-MARKS a discontinuity
+
+// parity (D17)
+#define WRT_PARITY_NONE_m13	((si1) 0)
+#define WRT_PARITY_ALL_m13	((si1) 1) // all files
+#define WRT_PARITY_DATA_m13	((si1) 2) // data files only
+
+// exists_behavior
+#define WRT_EXISTS_FAIL_m13	((si1) 0) // default: refuse to touch an existing session
+#define WRT_EXISTS_OVERWRITE_m13	((si1) 1)
+#define WRT_EXISTS_RENAME_m13	((si1) 2) // append numeric suffix to the new session
+
+// medlib-internal WRT defines - all expand only inside medlib_m13.c (the types & tables they
+// reference are .c-local by design - D16); defined here per the header-only defines rule
+
+// per-channel pool_state (D30)
+#define WRT_POOL_IDLE_m13	((ui1) 0)
+#define WRT_POOL_QUEUED_m13	((ui1) 1)
+#define WRT_POOL_RUNNING_m13	((ui1) 2)
+
+// adopted-video encryption io (D25)
+#define WRT_VID_ENCRYPT_CHUNK_BYTES_m13	((si8) 1 << 22)  // 4 MiB encryption io chunks (the NAT2MED constant)
+
+// internal per-channel write state accessor
+#define WRT_INT_m13(ws)	((WRT_INT_m13 *) (ws)->chan_state_int)
+
+// RC field table (D18; the table itself lives in medlib_m13.c)
+#define WRT_RC_MD_m13		((si1) 0)  // row targets the METADATA_m13 template
+#define WRT_RC_OPT_m13		((si1) 1)  // row targets WRT_OPTIONS_m13
+#define WRT_RC_NO_SENT_m13	((si8) 0x8000000000000000)  // "this integer row has no NO-ENTRY value"
+#define WRT_RC_N_FIELDS_m13	((si4) (sizeof(WRT_rc_fields_m13) / sizeof(WRT_rc_fields_m13[0])))
+// row builders (bytes from sizeof => cannot drift from the structs)
+#define WRT_MDSTR_m13(nm, fld, nts) \
+	{.name = nm, .type = "string", .default_str = "NO ENTRY", .notes = nts, .dest = WRT_RC_MD_m13, .kind = WRT_RC_KSTR_m13, \
+	.offset = offsetof(METADATA_m13, fld), .bytes = (si4) sizeof(((METADATA_m13 *) 0)->fld), .no_entry_f = (sf8) NAN, .no_entry_i = WRT_RC_NO_SENT_m13}
+#define WRT_MDF8_m13(nm, fld, dflt, noent, nts) \
+	{.name = nm, .type = "float", .default_str = dflt, .notes = nts, .dest = WRT_RC_MD_m13, .kind = WRT_RC_KSF8_m13, \
+	.offset = offsetof(METADATA_m13, fld), .scale = (sf8) 1.0, .no_entry_f = noent, .no_entry_i = WRT_RC_NO_SENT_m13}
+#define WRT_OPTSTR_m13(nm, fld, nts) \
+	{.name = nm, .type = "string", .default_str = "NO ENTRY", .notes = nts, .dest = WRT_RC_OPT_m13, .kind = WRT_RC_KSTR_m13, \
+	.offset = offsetof(WRT_OPTIONS_m13, fld), .bytes = (si4) sizeof(((WRT_OPTIONS_m13 *) 0)->fld), .no_entry_f = (sf8) NAN, .no_entry_i = WRT_RC_NO_SENT_m13}
+#define WRT_OPTF8_m13(nm, fld, dflt, noent, scl, nts) \
+	{.name = nm, .type = "float", .default_str = dflt, .notes = nts, .dest = WRT_RC_OPT_m13, .kind = WRT_RC_KSF8_m13, \
+	.offset = offsetof(WRT_OPTIONS_m13, fld), .scale = scl, .no_entry_f = noent, .no_entry_i = WRT_RC_NO_SENT_m13}
+#define WRT_OPTINT_m13(knd, nm, fld, dflt, noent, nts) \
+	{.name = nm, .type = "integer", .default_str = dflt, .notes = nts, .dest = WRT_RC_OPT_m13, .kind = knd, \
+	.offset = offsetof(WRT_OPTIONS_m13, fld), .no_entry_f = (sf8) NAN, .no_entry_i = noent}
+#define WRT_OPTTERN_m13(nm, fld, dflt, nts) \
+	{.name = nm, .type = "ternary", .default_str = dflt, .notes = nts, .opts = WRT_yes_no_opts_m13, .n_opts = 2, \
+	.dest = WRT_RC_OPT_m13, .kind = WRT_RC_KTERN_m13, .offset = offsetof(WRT_OPTIONS_m13, fld), .no_entry_f = (sf8) NAN, .no_entry_i = WRT_RC_NO_SENT_m13}
+#define WRT_OPTMAP_m13(knd, nm, fld, dflt, oarr, varr, nts) \
+	{.name = nm, .type = "string", .default_str = dflt, .notes = nts, .opts = oarr, .opt_vals = varr, .only = TRUE_m13, \
+	.n_opts = (si4) (sizeof(oarr) / sizeof(oarr[0])), .dest = WRT_RC_OPT_m13, .kind = knd, \
+	.offset = offsetof(WRT_OPTIONS_m13, fld), .no_entry_f = (sf8) NAN, .no_entry_i = WRT_RC_NO_SENT_m13}
+
+// Tier 2 handle. D16: the internals ARE the MED hierarchy - sess is a real SESS_m13 whose channels/
+// segments/FPSes are the same structures the read path uses; per-channel write state (sf8 magic ring,
+// initial/target block sizes, aggregates cursor) attaches alongside the real CHAN_m13. The curated
+// structs below are the applied INPUT, retained only as the defaults template for late add_channel
+// merges. Open by philosophy - deep apps navigate it like any open session.
+typedef struct {
+	SESS_m13		*sess;		// the real hierarchy (single source of truth)
+	METADATA_m13		metadata;	// session defaults TEMPLATE (D19: the real library struct; appliers, not storage - D16)
+	WRT_OPTIONS_m13	options;
+	si4			n_chans;
+	si4			n_vid_chans;	// D25
+	tern			writing_started; // add_channel refused after first write_samples
+	pthread_mutex_t_m13	start_mutex;	// first-write latch: per-channel writer THREADS may race the
+						// G_alloc_session_m13() trigger (Matt: channels encode in threads).
+						// Steady-state writes touch only their own channel's state - no lock.
+						// mark_discontinuity / flush / close are CONTROL-THREAD operations:
+						// they touch every channel; caller quiesces the writers first.
+	si1			path[PATH_BYTES_m13]; // resolved session directory (RENAME exists-behavior may alter the requested path)
+	PROC_GLOBS_m13		*pg;		// this write session's proc globals (claimed at create - D20a)
+	FPS_m13			*proto_fps;	// prototype metadata FPS (template applied); G_alloc_session_m13() inherits from it at first write (D14: channel count is known then)
+	void			*chan_state_int;// internal per-channel write state (public struct once the surface settles - D16)
+} WRT_SESS_m13;
+
+
+//**********************************************************************************//
+// MARK: WRT Prototypes
+//**********************************************************************************//
+
+// geolocation
+tern	WRT_format_geotag_m13(sf8 latitude, sf8 longitude, sf8 altitude_meters, si1 *format_out, si1 *data_out);
+	// formats an ISO 6709 point string (datum WGS 84) into data_out (>= METADATA_GEOTAG_DATA_BYTES_m13)
+	// & sets format_out (>= METADATA_GEOTAG_FORMAT_BYTES_m13) to "ISO 6709". altitude_meters NAN => omitted.
+tern	WRT_acquire_geotag_m13(si1 *format_out, si1 *data_out);
+	// STUB: automatic geolocation (OS location services / IP geolocation) -> WRT_format_geotag_m13().
+	// Must remain OPTIONAL & fail cleanly with no network: DHN deployments are AIR-GAPPED by requirement.
+
+// config loaders (D18): fill the structs from RC / CS files (the DHN_Acq field vocabulary)
+tern	WRT_config_read_m13(const si1 *rc_path, METADATA_m13 *md, WRT_OPTIONS_m13 *opt);
+tern	WRT_config_write_m13(const si1 *rc_path, METADATA_m13 *md, WRT_OPTIONS_m13 *opt); // template generator: full standard-field rc with current values (NULL structs => "DEFAULT"); doubles as the vocabulary documentation
+si4	WRT_cs_read_m13(const si1 *cs_path, si1 ***chan_names, METADATA_m13 **md_overrides, WRT_OPTIONS_m13 **opt_overrides);
+	// returns n_chans; allocates the three arrays (caller frees); overrides are D1-merge-ready
+
+// magic ring buffer (D23): VM double-mapped - element i & element (i + len) address the SAME memory,
+// so any window of <= len elements starting anywhere is linear. Element-size agnostic (Matt, D24
+// symmetry: si4 output rings for EVERY channel - the ring IS the block accumulator & the encoder
+// reads linear windows from it zero-copy; sf8 rings carry the filter chain).
+typedef struct {
+	void	*data;		// double-mapped base (2 * len elements addressable)
+	si8	len;		// ring length in ELEMENTS (byte size is page-multiple)
+	si8	el_bytes;	// element size
+	void	*_map_hdl;	// platform mapping handle (internal)
+} WRT_RING_m13;
+
+tern	WRT_ring_alloc_m13(WRT_RING_m13 *ring, si8 min_elements, si8 el_bytes);	// rounds up to page multiple
+void	WRT_ring_free_m13(WRT_RING_m13 *ring);
+
+// time-string translation (D22): "YYYY-MM-DD HH:MM:SS[.ffffff]" (space or 'T'), LOCAL time at the
+// recording site -> uutc, against the LEVEL's resolved time constants; TIME_NO_ENTRY_m13 on failure
+si8	WRT_parse_time_string_m13(void *level_header, const si1 *time_str);
+
+// defaults (zero-filled structs from bindings are equivalent to calling these)
+void	WRT_metadata_defaults_m13(METADATA_m13 *md);	// initialize a template to library defaults/NO_ENTRYs (D19)
+void	WRT_options_defaults_m13(WRT_OPTIONS_m13 *opt);
+
+// Tier 1 - one-shot: samples[chan][samp] (or NULL-terminated set of channel arrays), all channels same
+// length & rate in v1; channel names from chan_names (NULL => "ch_0001" style)
+tern	WRT_session_m13(const si1 *sess_path, si4 **samples, si4 n_chans, si8 n_samps, sf8 sampling_frequency,
+			      si1 **chan_names, METADATA_m13 *md, WRT_OPTIONS_m13 *opt);
+			      // chan_names/md/opt may ALL be NULL (the 90% path above); sampling_frequency
+			      // is authoritative for the session (md may refine everything else)
+tern	WRT_session_sf8_m13(const si1 *sess_path, sf8 **samples, si4 n_chans, si8 n_samps, sf8 sampling_frequency,
+			      si1 **chan_names, METADATA_m13 *md, WRT_OPTIONS_m13 *opt);
+			      // the Python/MATLAB-native one-shot (D13): physical-units arrays; the library
+			      // AUTO-RANGES amplitude_units_conversion_factor unless md supplies one
+
+// Tier 2 - streaming
+WRT_SESS_m13	*WRT_create_session_m13(const si1 *sess_path, METADATA_m13 *md, WRT_OPTIONS_m13 *opt);
+si4	WRT_add_ts_channel_m13(WRT_SESS_m13 *ws, const si1 *chan_name,
+			       METADATA_m13 *md_override, WRT_OPTIONS_m13 *opt_override);  // FIELD-WISE merge over session defaults; NULL => inherit all (D1)
+// D27: per-channel telemetry - the throttle controller's observation surface (& the app's buffer
+// gauge / startup capacity prediction). SNAPSHOT semantics: single racy read of live cursors -
+// values are instantaneously consistent enough for control decisions, never for sample accounting.
+typedef struct {
+	si8	pending_in;		// chain input samples ingested but not yet serviced (0 for direct)
+	si8	pending_out;		// output samples accumulated but not yet encoded
+	sf8	in_ring_fill;		// chain ring occupancy [0,1] (0 for direct)
+	sf8	out_ring_fill;		// output ring occupancy [0,1]
+	sf8	encode_lag_secs;	// data time waiting to be encoded ((pending_in/in_fs) + (pending_out/fs))
+	sf8	visit_cost_ewma_us;	// worker visit cost, exponentially weighted mean (pool mode; 0 in caller mode)
+	sf8	visit_cost_peak_us;	// decaying peak (throttle budgets against bursts, not means - VDS cost is correlated)
+	si8	visits;			// total worker visits
+	si4	events_pending;		// unprocessed boundary events
+	sf8	line_noise_score;	// most recent encoded block's line-noise score [0,1] (0 clean); NAN before the first scored block (or scoring off)
+} WRT_TELEM_m13;
+
+tern	WRT_set_codec_m13(WRT_SESS_m13 *ws, si4 chan_idx, ui4 codec);  // D28: mid-recording codec switch at a clean block boundary (the throttle VDS->PRED2 rung; CHANNEL_NUMBER_ALL_CHANNELS_m13 = all)
+tern	WRT_set_encode_workers_m13(WRT_SESS_m13 *ws, si4 n_workers);  // D31b: live pool resize (CPU-reclamation actuator; grow = new PROC jobs, shrink = index-based exits at visit boundaries; ceiling = logical cores; pre-start = config only)
+si8	WRT_bytes_written_m13(WRT_SESS_m13 *ws, si8 *segment_bytes);  // D32: bytes on disk (session return; current segment via arg) - session size, bits/sample & time-to-full readouts; snapshot semantics
+tern	WRT_set_VDS_goal_attempts_m13(WRT_SESS_m13 *ws, si4 chan_idx, si4 attempts);  // D28: cap VDS refinement rounds live (the cheap half-step before a full PRED2 switch; 0 = library default)
+tern	WRT_telemetry_m13(WRT_SESS_m13 *ws, si4 chan_idx, WRT_TELEM_m13 *t);
+tern	WRT_packets_m13(WRT_SESS_m13 *ws, void *packets, si8 n_packets, si8 packet_bytes, si8 samples_offset, si4 *chan_map, si8 start_time);  // INTERLEAVED entry (acquisition/DAT): packet = all channels' si4 values at one sample time; stride packet_bytes, values at samples_offset; chan_map[w] = packet slot for channel w (NULL = identity, negative = skip); start_time as WRT_samples_m13
+tern	WRT_samples_m13(WRT_SESS_m13 *ws, si4 chan_idx, si4 *samps, si8 n_samps, si8 start_time);  // any length; start_time = caller's wall-time estimate for samps[0] (online), TIME_NO_ENTRY_m13 = continuous flow (offline; D2)
+tern	WRT_samples_sf8_m13(WRT_SESS_m13 *ws, si4 chan_idx, sf8 *samps, si8 n_samps, si8 start_time);  // physical-units input (D13); quantized by amplitude_units_conversion_factor at encode
+tern	WRT_flush_m13(WRT_SESS_m13 *ws);  // D15: deep-user flush - partials written as SHORT blocks, NO discontinuity mark
+si4	WRT_add_vid_channel_m13(WRT_SESS_m13 *ws, const si1 *chan_name);  // D25: register a video channel (before writing starts); returns video channel index
+tern	WRT_video_m13(WRT_SESS_m13 *ws, si4 vid_chan_idx, si1 **file_paths, si4 n_files, si8 *file_start_times);  // D25: adopt native video files (chronological) into the current segment; times NULL => contiguous
+tern	WRT_set_line_noise_filter_m13(WRT_SESS_m13 *ws, si4 chan_idx, tern on);  // D24; chan_idx or CHANNEL_NUMBER_ALL_CHANNELS_m13
+tern	WRT_set_antialias_filter_m13(WRT_SESS_m13 *ws, si4 chan_idx, tern on);   // D24; decimating channels only (AA exists for decimation)
+tern	WRT_mark_discontinuity_m13(WRT_SESS_m13 *ws, si8 new_start_time);  // applies to all channels (D2)
+tern	WRT_new_segment_m13(WRT_SESS_m13 *ws, const si1 *segment_description);  // MANUAL segmenting (D3): close current segment, open the next; NULL description = keep current (D17)
+struct REC_WRITE_m13;  // defined in medrec_m13.h (included below - the record machinery lives there)
+tern	WRT_record_m13(WRT_SESS_m13 *ws, struct REC_WRITE_m13 *req);  // D4: session-level record via the generic medrec writer (REC_write_m13); pool mode drains first  // D4: Note only in v1
+tern	WRT_close_session_m13(WRT_SESS_m13 *ws);  // flush, settle UHs, write final metadata, free
+
+// post-block callback (D11c): invoked after each block is encoded & written; read-only facts for
+// display taps, stats & alerts (e.g. line-noise alert = noise_scores[0]). Called on the writing thread.
+typedef struct {
+	si4	chan_idx;
+	si8	start_time;			// block start (uutc/oUTC per time_mode)
+	ui4	n_samples;
+	ui4	total_block_bytes;
+	ui4	algorithm;			// CMP_BF_*_ENCODING_m13 flag actually used
+	ui1	noise_scores[4];		// 0xFF = not computed
+	tern	discontinuity;
+} WRT_BLOCK_INFO_m13;
+typedef void	(*MED_write_block_callback_m13)(WRT_SESS_m13 *ws, const WRT_BLOCK_INFO_m13 *info, void *user_data);
+tern	WRT_set_block_callback_m13(WRT_SESS_m13 *ws, MED_write_block_callback_m13 fn, void *user_data);
+
+// optional convenience (D12): the DHN_Acq spreading policy - within each group of channels sharing a
+// steady-state block size, set channel k's initial_block_samples to round(full * k/N) (input domain,
+// decimation-aware). Call after add_channel calls, before the first write. Purely optional: any app may
+// set per-channel initials itself instead.
+tern	WRT_spread_block_phases_m13(WRT_SESS_m13 *ws);
+
+
+
+
 //**********************************************************************************//
 
 #include "medrec_m13.h"

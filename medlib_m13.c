@@ -107,6 +107,7 @@ static const si1	*PW_NAMES_SRC_m13[PW_NAMES_ENTRIES_m13] = PW_NAMES_m13;
 // "static" qualifier necessary for Matlab to maintain values between mex calls
 // limits scope to current file - prevents linking across compiled libraries
 static GLOBALS_m13	*globals_m13 = NULL;
+// (deliberately outside GLOBALS_m13: must persist across free/re-init cycles within one mex session)
 // MATLAB's interpreter thread, recorded by G_init_medlib_m13() for the mex output gate (see
 // G_mex_interp_thread_m13()).  Defined HERE with the other file-scope globals, not beside the gate:
 // G_init_medlib_m13() writes them & sits far earlier in the file, so a definition further down is
@@ -117,17 +118,18 @@ static tern		G_mat_interp_thread_set_m13 = FALSE_m13;
 GLOBALS_m13		*globals_m13 = NULL;
 #endif
 
-// concurrently active job distributions (PROC & PAR)
-// used by adaptive jobs_per_core: utilization measurements are only trusted when a distribution runs alone
-static _Atomic si4	distribute_calls_m13 = 0;
-
 // type 2 recovery anchor configuration (process-wide, write-once at startup via G_set_anchor_public_key_m13():
 // no reset machinery to trip re-initialization; public keys are not secret, so no erasure obligations either)
+// (deliberately outside GLOBALS_m13: write-once per PROCESS - folding it in would silently drop the
+//  app's anchor key across a G_free_globals_m13()/re-init cycle & files written after would carry no
+//  recovery escrow)
 static ui1	G_anchor_public_key_m13[XEC_KEY_BYTES_m13];
 static ui1	G_anchor_key_ID_m13 = 0;
 static tern	G_anchor_public_key_set_m13 = FALSE_m13;
 
 // stack registry epoch: incremented by G_free_globals_m13() (must outlive the globals it guards)
+// (deliberately outside GLOBALS_m13 - it cannot live inside the structure whose death it announces:
+//  a re-init would reset it & a thread's stale cached epoch of zero would "match" a freed stack)
 // threads cache pointers into the function stack registry; freeing the registry invalidates every cache -
 // without this check a re-initialized library hands a thread its FREED stack (same _id bytes still in the block)
 static _Atomic ui4	stacks_epoch_m13 = 0;
@@ -208,6 +210,7 @@ static void AES_inv_cipher_hw_m13(ui1 *in, ui1 *out, ui1 *round_key, si4 nr);
 
 // COMPRESSION & COMPUTATION FUNCTIONS  (CMP)
 static tern CMP_fit_CPS_scratch_m13(CPS_m13 *cps, ui4 mode, ui4 block_samples);
+static void CMP_set_RED_PRED_side_m13(CPS_m13 *cps, tern red_side);
 static void CMP_derivative_window_m13(tern pos_derivs, si4 *low_d, si4 *high_d, ui1 *ks_flag);
 static ui1 CMP_overflow_bytes_for_extrema_m13(si8 min_val, si8 max_val, tern pos_derivs);
 static int CMP_VDS_cand_cmp_m13(const void *a, const void *b);
@@ -311,13 +314,9 @@ static void	G_build_kdf_salt_m13(UH_m13 *uh, ui1 *salt);  // salt = session UID 
 // --- creation-time password strength estimate (see G_estimate_password_bits_m13()) ---
 
 
-// ⭐ Two read-path integrity guards, added 2026-08-04 after a session whose universal header recorded a
-// DECRYPTED encryption level on disk: the reader's "> NO_ENCRYPTION" test was therefore false, decryption was
-// skipped, and CIPHERTEXT was handed to callers AS PLAINTEXT. Metadata section 2 then read as random bytes -
-// sampling frequency -4.5e62, sample counts in the quintillions, negative block counts - which flowed into
-// allocation sizes (observed: calloc failure in a read worker) and into divisors (SIGFPE on x86; on arm64
-// integer divide-by-zero yields 0 instead of trapping, so it limped on and failed later & less legibly).
-// Reproducer & write-up: dev/claude_tests/bad_data/.
+// ⭐ Two read-path integrity guards: a header that (wrongly) records DECRYPTED on disk would otherwise skip
+// decryption & hand CIPHERTEXT to callers as plaintext, whose garbage numbers flow into allocation sizes &
+// divisors. Reproducer & write-up: dev/claude_tests/bad_data/.
 
 
 static const E_STRING_m13	E_STR_TABLE_SRC_m13[E_STR_TABLE_ENTRIES_m13] = E_STR_TABLE_m13;
@@ -656,7 +655,7 @@ CHAN_m13	*G_alloc_channel_m13(CHAN_m13 *chan, FPS_m13 *proto_fps, const si1 *pat
 	
 	// make new prototype fps (don't modify original)
 	if (proto_fps)
-		proto_fps = FPS_clone_m13(proto_fps, chan->path, FPS_PROTOTYPE_BYTES_m13, 0, parent);
+		proto_fps = FPS_clone_m13(proto_fps, chan->path, FPS_PROTOTYPE_BYTES_m13, FPS_PROTOTYPE_BYTES_m13, parent);  // copy the metadata body: inheritance is the prototype's purpose (copy_bytes 0 dropped it at every level - writer-side fix 2026-08-10)
 	else
 		proto_fps = FPS_init_m13(NULL, chan->path, NULL, FPS_PROTOTYPE_BYTES_m13, parent);
 	if (proto_fps == NULL) {
@@ -763,7 +762,7 @@ SEG_m13	*G_alloc_segment_m13(SEG_m13 *seg, FPS_m13 *proto_fps, const si1 *path, 
 	
 	// make new prototype fps (don't modify original)
 	if (proto_fps)
-		proto_fps = FPS_clone_m13(proto_fps, seg->path, FPS_PROTOTYPE_BYTES_m13, 0, parent);
+		proto_fps = FPS_clone_m13(proto_fps, seg->path, FPS_PROTOTYPE_BYTES_m13, FPS_PROTOTYPE_BYTES_m13, parent);  // copy the metadata body (see G_alloc_channel_m13() note)
 	else
 		proto_fps = FPS_init_m13(NULL, seg->path, NULL, FPS_PROTOTYPE_BYTES_m13, parent);
 	if (proto_fps == NULL) {
@@ -782,7 +781,7 @@ SEG_m13	*G_alloc_segment_m13(SEG_m13 *seg, FPS_m13 *proto_fps, const si1 *path, 
 
 			// time series metadata
 			sprintf_m13(tmp_str, "%s/%s.%s", seg->path, seg->name, TS_METADATA_TYPE_STR_m13);
-			if ((seg->metadata_fps = FPS_clone_m13(proto_fps, tmp_str, METADATA_BYTES_m13, 0, (LH_m13 *) seg)) == NULL) {
+			if ((seg->metadata_fps = FPS_clone_m13(proto_fps, tmp_str, METADATA_BYTES_m13, METADATA_BYTES_m13, (LH_m13 *) seg)) == NULL) {
 				G_free_segment_m13(seg);
 				FPS_free_m13(proto_fps);
 				return_m13(NULL);
@@ -810,7 +809,7 @@ SEG_m13	*G_alloc_segment_m13(SEG_m13 *seg, FPS_m13 *proto_fps, const si1 *path, 
 			
 			// video metadata
 			sprintf_m13(tmp_str, "%s/%s.%s", seg->path, seg->name, VID_METADATA_TYPE_STR_m13);
-			if ((seg->metadata_fps = FPS_clone_m13(proto_fps, tmp_str, METADATA_BYTES_m13, 0, (LH_m13 *) seg)) == NULL) {
+			if ((seg->metadata_fps = FPS_clone_m13(proto_fps, tmp_str, METADATA_BYTES_m13, METADATA_BYTES_m13, (LH_m13 *) seg)) == NULL) {
 				G_free_segment_m13(seg);
 				FPS_free_m13(proto_fps);
 				return_m13(NULL);
@@ -902,7 +901,7 @@ SESS_m13	*G_alloc_session_m13(FPS_m13 *proto_fps, const si1 *path, si4 n_ts_chan
 	
 	// make new prototype fps (don't modify original)
 	if (proto_fps)
-		proto_fps = FPS_clone_m13(proto_fps, sess->path, FPS_PROTOTYPE_BYTES_m13, 0, sess->parent);
+		proto_fps = FPS_clone_m13(proto_fps, sess->path, FPS_PROTOTYPE_BYTES_m13, FPS_PROTOTYPE_BYTES_m13, sess->parent);  // copy the metadata body (see G_alloc_channel_m13() note)
 	else
 		proto_fps = FPS_init_m13(NULL, sess->path, NULL, FPS_PROTOTYPE_BYTES_m13, sess->parent);
 	if (proto_fps == NULL) {
@@ -1326,6 +1325,8 @@ BEHAVIOR_STACK_m13	*G_behavior_stack_m13(void)
 
 
 #if defined MACOS_m13 || defined LINUX_m13
+// (atomic unit: behavior-stack key/once machinery + its key_create platform variants stay
+//  colocated with their consumers; internal order is init-lifecycle, not alphabetical)
 static pthread_key_t	G_behavior_stack_key_m13;
 static pthread_once_t	G_behavior_stack_key_once_m13 = PTHREAD_ONCE_INIT;
 
@@ -2357,8 +2358,13 @@ tern	G_check_file_system_m13(const si1 *file_system_path, si4 is_cloud, ...)  //
 	G_push_function_m13();
 #endif
 
-	if (STR_is_empty_m13(file_system_path) == TRUE_m13)
-		file_system_path = ".";
+	// an empty path is an ERROR, not the CWD: this function creates directories & probe files, so a
+	// path field that lost its contents upstream must not silently retarget the working directory
+	// (the 2026-08-11 NAT2MED deletion rode exactly that). Pass "." to mean the CWD explicitly.
+	if (STR_is_empty_m13(file_system_path) == TRUE_m13) {
+		G_set_error_m13(E_GEN_m13, "empty file system path (pass \".\" for the current working directory)");
+		return_m13(FALSE_m13);
+	}
 	G_full_path_m13(file_system_path, full_path);
 	
 	// make directory if it doesn't exist
@@ -2610,7 +2616,7 @@ si4	G_compare_acq_nums_m13(const void *a, const void *b)
 }
 
 
-si4	G_compare_record_index_times(const void *a, const void *b)
+si4	G_compare_record_index_times_m13(const void *a, const void *b)
 {
 	REC_IDX_m13	*ria, *rib;
 	
@@ -3738,6 +3744,311 @@ tern	G_encryption_decrypted_state_m13(si1 level)
 
 	return((level == LEVEL_1_ENCRYPTION_DECRYPTED_m13 || level == LEVEL_2_ENCRYPTION_DECRYPTED_m13) ? TRUE_m13 : FALSE_m13);
 }
+
+
+#if defined MACOS_m13 || defined LINUX_m13
+static si4	G_read_password_line_m13(si1 *buf)
+{
+	si4	i, c, seq, k;
+
+	// Read one line into buf as UTF-8, no echo (caller has cleared the ECHO termios bit).  Accepts whole
+	// characters up to PASSWORD_BYTES_m13 BYTES (the crypto cap - G_condition_password_m13 REJECTS anything
+	// longer, so entry stops here rather than handing on an over-length string); a character that would cross
+	// the cap is refused (beep) and the rest of the line drained.  Returns the byte length.
+
+	i = 0;
+	while ((c = getchar()) != '\n' && c != EOF) {
+		if (G_password_char_ok_m13(c) == FALSE_m13) {  // control / DEL
+			putchar_m13(7);  // beep
+			continue;
+		}
+		seq = G_utf8_seq_len_m13(c);
+		if ((i + seq) > PASSWORD_BYTES_m13) {  // no room for this whole character: refuse & drain the rest
+			putchar_m13(7);  // beep
+			while ((c = getchar()) != '\n' && c != EOF);
+			break;
+		}
+		buf[i++] = (si1) c;
+		for (k = 1; k < seq; ++k) {  // pull the continuation bytes of this character together with its lead
+			c = getchar();
+			if (c == '\n' || c == EOF)
+				break;
+			buf[i++] = (si1) c;
+		}
+	}
+	buf[i] = 0;
+	putchar_m13('\n');
+
+	return(i);
+}
+
+
+tern	G_enter_password_m13(si1 *password, const si1 *prompt, tern confirm_no_entry, sf8 timeout_secs, tern create_password)
+{
+	si1			pw_copy[MAX_PASSWORD_STRING_BYTES_m13], dc[8];
+	struct termios		term, saved_term;
+	
+#ifdef FT_DEBUG_m13
+	G_push_function_m13();
+#endif
+
+	// pass timeout_secs == 0.0 for no timeout
+
+	if (password == NULL) {
+		G_set_error_m13(E_GEN_m13, "password is null");
+		return_m13(FALSE_m13);
+	}
+		
+	if (prompt == NULL)
+		prompt = "Enter Password";
+	else if (*prompt == 0)
+		prompt = "Enter Password";
+	
+	// get settings of STDIN_FILENO and copy for resetting
+	tcgetattr(STDIN_FILENO, &term);
+	saved_term = term;
+	
+	// unset the echo bit in the termios struct (displays "key" character)
+	term.c_lflag &= ~(ECHO);
+	
+	// set the new bits
+	tcsetattr(STDIN_FILENO, TCSANOW, &term);
+
+	if (create_password == TRUE_m13) {  // show the current policy up front (once), not just as an after-the-fact error
+		si1	req[256];
+
+		printf_m13("%s\n", G_password_requirements_m13(req));
+	}
+
+
+ENTER_ASCII_PASSWORD_RETRY_1_m13:
+
+	if (timeout_secs > (sf8) 0.0) {
+		struct timeval	tv;
+		fd_set		fds;
+		si4		fds_ready;
+		
+		printf_m13("%s %s[%0.1lfs timeout]%s: ", prompt, TC_GREEN_m13, timeout_secs, TC_RESET_m13);
+		fflush(stdout);
+
+		// set timeout
+		tv.tv_sec = (time_t) timeout_secs;
+		timeout_secs -= (sf8) tv.tv_sec;
+		tv.tv_usec = (time_t) (timeout_secs * (sf8) 1.0e6);
+
+		// wait for keyboard entry
+		FD_ZERO(&fds);
+		FD_SET(0, &fds);
+		fds_ready = select(1, &fds, NULL, NULL, &tv);  // just the stdin read descriptor
+		if (fds_ready <= 0) {  // timed out
+			putchar_m13('\n'); fflush(stdout);
+			tcsetattr(STDIN_FILENO, TCSANOW, &saved_term);  // reset terminal
+			return_m13(FALSE_m13);
+		}
+	} else {
+		printf_m13("%s: ", prompt); fflush(stdout);
+	}
+
+	// read password from the console (UTF-8, capped at PASSWORD_BYTES bytes on a character boundary)
+	G_read_password_line_m13(password);
+	if (*password == 0) {
+		if (confirm_no_entry == TRUE_m13) {
+			printf_m13("\tIs %s<no entry>%s correct (y/n): ", TC_RED_m13, TC_RESET_m13);
+			fflush(stdout);
+			*dc = 0;
+			scanf("%7[^\n]", dc);
+			getchar();  // clear '\n' from stdin
+			putchar_m13(*dc);
+		} else {
+			*dc = 'y';
+		}
+		if (*dc == 'y' || *dc == 'Y') {
+			putchar_m13('\n');
+			tcsetattr(STDIN_FILENO, TCSANOW, &saved_term);
+			return_m13(TRUE_m13);  // user intends no entry so return TRUE. Calling function should decide what to do with no password.
+		} else {
+			putchar_m13('\n');
+			goto ENTER_ASCII_PASSWORD_RETRY_1_m13;
+		}
+	}
+
+	// create only: validate against policy BEFORE asking for re-entry, and report the SPECIFIC reason (too short,
+	// composition, ...) - distinct from a re-entry mismatch below - so the user knows exactly what to fix and is
+	// not made to re-type a password that was going to be rejected anyway.  (Blank entry above already cancelled.)
+	if (create_password == TRUE_m13 && G_check_new_password_m13(password, 0, FALSE_m13) == FALSE_m13) {
+		printf_m13("%s%s%s\n", TC_RED_m13, globals_m13->error.message, TC_RESET_m13);
+		G_error_clear_m13();  // shown to the user here; do not leave it on the error stack
+		goto ENTER_ASCII_PASSWORD_RETRY_1_m13;
+	}
+
+	// confirm (create only): mistypes are common even for a known password, so DON'T lock out - just re-prompt
+	// both entries until they match; a blank re-entry is the explicit cancel.  No attempt cap (nothing to brute-
+	// force here - the user is choosing the password), so no "maximum attempts" trigger.
+	if (create_password == TRUE_m13) {
+		printf_m13("Re-enter password: ");
+		G_read_password_line_m13(pw_copy);
+		if (strcmp_m13(password, pw_copy)) {
+			if (*pw_copy == 0) {  // blank re-entry => explicit cancel
+				printf_m13("%s(cancelled)%s\n", TC_RED_m13, TC_RESET_m13);
+				tcsetattr(STDIN_FILENO, TCSANOW, &saved_term);
+				return_m13(FALSE_m13);
+			}
+			printf_m13("%sPasswords don't match - try again (leave blank to cancel).%s\n", TC_RED_m13, TC_RESET_m13);
+			goto ENTER_ASCII_PASSWORD_RETRY_1_m13;  // re-prompt BOTH entries: a typo in the first is recoverable
+		}
+	}
+	
+	// reset terminal
+	tcsetattr(STDIN_FILENO, TCSANOW, &saved_term);
+	
+	return_m13(TRUE_m13);
+}
+#endif  // MACOS_m13 || LINUX_m13
+
+
+#ifdef WINDOWS_m13
+static si4	G_read_password_line_m13(si1 *buf)
+{
+	si4	i, c, seq, k;
+
+	// Windows console counterpart of the POSIX reader: UTF-8, one masked '*' per CHARACTER, backspace removes a
+	// whole character (walks back over continuation bytes).  Same PASSWORD_BYTES_m13 byte cap on a character
+	// boundary.  Returns the byte length.  (Console codepage/wide-char quirks make multibyte input best-effort
+	// here - Windows is unverified - but ASCII, backspace, and the cap are exact.)
+
+	i = 0;
+	buf[0] = 0;
+	for (;;) {
+		c = _getch();
+		if (c == '\r' || c == 3) {  // carriage return or CTRL-C: finished
+			putch_m13('\r'); putch_m13('\n');
+			break;
+		}
+		if (c == '\b') {  // backspace: drop the whole last character
+			if (i) {
+				do { --i; } while (i > 0 && ((ui1) buf[i] & 0xC0) == 0x80);  // back over continuation bytes
+				putch_m13('\b'); putch_m13(' '); putch_m13('\b');  // erase its single mask glyph
+			}
+			continue;
+		}
+		if (G_password_char_ok_m13(c) == FALSE_m13) {  // control / DEL
+			putch_m13(7);  // beep
+			continue;
+		}
+		seq = G_utf8_seq_len_m13(c);
+		if ((i + seq) > PASSWORD_BYTES_m13) {  // no room for this whole character
+			putch_m13(7);  // beep
+			continue;
+		}
+		buf[i++] = (si1) c;
+		for (k = 1; k < seq; ++k)  // continuation bytes belong to the same character - read them raw
+			buf[i++] = (si1) _getch();
+		putch_m13('*');  // one mask glyph per character
+	}
+	buf[i] = 0;
+
+	return(i);
+}
+
+
+tern	G_enter_password_m13(si1 *password, const si1 *prompt, tern confirm_no_entry, sf8 timeout_secs, tern create_password)
+{
+	si1		pw_copy[MAX_PASSWORD_STRING_BYTES_m13];
+	si4		dc;
+
+#ifdef FT_DEBUG_m13
+	G_push_function_m13();
+#endif
+
+	// pass timeout_secs == 0.0 for no timeout
+	if (password == NULL) {
+		G_set_error_m13(E_GEN_m13, "password is null");
+		return_m13(FALSE_m13);
+	}
+	
+	if (prompt == NULL)
+		prompt = "Enter password";
+	else if (*prompt == 0)
+		prompt = "Enter password";
+
+	if (create_password == TRUE_m13) {  // show the current policy up front (once), not just as an after-the-fact error
+		si1	req[256];
+
+		printf_m13("%s\n", G_password_requirements_m13(req));
+	}
+
+	ENTER_ASCII_PASSWORD_RETRY_1_m13:
+
+	if (timeout_secs > (sf8) 0.0) {
+		struct timeval	tv;
+		fd_set		fds;
+		si4		fds_ready;
+		
+		printf_m13("%s %s[%0.1lfs timeout]%s: ", prompt, TC_GREEN_m13, timeout_secs, TC_RESET_m13);
+		fflush(stdout);
+		
+		// set timeout
+		tv.tv_sec = (time_t) timeout_secs;
+		timeout_secs -= (sf8) tv.tv_sec;
+		tv.tv_usec = (time_t) (timeout_secs * (sf8) 1.0e6);
+
+		// wait for keyboard entry
+		FD_ZERO(&fds);
+		FD_SET(0, &fds);
+		fds_ready = select(1, &fds, NULL, NULL, &tv);  // just the read descriptor
+		if (fds_ready <= 0)
+			return_m13(FALSE_m13);
+	} else {
+		printf_m13("%s: ", prompt); fflush(stdout);
+	}
+	
+	// read password from the console (UTF-8, capped at PASSWORD_BYTES bytes on a character boundary)
+	G_read_password_line_m13(password);
+
+	if (*password == 0) {
+		if (confirm_no_entry == TRUE_m13) {
+			printf_m13("\tIs %s<no entry>%s correct (y/n): ", TC_RED_m13, TC_RESET_m13);
+			fflush(stdout);
+			dc = _getch();
+			putch_m13(dc); putch_m13('\r'); putch_m13('\n');
+		} else {
+			dc = 'y';
+		}
+		if (dc == 'y' || dc == 'Y') {
+			return_m13(TRUE_m13);  // user intends no entry so return TRUE. Calling function should decide what to do with no password.
+		} else {
+			goto ENTER_ASCII_PASSWORD_RETRY_1_m13;  // re-prompt (no cap)
+		}
+	}
+
+	// create only: validate against policy BEFORE asking for re-entry, and report the SPECIFIC reason (too short,
+	// composition, ...) - distinct from a re-entry mismatch below.  (Blank entry above already cancelled.)
+	if (create_password == TRUE_m13 && G_check_new_password_m13(password, 0, FALSE_m13) == FALSE_m13) {
+		printf_m13("%s%s%s\n", TC_RED_m13, globals_m13->error.message, TC_RESET_m13);
+		G_error_clear_m13();  // shown to the user here; do not leave it on the error stack
+		goto ENTER_ASCII_PASSWORD_RETRY_1_m13;
+	}
+
+	// confirm (create only): mistypes are common; re-prompt until match, blank re-entry cancels. No attempt cap.
+	if (create_password == TRUE_m13) {
+
+		printf_m13("Re-enter password: ");
+		G_read_password_line_m13(pw_copy);
+
+		if (strcmp_m13(password, pw_copy)) {
+			if (*pw_copy == 0) {  // blank re-entry => explicit cancel
+				printf_m13("%s(cancelled)%s\n", TC_RED_m13, TC_RESET_m13);
+				return_m13(FALSE_m13);
+			}
+			printf_m13("%sPasswords don't match - try again (leave blank to cancel).%s\n", TC_RED_m13, TC_RESET_m13);
+			goto ENTER_ASCII_PASSWORD_RETRY_1_m13;  // re-prompt BOTH entries: a typo in the first is recoverable
+		}
+	}
+
+	return_m13(TRUE_m13);
+}
+#endif  // WINDOWS_m13
+
 
 
 #ifdef FT_DEBUG_m13
@@ -6241,7 +6552,7 @@ tern	G_generate_password_m13(si1 *password, si4 n_chars, ui1 *suggested_kdf_expo
 }
 
 
-si8	G_generate_recording_time_offset_m13(si8 recording_start_time_uutc)
+si8	G_generate_recording_time_offset_m13(void *level_header, si8 recording_start_time_uutc)
 {
 	time_t			recording_start_time_utc, offset_utc_time, UTC_offset, secs_since_midnight;
 	struct tm		time_info;
@@ -6253,8 +6564,10 @@ si8	G_generate_recording_time_offset_m13(si8 recording_start_time_uutc)
 
 	// receives UNOFFSET recording start time (or CURRENT_TIME_m13)
 	// returns OFFSET recording start time
+	// level_header resolves WHICH pg's constants are read & offset written (NULL == current thread's -
+	// the m12-heritage single-session case; a writer with multiple same-thread sessions passes a level)
 	
-	pg = G_proc_globs_m13(NULL);
+	pg = G_proc_globs_m13(level_header);
 	
 	if (recording_start_time_uutc == CURRENT_TIME_m13) // use current system time
 		recording_start_time_uutc = G_current_uutc_m13();
@@ -6320,6 +6633,87 @@ si1	*G_generate_segment_name_m13(si1 *segment_name, FPS_m13 *fps)
 	snprintf_m13(segment_name, SEG_NAME_BYTES_m13, "%s_s%s", fps->uh->channel_name, num_str);
 	
 	return_m13(segment_name);
+}
+
+
+// guarded-table static (alphabetical order puts callers first - prototype required)
+static ui8	G_guarded_table_page_size_m13(void);
+
+void	*G_guarded_table_alloc_m13(size_t bytes)
+{
+	ui1	*base;
+	ui8	pg, total;
+
+#ifdef FT_DEBUG_m13
+	G_push_function_m13();
+#endif
+
+	pg = G_guarded_table_page_size_m13();
+	total = (((((ui8) bytes) + pg - 1) / pg) + 2) * pg;  // data pages + 2 guards
+	base = (ui1 *) aligned_alloc_m13((si8) pg, (si8) total);  // explicit alignment: the -1 (page) path would take tables->mutex (see above)
+	if (base == NULL)
+		return_m13(NULL);
+	mprotect_m13(base, (size_t) pg, PROT_NONE);  // leading guard
+	mprotect_m13(base + total - pg, (size_t) pg, PROT_NONE);  // trailing guard
+
+	return_m13(base + pg);
+}
+
+
+tern	G_guarded_table_free_m13(void *table, size_t bytes)
+{
+	ui1	*base;
+	ui8	pg, total;
+
+#ifdef FT_DEBUG_m13
+	G_push_function_m13();
+#endif
+
+	if (table == NULL)
+		return_m13(TRUE_m13);
+	pg = G_guarded_table_page_size_m13();
+	total = (((((ui8) bytes) + pg - 1) / pg) + 2) * pg;
+	base = ((ui1 *) table) - pg;
+	mprotect_m13(base, (size_t) total, PROT_READ | PROT_WRITE);  // guards & seal off: allocator must be able to write
+	aligned_free_m13(base);
+
+	return_m13(TRUE_m13);
+}
+
+
+static ui8	G_guarded_table_page_size_m13(void)
+{
+	static ui8	pg = 0;
+
+	if (pg == 0) {
+		#if defined MACOS_m13 || defined LINUX_m13
+		pg = (ui8) sysconf(_SC_PAGESIZE);
+		#endif
+		#ifdef WINDOWS_m13
+		SYSTEM_INFO	sys_info;
+
+		GetSystemInfo(&sys_info);
+		pg = (ui8) sys_info.dwPageSize;
+		#endif
+	}
+
+	return(pg);
+}
+
+
+tern	G_guarded_table_seal_m13(void *table, size_t bytes)
+{
+	ui8	pg;
+
+#ifdef FT_DEBUG_m13
+	G_push_function_m13();
+#endif
+
+	pg = G_guarded_table_page_size_m13();
+	if (mprotect_m13(table, (size_t) ((((ui8) bytes + pg - 1) / pg) * pg), PROT_READ))
+		return_m13(FALSE_m13);
+
+	return_m13(TRUE_m13);
 }
 
 
@@ -6593,14 +6987,19 @@ si8	G_index_for_time_m13(void *level_header, si8 target_time, ui4 mode, ...)  //
 			rate = (sf8) (tsi->start_samp_num - ref_index) / (sf8) (tsi->start_time - ref_time);  // samples per microsecond
 		}
 		
-		// round up if very close to next index
+		// round up if very close to next index - "close" measured in TIME, not index fraction:
+		// the forgiveness exists for FLOAT FUZZ, which is sub-microsecond; a real microsecond is
+		// never fuzz (end times use the "next start - 1 usec" convention, & the old index-fraction
+		// eps [SAMPLE_NUMBER_EPS_m13] snapped that deliberate -1 usec UP one sample at rates below
+		// ~10 kHz: 1 usec == 1e-4 of a period at 100 Hz - first exposed by the write API's
+		// decimated [low-rate] sessions, 2026-08-10)
 		tmp_sf8 = (sf8) (target_time - ref_time) * rate;
 		tmp_si8 = (si8) tmp_sf8;
 		if (tmp_sf8 != (sf8) tmp_si8)  // ceil() without calling function
 			++tmp_si8;
 		rounded_index = (sf8) tmp_si8;
 		index_eps = rounded_index - tmp_sf8;
-		if (index_eps < SAMPLE_NUMBER_EPS_m13) {
+		if ((index_eps / rate) < (sf8) 0.5) {  // rate is samples/usec: eps in USECS < half a usec
 			tmp_sf8 = rounded_index;
 			last_index = (sf8) (tmd2->number_of_samples - 1);
 			if (tmp_sf8 > last_index)
@@ -7066,21 +7465,37 @@ tern	G_init_medlib_m13(tern init_all_tables, const si1 *app_path, ...)  // varar
 
 tern	G_init_metadata_m13(FPS_m13 *fps, tern init_for_update)
 {
-	PROC_GLOBS_m13			*pg;
+#ifdef FT_DEBUG_m13
+	G_push_function_m13();
+#endif
+
+	return_m13(G_init_metadata_struct_m13(fps->metadata, fps->uh->type_code, init_for_update, G_proc_globs_m13(fps)));
+}
+
+
+tern	G_init_metadata_struct_m13(METADATA_m13 *md, ui4 type_code, tern init_for_update, PROC_GLOBS_m13 *pg)
+{
+	// Struct-level metadata initializer, factored out of G_init_metadata_m13() so a bare METADATA_m13
+	// (e.g. the write-API template - see the Write API section, D19) can be initialized without an FPS. Section 1
+	// is NOT touched (callers zero it; the FPS path never initialized it here either). Section 3 time
+	// fields are seeded from pg->time_constants - empty/zero if the constants are not yet set, which is
+	// correct for a template built before G_set_time_constants_m13() runs. Pass NULL pg for the current
+	// thread's proc globals.
 	TS_METADATA_SECTION_2_m13	*tmd2;
 	VID_METADATA_SECTION_2_m13	*vmd2;
 	METADATA_SECTION_3_m13		*md3;
-	UH_m13				*uh;
 	
 #ifdef FT_DEBUG_m13
 	G_push_function_m13();
 #endif
 
+	if (pg == NULL)
+		pg = G_proc_globs_m13(NULL);
+
 	// shortcuts
-	tmd2 = &fps->metadata->time_series_section_2;
-	vmd2 = &fps->metadata->video_section_2;
-	md3 = &fps->metadata->section_3;
-	uh = fps->uh;
+	tmd2 = &md->time_series_section_2;
+	vmd2 = &md->video_section_2;
+	md3 = &md->section_3;
 	
 	// section 2 fields
 	
@@ -7092,7 +7507,7 @@ tern	G_init_metadata_m13(FPS_m13 *fps, tern init_for_update)
 	tmd2->acquisition_channel_number = METADATA_ACQUISITION_CHANNEL_NUMBER_NO_ENTRY_m13;
 	
 	// type specific fields
-	switch (uh->type_code) {
+	switch (type_code) {
 		case TS_METADATA_TYPE_CODE_m13:
 			tmd2->sampling_frequency = RATE_NO_ENTRY_m13;
 			tmd2->low_frequency_filter_setting = RATE_NO_ENTRY_m13;
@@ -7161,12 +7576,11 @@ tern	G_init_metadata_m13(FPS_m13 *fps, tern init_for_update)
 			}
 			break;
 		default:
-			G_set_error_m13(E_FMED_m13, "unrecognized metadata section 2 type in file \"%s\"", fps->path);
+			G_set_error_m13(E_FMED_m13, "unrecognized metadata section 2 type code (0x%08x)", type_code);
 			break;
 	}
 	
 	// section 3 fields
-	pg = G_proc_globs_m13(fps);
 	md3->recording_time_offset = pg->time_constants.recording_time_offset;
 	md3->daylight_time_start_code = pg->time_constants.daylight_start_code;
 	md3->daylight_time_end_code = pg->time_constants.daylight_end_code;
@@ -7609,6 +8023,187 @@ ui4	G_level_m13(const si1 *full_file_name, ui4 *type_code)
 }
 
 
+static void	G_local_timezone_no_DST_m13(TIMEZONE_INFO_m13 *timezone_info);  // defined below (alphabetical order places the caller first)
+
+tern	G_local_timezone_m13(TIMEZONE_INFO_m13 *timezone_info)
+{
+	time_t		probe_1, probe_2;
+	struct tm	tm_1, tm_2;
+#if defined MACOS_m13 || defined LINUX_m13
+	struct tm	*std_tm, *dst_tm;
+#endif
+
+#ifdef FT_DEBUG_m13
+	G_push_function_m13();
+#endif
+
+	// Fill a TIMEZONE_INFO_m13 from the machine's OWN timezone configuration - no network &
+	// no shell (the OS carries the full IANA rule set locally).  Two probes half a year apart
+	// cover both hemispheres: wherever daylight time is observed exactly one probe is standard
+	// time; identical probes mean it is not observed.  The fields filled (acronyms & UTC offset
+	// on Unix; full zone names & offset on Windows) are what G_set_time_constants_m13()'s
+	// matching cascade needs - country is unnecessary: zone-sharing countries (e.g. US/Canada
+	// Mountain) pass its time-equivalence acceptance, & differing daylight policies (e.g.
+	// US/Mexico Central) are separated by the daylight fields.  The locale region (e.g.
+	// "en_US" => "US") supplies a country HINT - same narrowing the IP-geolocation path got
+	// from ipinfo, but from the machine's own configuration (heuristic: the language region
+	// usually matches the physical country; it is needed where countries sharing an acronym
+	// & offset differ in daylight RULES - e.g. US vs Mexico Mountain).  Ambiguity can remain
+	// (a no-DST zone sharing acronym & offset with a DST zone, no locale hint): the caller
+	// falls back to G_location_info_m13() (IP geolocation) or prompts when the cascade
+	// cannot settle it.
+
+	if (timezone_info == NULL) {
+		G_set_error_m13(E_GEN_m13, "NULL timezone_info");
+		return_m13(FALSE_m13);
+	}
+	memset((void *) timezone_info, 0, sizeof(TIMEZONE_INFO_m13));
+
+	// country hint from the locale region
+#if defined MACOS_m13 || defined LINUX_m13
+	{
+		const si1	*locale_str;
+
+		locale_str = getenv("LC_ALL");
+		if (locale_str == NULL || *locale_str == 0)
+			locale_str = getenv("LANG");
+		if (locale_str != NULL) {  // e.g. "en_US.UTF-8" (a GUI-launched process may have no locale in its environment - the hint is simply absent then)
+			const si1	*u = strchr(locale_str, '_');
+
+			if (u != NULL && u[1] >= 'A' && u[1] <= 'Z' && u[2] >= 'A' && u[2] <= 'Z' && (u[3] == '.' || u[3] == 0 || u[3] == '@')) {
+				timezone_info->country_acronym_2_letter[0] = u[1];
+				timezone_info->country_acronym_2_letter[1] = u[2];
+			}
+		}
+	}
+#endif
+#ifdef WINDOWS_m13
+	{
+		wchar_t	locale_name[LOCALE_NAME_MAX_LENGTH];
+		si4	i;
+
+		if (GetUserDefaultLocaleName(locale_name, LOCALE_NAME_MAX_LENGTH)) {  // e.g. "en-US"
+			for (i = 0; locale_name[i]; ++i)
+				if (locale_name[i] == L'-')
+					break;
+			if (locale_name[i] == L'-' && locale_name[i + 1] >= L'A' && locale_name[i + 1] <= L'Z' && locale_name[i + 2] >= L'A' && locale_name[i + 2] <= L'Z' && (locale_name[i + 3] == 0 || locale_name[i + 3] == L'-')) {
+				timezone_info->country_acronym_2_letter[0] = (si1) locale_name[i + 1];
+				timezone_info->country_acronym_2_letter[1] = (si1) locale_name[i + 2];
+			}
+		}
+	}
+#endif
+
+	probe_1 = time(NULL);
+	probe_2 = probe_1 + (time_t) 15778800;  // half a year
+#if defined MACOS_m13 || defined LINUX_m13
+	localtime_r(&probe_1, &tm_1);
+	localtime_r(&probe_2, &tm_2);
+	std_tm = dst_tm = NULL;
+	if (tm_1.tm_isdst > 0)
+		dst_tm = &tm_1;
+	else
+		std_tm = &tm_1;
+	if (tm_2.tm_isdst > 0) {
+		if (dst_tm == NULL)
+			dst_tm = &tm_2;
+	} else if (std_tm == NULL) {
+		std_tm = &tm_2;
+	}
+	if (std_tm == NULL)  // both probes claim daylight time - hand this oddity to the fallback
+		return_m13(FALSE_m13);
+	if (std_tm->tm_zone != NULL && strlen(std_tm->tm_zone) >= 3)  // the table has no 2-letter acronyms (e.g. MT); numeric zones ("-07") excluded below
+		strncpy(timezone_info->standard_timezone_acronym, std_tm->tm_zone, TIMEZONE_ACRONYM_BYTES_m13 - 1);
+	if (dst_tm != NULL)
+		if (dst_tm->tm_zone != NULL && strlen(dst_tm->tm_zone) >= 3)
+			strncpy(timezone_info->daylight_timezone_acronym, dst_tm->tm_zone, TIMEZONE_ACRONYM_BYTES_m13 - 1);
+	timezone_info->standard_UTC_offset = (si4) std_tm->tm_gmtoff;  // seconds east of UTC, standard time
+	if (*timezone_info->standard_timezone_acronym == 0)  // unnamed or numeric zone - nothing for the cascade to match
+		return_m13(FALSE_m13);
+	if (dst_tm == NULL)  // DST not observed - a further native discriminator (see helper)
+		G_local_timezone_no_DST_m13(timezone_info);
+#endif  // MACOS_m13 || LINUX_m13
+#ifdef WINDOWS_m13
+	// Windows tm has no tm_zone/tm_gmtoff; _tzname[] carries FULL names ("Mountain Standard
+	// Time"), which match the table's standard_timezone/daylight_timezone name fields
+	_tzset();
+	tm_1 = *(localtime(&probe_1));
+	tm_2 = *(localtime(&probe_2));
+	if (*_tzname[0])
+		strncpy(timezone_info->standard_timezone, _tzname[0], TIMEZONE_STRING_BYTES_m13 - 1);
+	if (_daylight && (tm_1.tm_isdst > 0 || tm_2.tm_isdst > 0))  // zone observes daylight time
+		if (*_tzname[1])
+			strncpy(timezone_info->daylight_timezone, _tzname[1], TIMEZONE_STRING_BYTES_m13 - 1);
+	timezone_info->standard_UTC_offset = (si4) -_timezone;  // _timezone is seconds WEST of UTC
+	if (*timezone_info->standard_timezone == 0)
+		return_m13(FALSE_m13);
+	if (tm_1.tm_isdst <= 0 && tm_2.tm_isdst <= 0)  // DST not observed - a further native discriminator (see helper)
+		G_local_timezone_no_DST_m13(timezone_info);
+#endif  // WINDOWS_m13
+
+	return_m13(TRUE_m13);
+}
+
+
+static void	G_local_timezone_no_DST_m13(TIMEZONE_INFO_m13 *timezone_info)
+{
+	si4				i, n_matches;
+	const si1			*country;
+	const TIMEZONE_INFO_m13		*tz_table, *row, *match;
+
+	// The machine's DST OBEYANCE is native knowledge too (identical half-year probes == not
+	// observed) & the table encodes it (daylight_time_start_code 0).  Zones that skip DST while
+	// sharing acronym & offset with observing neighbors (Arizona MST, Saskatchewan CST,
+	// Queensland AEST) are exactly the cases the matching cascade cannot settle from acronym +
+	// offset alone - so keep only no-DST rows & adopt their country (& territory when unique) as
+	// evidence.  Timezone-derived, so PHYSICAL evidence: overrides the locale-region language
+	// hint on conflict.  No match or a cross-country tie leaves the info untouched.
+
+	if (globals_m13->tables->timezone_table == NULL)
+		if (G_init_timezone_tables_m13() == FALSE_m13)
+			return;
+	tz_table = globals_m13->tables->timezone_table;
+
+	n_matches = 0;
+	country = NULL;
+	match = NULL;
+	for (i = 0; i < TZ_TABLE_ENTRIES_m13; ++i) {
+		row = tz_table + i;
+		if (row->daylight_time_start_code != 0)  // observes DST (or no entry) - not this machine
+			continue;
+		if (row->standard_UTC_offset != timezone_info->standard_UTC_offset)
+			continue;
+		if (*timezone_info->standard_timezone_acronym) {  // Unix path (acronyms)
+			if (strcmp_m13(timezone_info->standard_timezone_acronym, row->standard_timezone_acronym))
+				continue;
+		} else {  // Windows path (full names; table is upper case, _tzname[] is title case)
+			si1	upper_name[TIMEZONE_STRING_BYTES_m13];
+
+			strncpy(upper_name, timezone_info->standard_timezone, TIMEZONE_STRING_BYTES_m13 - 1);
+			upper_name[TIMEZONE_STRING_BYTES_m13 - 1] = 0;
+			STR_to_upper_m13(upper_name);
+			if (strcmp_m13(upper_name, row->standard_timezone))
+				continue;
+		}
+		if (country == NULL) {
+			country = row->country;
+			match = row;
+		} else if (strcmp_m13(country, row->country)) {
+			return;  // no-DST rows from more than one country - not decisive, leave untouched
+		}
+		++n_matches;
+	}
+	if (n_matches == 0)
+		return;
+
+	strncpy(timezone_info->country, country, METADATA_RECORDING_LOCATION_BYTES_m13 - 1);
+	if (n_matches == 1)
+		strncpy(timezone_info->territory, match->territory, METADATA_RECORDING_LOCATION_BYTES_m13 - 1);
+
+	return;
+}
+
+
 tern	G_location_info_m13(LOCATION_INFO_m13 *loc_info, const si1 *ip_str, const si1 *ipinfo_token, tern set_timezone_globals, tern prompt)
 {
 	tern		free_loc_info, local_ip, r_val;
@@ -7737,7 +8332,7 @@ tern	G_location_info_m13(LOCATION_INFO_m13 *loc_info, const si1 *ip_str, const s
 	
 	r_val = TRUE_m13;
 	if (set_timezone_globals == TRUE_m13) {
-		if (G_set_time_constants_m13(&loc_info->timezone_info, 0, prompt) == FALSE_m13) {
+		if (G_set_time_constants_m13(NULL, &loc_info->timezone_info, 0, prompt) == FALSE_m13) {
 			G_warning_message_m13("%s(): could not set timezone globals => returning NULL\n", __FUNCTION__);
 			r_val = FALSE_m13;
 		}
@@ -7976,6 +8571,42 @@ const si1	*G_MED_type_string_from_code_m13(ui4 code)
 	}
 		
 	return_m13(NULL);
+}
+
+
+// Guarded table allocation (2026-08-09 hardening #2): page-aligned data region with PROT_NONE guard
+// pages either side, sealed PROT_READ after filling. For COMPUTED read-forever tables (CRC_tables,
+// CMP_log_table) - the static const masters already live in .rodata & need nothing. A wild write into a
+// sealed table (or a linear overrun crossing a guard) faults AT THE CORRUPTING STORE - the diagnostic a
+// debugger gives, in production, for free (one mprotect per table per process; reads untouched).
+// The (ptr, bytes) pair passed to seal/free must match the alloc call - sizes are compile-time constants
+// at every current call site. free RESTORES read/write before releasing (the allocator writes bookkeeping
+// into freed blocks).
+// page size for the guarded-table helpers: LOCK-FREE by design. The natural source (HW_params via
+// HW_get_memory_info_m13()) takes tables->mutex - which both table-init callers HOLD while allocating -
+// & aligned_alloc_m13(-1, ...) reaches the same lock for the same reason. Direct syscall, static cache
+// (concurrent first calls write the same value: benign).
+ui4	G_map_granularity_m13(void)
+{
+	// mapping-placement granularity (ring double-maps, MapViewOfFile offsets): HW_params' known value;
+	// same lock-free contract as G_page_size_m13() below
+	ui4	mg;
+
+	mg = 0;
+	if (globals_m13 != NULL && globals_m13->tables != NULL)
+		mg = globals_m13->tables->HW_params.map_granularity;
+	if (mg == 0) {
+#if defined MACOS_m13 || defined LINUX_m13
+		mg = (ui4) sysconf(_SC_PAGESIZE);
+#endif
+#ifdef WINDOWS_m13
+		SYSTEM_INFO	si;
+		GetSystemInfo(&si);
+		mg = (ui4) si.dwAllocationGranularity;
+#endif
+	}
+
+	return(mg);
 }
 
 
@@ -9787,6 +10418,32 @@ si8	G_pad_m13(ui1 *buffer, si8 content_len, ui4 alignment)
 }
 
 
+ui4	G_page_size_m13(void)
+{
+	// The library gathers the page size into HW_params at init; serve that. Fallback = direct query
+	// (never HW_get_memory_info_m13() from here: it takes the tables mutex, & an allocation-adjacent
+	// getter must not take ambient locks - the guarded-table lesson). MATLAB-safe: globals_m13 is in
+	// scope HERE, which is why the write API's rings call this instead of reaching in.
+	ui4	ps;
+
+	ps = 0;
+	if (globals_m13 != NULL && globals_m13->tables != NULL)
+		ps = globals_m13->tables->HW_params.system_page_size;
+	if (ps == 0) {
+#if defined MACOS_m13 || defined LINUX_m13
+		ps = (ui4) sysconf(_SC_PAGESIZE);
+#endif
+#ifdef WINDOWS_m13
+		SYSTEM_INFO	si;
+		GetSystemInfo(&si);
+		ps = (ui4) si.dwPageSize;
+#endif
+	}
+
+	return(ps);
+}
+
+
 tern	G_password_char_ok_m13(si4 c)
 {
 	ui1	b;
@@ -10052,22 +10709,31 @@ tern	G_path_parts_m13(const si1 *file_name, si1 *path, si1 *name, si1 *extension
 #endif
 
 	// outputs defined on all paths, including failures (callers may pass uninitialized buffers => stale
-	// contents must never be mistaken for results, or sniffed as pstrs - see PSTR_m13() note)
+	// contents must never be mistaken for results, or sniffed as pstrs - see PSTR_m13() note).
+	// The INPUT is captured before the outputs are zeroed: in-place parses (path or name aliasing
+	// file_name) are long-standing caller usage - zero-first wiped the aliased input & silently
+	// emptied the caller's path (the 2026-08-11 NAT2MED working-directory deletion)
+
+	// handle bad calls
+	if (STR_is_empty_m13(file_name) == TRUE_m13) {
+		if (path)
+			*path = 0;
+		if (name)
+			*name = 0;
+		if (extension)
+			*extension = 0;
+		G_set_error_m13(E_GEN_m13, "file name is empty");
+		return_m13(FALSE_m13);
+	}
+
+	// get path from root (captures the input - output zeroing below is aliasing-safe)
+	G_full_path_m13(file_name, tmp_path);
 	if (path)
 		*path = 0;
 	if (name)
 		*name = 0;
 	if (extension)
 		*extension = 0;
-
-	// handle bad calls
-	if (STR_is_empty_m13(file_name) == TRUE_m13) {
-		G_set_error_m13(E_GEN_m13, "file name is empty");
-		return_m13(FALSE_m13);
-	}
-
-	// get path from root
-	G_full_path_m13(file_name, tmp_path);
 
 	// move pointer to end of string
 	c = tmp_path + strlen(tmp_path) - 1;
@@ -12104,310 +12770,6 @@ tern	G_read_medlibrc_m13(const si1 *path, tern sequential)
 
 	return_m13(applied);
 }
-
-
-#if defined MACOS_m13 || defined LINUX_m13
-static si4	G_read_password_line_m13(si1 *buf)
-{
-	si4	i, c, seq, k;
-
-	// Read one line into buf as UTF-8, no echo (caller has cleared the ECHO termios bit).  Accepts whole
-	// characters up to PASSWORD_BYTES_m13 BYTES (the crypto cap - G_condition_password_m13 REJECTS anything
-	// longer, so entry stops here rather than handing on an over-length string); a character that would cross
-	// the cap is refused (beep) and the rest of the line drained.  Returns the byte length.
-
-	i = 0;
-	while ((c = getchar()) != '\n' && c != EOF) {
-		if (G_password_char_ok_m13(c) == FALSE_m13) {  // control / DEL
-			putchar_m13(7);  // beep
-			continue;
-		}
-		seq = G_utf8_seq_len_m13(c);
-		if ((i + seq) > PASSWORD_BYTES_m13) {  // no room for this whole character: refuse & drain the rest
-			putchar_m13(7);  // beep
-			while ((c = getchar()) != '\n' && c != EOF);
-			break;
-		}
-		buf[i++] = (si1) c;
-		for (k = 1; k < seq; ++k) {  // pull the continuation bytes of this character together with its lead
-			c = getchar();
-			if (c == '\n' || c == EOF)
-				break;
-			buf[i++] = (si1) c;
-		}
-	}
-	buf[i] = 0;
-	putchar_m13('\n');
-
-	return(i);
-}
-
-
-tern	G_enter_password_m13(si1 *password, const si1 *prompt, tern confirm_no_entry, sf8 timeout_secs, tern create_password)
-{
-	si1			pw_copy[MAX_PASSWORD_STRING_BYTES_m13], dc[8];
-	struct termios		term, saved_term;
-	
-#ifdef FT_DEBUG_m13
-	G_push_function_m13();
-#endif
-
-	// pass timeout_secs == 0.0 for no timeout
-
-	if (password == NULL) {
-		G_set_error_m13(E_GEN_m13, "password is null");
-		return_m13(FALSE_m13);
-	}
-		
-	if (prompt == NULL)
-		prompt = "Enter Password";
-	else if (*prompt == 0)
-		prompt = "Enter Password";
-	
-	// get settings of STDIN_FILENO and copy for resetting
-	tcgetattr(STDIN_FILENO, &term);
-	saved_term = term;
-	
-	// unset the echo bit in the termios struct (displays "key" character)
-	term.c_lflag &= ~(ECHO);
-	
-	// set the new bits
-	tcsetattr(STDIN_FILENO, TCSANOW, &term);
-
-	if (create_password == TRUE_m13) {  // show the current policy up front (once), not just as an after-the-fact error
-		si1	req[256];
-
-		printf_m13("%s\n", G_password_requirements_m13(req));
-	}
-
-
-ENTER_ASCII_PASSWORD_RETRY_1_m13:
-
-	if (timeout_secs > (sf8) 0.0) {
-		struct timeval	tv;
-		fd_set		fds;
-		si4		fds_ready;
-		
-		printf_m13("%s %s[%0.1lfs timeout]%s: ", prompt, TC_GREEN_m13, timeout_secs, TC_RESET_m13);
-		fflush(stdout);
-
-		// set timeout
-		tv.tv_sec = (time_t) timeout_secs;
-		timeout_secs -= (sf8) tv.tv_sec;
-		tv.tv_usec = (time_t) (timeout_secs * (sf8) 1.0e6);
-
-		// wait for keyboard entry
-		FD_ZERO(&fds);
-		FD_SET(0, &fds);
-		fds_ready = select(1, &fds, NULL, NULL, &tv);  // just the stdin read descriptor
-		if (fds_ready <= 0) {  // timed out
-			putchar_m13('\n'); fflush(stdout);
-			tcsetattr(STDIN_FILENO, TCSANOW, &saved_term);  // reset terminal
-			return_m13(FALSE_m13);
-		}
-	} else {
-		printf_m13("%s: ", prompt); fflush(stdout);
-	}
-
-	// read password from the console (UTF-8, capped at PASSWORD_BYTES bytes on a character boundary)
-	G_read_password_line_m13(password);
-	if (*password == 0) {
-		if (confirm_no_entry == TRUE_m13) {
-			printf_m13("\tIs %s<no entry>%s correct (y/n): ", TC_RED_m13, TC_RESET_m13);
-			fflush(stdout);
-			*dc = 0;
-			scanf("%7[^\n]", dc);
-			getchar();  // clear '\n' from stdin
-			putchar_m13(*dc);
-		} else {
-			*dc = 'y';
-		}
-		if (*dc == 'y' || *dc == 'Y') {
-			putchar_m13('\n');
-			tcsetattr(STDIN_FILENO, TCSANOW, &saved_term);
-			return_m13(TRUE_m13);  // user intends no entry so return TRUE. Calling function should decide what to do with no password.
-		} else {
-			putchar_m13('\n');
-			goto ENTER_ASCII_PASSWORD_RETRY_1_m13;
-		}
-	}
-
-	// create only: validate against policy BEFORE asking for re-entry, and report the SPECIFIC reason (too short,
-	// composition, ...) - distinct from a re-entry mismatch below - so the user knows exactly what to fix and is
-	// not made to re-type a password that was going to be rejected anyway.  (Blank entry above already cancelled.)
-	if (create_password == TRUE_m13 && G_check_new_password_m13(password, 0, FALSE_m13) == FALSE_m13) {
-		printf_m13("%s%s%s\n", TC_RED_m13, globals_m13->error.message, TC_RESET_m13);
-		G_error_clear_m13();  // shown to the user here; do not leave it on the error stack
-		goto ENTER_ASCII_PASSWORD_RETRY_1_m13;
-	}
-
-	// confirm (create only): mistypes are common even for a known password, so DON'T lock out - just re-prompt
-	// both entries until they match; a blank re-entry is the explicit cancel.  No attempt cap (nothing to brute-
-	// force here - the user is choosing the password), so no "maximum attempts" trigger.
-	if (create_password == TRUE_m13) {
-		printf_m13("Re-enter password: ");
-		G_read_password_line_m13(pw_copy);
-		if (strcmp_m13(password, pw_copy)) {
-			if (*pw_copy == 0) {  // blank re-entry => explicit cancel
-				printf_m13("%s(cancelled)%s\n", TC_RED_m13, TC_RESET_m13);
-				tcsetattr(STDIN_FILENO, TCSANOW, &saved_term);
-				return_m13(FALSE_m13);
-			}
-			printf_m13("%sPasswords don't match - try again (leave blank to cancel).%s\n", TC_RED_m13, TC_RESET_m13);
-			goto ENTER_ASCII_PASSWORD_RETRY_1_m13;  // re-prompt BOTH entries: a typo in the first is recoverable
-		}
-	}
-	
-	// reset terminal
-	tcsetattr(STDIN_FILENO, TCSANOW, &saved_term);
-	
-	return_m13(TRUE_m13);
-}
-#endif  // MACOS_m13 || LINUX_m13
-
-
-#ifdef WINDOWS_m13
-static si4	G_read_password_line_m13(si1 *buf)
-{
-	si4	i, c, seq, k;
-
-	// Windows console counterpart of the POSIX reader: UTF-8, one masked '*' per CHARACTER, backspace removes a
-	// whole character (walks back over continuation bytes).  Same PASSWORD_BYTES_m13 byte cap on a character
-	// boundary.  Returns the byte length.  (Console codepage/wide-char quirks make multibyte input best-effort
-	// here - Windows is unverified - but ASCII, backspace, and the cap are exact.)
-
-	i = 0;
-	buf[0] = 0;
-	for (;;) {
-		c = _getch();
-		if (c == '\r' || c == 3) {  // carriage return or CTRL-C: finished
-			putch_m13('\r'); putch_m13('\n');
-			break;
-		}
-		if (c == '\b') {  // backspace: drop the whole last character
-			if (i) {
-				do { --i; } while (i > 0 && ((ui1) buf[i] & 0xC0) == 0x80);  // back over continuation bytes
-				putch_m13('\b'); putch_m13(' '); putch_m13('\b');  // erase its single mask glyph
-			}
-			continue;
-		}
-		if (G_password_char_ok_m13(c) == FALSE_m13) {  // control / DEL
-			putch_m13(7);  // beep
-			continue;
-		}
-		seq = G_utf8_seq_len_m13(c);
-		if ((i + seq) > PASSWORD_BYTES_m13) {  // no room for this whole character
-			putch_m13(7);  // beep
-			continue;
-		}
-		buf[i++] = (si1) c;
-		for (k = 1; k < seq; ++k)  // continuation bytes belong to the same character - read them raw
-			buf[i++] = (si1) _getch();
-		putch_m13('*');  // one mask glyph per character
-	}
-	buf[i] = 0;
-
-	return(i);
-}
-
-
-tern	G_enter_password_m13(si1 *password, const si1 *prompt, tern confirm_no_entry, sf8 timeout_secs, tern create_password)
-{
-	si1		pw_copy[MAX_PASSWORD_STRING_BYTES_m13];
-	si4		dc;
-
-#ifdef FT_DEBUG_m13
-	G_push_function_m13();
-#endif
-
-	// pass timeout_secs == 0.0 for no timeout
-	if (password == NULL) {
-		G_set_error_m13(E_GEN_m13, "password is null");
-		return_m13(FALSE_m13);
-	}
-	
-	if (prompt == NULL)
-		prompt = "Enter password";
-	else if (*prompt == 0)
-		prompt = "Enter password";
-
-	if (create_password == TRUE_m13) {  // show the current policy up front (once), not just as an after-the-fact error
-		si1	req[256];
-
-		printf_m13("%s\n", G_password_requirements_m13(req));
-	}
-
-	ENTER_ASCII_PASSWORD_RETRY_1_m13:
-
-	if (timeout_secs > (sf8) 0.0) {
-		struct timeval	tv;
-		fd_set		fds;
-		si4		fds_ready;
-		
-		printf_m13("%s %s[%0.1lfs timeout]%s: ", prompt, TC_GREEN_m13, timeout_secs, TC_RESET_m13);
-		fflush(stdout);
-		
-		// set timeout
-		tv.tv_sec = (time_t) timeout_secs;
-		timeout_secs -= (sf8) tv.tv_sec;
-		tv.tv_usec = (time_t) (timeout_secs * (sf8) 1.0e6);
-
-		// wait for keyboard entry
-		FD_ZERO(&fds);
-		FD_SET(0, &fds);
-		fds_ready = select(1, &fds, NULL, NULL, &tv);  // just the read descriptor
-		if (fds_ready <= 0)
-			return_m13(FALSE_m13);
-	} else {
-		printf_m13("%s: ", prompt); fflush(stdout);
-	}
-	
-	// read password from the console (UTF-8, capped at PASSWORD_BYTES bytes on a character boundary)
-	G_read_password_line_m13(password);
-
-	if (*password == 0) {
-		if (confirm_no_entry == TRUE_m13) {
-			printf_m13("\tIs %s<no entry>%s correct (y/n): ", TC_RED_m13, TC_RESET_m13);
-			fflush(stdout);
-			dc = _getch();
-			putch_m13(dc); putch_m13('\r'); putch_m13('\n');
-		} else {
-			dc = 'y';
-		}
-		if (dc == 'y' || dc == 'Y') {
-			return_m13(TRUE_m13);  // user intends no entry so return TRUE. Calling function should decide what to do with no password.
-		} else {
-			goto ENTER_ASCII_PASSWORD_RETRY_1_m13;  // re-prompt (no cap)
-		}
-	}
-
-	// create only: validate against policy BEFORE asking for re-entry, and report the SPECIFIC reason (too short,
-	// composition, ...) - distinct from a re-entry mismatch below.  (Blank entry above already cancelled.)
-	if (create_password == TRUE_m13 && G_check_new_password_m13(password, 0, FALSE_m13) == FALSE_m13) {
-		printf_m13("%s%s%s\n", TC_RED_m13, globals_m13->error.message, TC_RESET_m13);
-		G_error_clear_m13();  // shown to the user here; do not leave it on the error stack
-		goto ENTER_ASCII_PASSWORD_RETRY_1_m13;
-	}
-
-	// confirm (create only): mistypes are common; re-prompt until match, blank re-entry cancels. No attempt cap.
-	if (create_password == TRUE_m13) {
-
-		printf_m13("Re-enter password: ");
-		G_read_password_line_m13(pw_copy);
-
-		if (strcmp_m13(password, pw_copy)) {
-			if (*pw_copy == 0) {  // blank re-entry => explicit cancel
-				printf_m13("%s(cancelled)%s\n", TC_RED_m13, TC_RESET_m13);
-				return_m13(FALSE_m13);
-			}
-			printf_m13("%sPasswords don't match - try again (leave blank to cancel).%s\n", TC_RED_m13, TC_RESET_m13);
-			goto ENTER_ASCII_PASSWORD_RETRY_1_m13;  // re-prompt BOTH entries: a typo in the first is recoverable
-		}
-	}
-
-	return_m13(TRUE_m13);
-}
-#endif  // WINDOWS_m13
 
 
 si8 G_read_records_m13(void *level_header, SLICE_m13 *slice, ...)  // varags(level->type_code == SSR_TYPE_CODE_m13): si4 seg_num
@@ -14740,7 +15102,7 @@ void	G_set_signal_traps_m13(tern set)
 }
 
 
-tern	G_set_time_constants_m13(TIMEZONE_INFO_m13 *timezone_info, si8 session_start_time, tern prompt)
+tern	G_set_time_constants_m13(void *level_header, TIMEZONE_INFO_m13 *timezone_info, si8 session_start_time, tern prompt)
 {
 	si4				n_potential_timezones, potential_timezone_entries[TZ_TABLE_ENTRIES_m13];
 	si4				i, j, response_num, items;
@@ -14754,7 +15116,7 @@ tern	G_set_time_constants_m13(TIMEZONE_INFO_m13 *timezone_info, si8 session_star
 	if (globals_m13->tables->timezone_table == NULL)
 		G_init_timezone_tables_m13();
 	
-	pg = G_proc_globs_m13(NULL);
+	pg = G_proc_globs_m13(level_header);  // NULL == current thread's (single-session); a writer with multiple same-thread sessions passes a level
 
 	// Build path (single writer, no election): set the constants directly from a known timezone_info.  Pessimistically
 	// mark FALSE ("not set") up front; on success set becomes TRUE at the bottom, so an early failure correctly leaves
@@ -14962,7 +15324,7 @@ SET_GTC_TIMEZONE_MATCH_m13:
 	pg->time_constants.set = TRUE_m13;
 
 	if (session_start_time)  // pass CURRENT_TIME_m13 for session starting now; pass zero if just need to get timezone_info for a locale
-		G_generate_recording_time_offset_m13(session_start_time);
+		G_generate_recording_time_offset_m13(level_header, session_start_time);
 
 	return_m13(TRUE_m13);
 }
@@ -17071,6 +17433,9 @@ tern	G_show_universal_header_m13(FPS_m13 *fps, UH_m13 *uh)
 
 
 #if defined MACOS_m13 || defined LINUX_m13
+// (atomic unit: signal machinery - the DELIBERATELY-BSS watchdog flag, watchdog & trap stay
+//  colocated; internal order is mechanism, not alphabetical. The flag is exempt from the
+//  globals-into-GLOBALS_m13 rule for the same reason it is BSS: heap-corruption immunity.)
 static si4	G_trap_watchdog_sig_m13 = 0;  // BSS, immune to heap corruption
 
 static void	G_trap_watchdog_m13(si4 alarm_sig)
@@ -17455,7 +17820,7 @@ tern	G_sort_records_m13(FPS_m13 *ri_fps, FPS_m13 *rd_fps)
 	}
 
 	// sort indices
-	qsort(inds, (size_t) n_recs, sizeof(REC_IDX_m13), G_compare_record_index_times);  // leave terminal index where it is
+	qsort(inds, (size_t) n_recs, sizeof(REC_IDX_m13), G_compare_record_index_times_m13);  // leave terminal index where it is
 
 	// copy universal header
 	memcpy(sorted_rd_data, rd_data, (size_t) UH_BYTES_m13);
@@ -20919,6 +21284,8 @@ void	AES_encrypt_m13(ui1 *data, si8 len, const si1 *password, ui1 *expanded_key)
 
 
 #ifdef HW_CRYPTO_m13
+// (atomic unit: detection + per-arch cipher pairs share this guard; internal order is
+//  lifecycle, not alphabetical - filed as a whole at AES_cipher_hw's position)
 
 static tern	AES_hw_ready_m13(void)  // detection results live in the global tables
 {
@@ -22402,137 +22769,6 @@ CMP_BUFFERS_m13  *CMP_allocate_buffers_m13(CMP_BUFFERS_m13 *buffers, si8 n_buffe
 }
 
 
-// ---------------------------------------------------------------------------------------------------
-// Per-block SCRATCH fit: the one place that knows which scratch buffers the CURRENT algorithm needs, in the
-// current mode, and makes sure they exist.
-//
-// SCRATCH is per-block working memory whose contents are rebuilt from nothing every block - the RED/PRED
-// count family, the derivative buffers, SRRED's residuals & overflows, the VDS work buffers. Its lifetime
-// belongs to the library, so it can be created at any block boundary.
-//
-// That is deliberately NOT true of the DATA buffers (decompressed_data/cache & the FPS compressed data).
-// The caller sizes those up front - exactly, from a slice on read or block count x CMP_max_compressed_bytes
-// on write - and the library WALKS them by advancing decompressed_ptr / block_header. Growing one mid-walk
-// discards already-decoded blocks and resets the walk position, so they belong to CMP_realloc_CPS_m13()
-// alone and are never touched here.
-//
-// Called EVERY block by CMP_encode_m13() & CMP_decode_m13(), unguarded. On decode that is the only point at
-// which the right question can even be asked: the algorithm is not known until the block header has been
-// read. It early-outs whenever everything is already present, which is the normal case & what makes a
-// per-block call affordable - and being on the every-block path means it cannot rot the way a rarely-taken
-// branch does.
-//
-// ⭐ It exists because the old "allocate creates, realloc grows" split left a hole: realloc could only grow
-// a buffer that already existed (`if (residuals_buffer) {...}`), so a codec whose buffer had never been
-// created had no way to obtain one. Every SRRED block in a MED file dereferenced NULL on read for exactly
-// that reason. Buffers are only ever ADDED here, never freed: a stream may legitimately mix a codec with the
-// algorithms it redirects to (VDS -> PRED2/RED2, SRRED -> RED2, anything -> MBE), and freeing on each switch
-// would thrash.
-//
-// ⚠️ A NEW CODEC DECLARES ITS SCRATCH HERE. That is the whole point of the function.
-// ---------------------------------------------------------------------------------------------------
-static tern	CMP_fit_CPS_scratch_m13(CPS_m13 *cps, ui4 mode, ui4 block_samples)
-{
-	tern	compression, pred_family, red_family;
-	si8	pad_samples;
-
-	compression = (mode == CMP_COMPRESSION_MODE_m13) ? TRUE_m13 : FALSE_m13;
-	red_family = (cps->direcs.flags & (CPS_DF_RED1_ALGORITHM_m13 | CPS_DF_RED2_ALGORITHM_m13 | CPS_DF_SSE_ALGORITHM_m13)) ? TRUE_m13 : FALSE_m13;  // SSE uses flat (RED-style) count buffers
-	pred_family = (cps->direcs.flags & (CPS_DF_PRED1_ALGORITHM_m13 | CPS_DF_PRED2_ALGORITHM_m13 | CPS_DF_VDS_ALGORITHM_m13 | CPS_DF_SRRED_ALGORITHM_m13)) ? TRUE_m13 : FALSE_m13;  // VDS & SRRED use PRED-shaped buffers
-
-	// count family. Only COMPRESSION builds counts - a decoder reads its model out of the block - but both
-	// modes need cumulative_count & minimum_range for the range coder.
-	if (pred_family == TRUE_m13) {
-		if (compression == TRUE_m13 && cps->params.PRED_base_count == NULL) {
-			if ((cps->params.PRED_base_count = cps->params.count = calloc_2D_m13((size_t) CMP_PRED_CATS_m13, CMP_RED_MAX_STATS_BINS_m13, sizeof(ui4))) == NULL)
-				return(FALSE_m13);
-			if ((cps->params.PRED_base_sorted_count = cps->params.sorted_count = calloc_2D_m13((size_t) CMP_PRED_CATS_m13, CMP_RED_MAX_STATS_BINS_m13, sizeof(CMP_STATISTICS_BIN_m13))) == NULL)
-				return(FALSE_m13);
-			if ((cps->params.PRED_base_symbol_map = cps->params.symbol_map = calloc_2D_m13((size_t) CMP_PRED_CATS_m13, CMP_RED_MAX_STATS_BINS_m13, sizeof(ui1))) == NULL)
-				return(FALSE_m13);
-		}
-		if (cps->params.cumulative_count == NULL)
-			if ((cps->params.PRED_base_cumulative_count = cps->params.cumulative_count = calloc_2D_m13((size_t) CMP_PRED_CATS_m13, CMP_RED_MAX_STATS_BINS_m13 + 1, sizeof(ui8))) == NULL)
-				return(FALSE_m13);
-		if (cps->params.minimum_range == NULL)
-			if ((cps->params.PRED_base_minimum_range = cps->params.minimum_range = calloc_2D_m13((size_t) CMP_PRED_CATS_m13, CMP_RED_MAX_STATS_BINS_m13, sizeof(ui8))) == NULL)
-				return(FALSE_m13);
-	} else if (red_family == TRUE_m13) {
-		if (compression == TRUE_m13 && cps->params.count == NULL) {
-			if ((cps->params.count = calloc_m13(CMP_RED_MAX_STATS_BINS_m13, sizeof(ui4))) == NULL)
-				return(FALSE_m13);
-			if ((cps->params.sorted_count = calloc_m13(CMP_RED_MAX_STATS_BINS_m13, sizeof(CMP_STATISTICS_BIN_m13))) == NULL)
-				return(FALSE_m13);
-			if ((cps->params.symbol_map = calloc_m13(CMP_RED_MAX_STATS_BINS_m13, sizeof(ui1))) == NULL)
-				return(FALSE_m13);
-		}
-		if (cps->params.cumulative_count == NULL)
-			if ((cps->params.cumulative_count = calloc_m13(CMP_RED_MAX_STATS_BINS_m13 + 1, sizeof(ui8))) == NULL)
-				return(FALSE_m13);
-		if (cps->params.minimum_range == NULL)
-			if ((cps->params.minimum_range = calloc_m13(CMP_RED_MAX_STATS_BINS_m13, sizeof(ui8))) == NULL)
-				return(FALSE_m13);
-	}
-	// MBE builds no model of its own, so as a FALL-THROUGH target it rides on whatever the redirecting
-	// algorithm allocated. But when MBE is the DIRECTED algorithm it still goes through
-	// CMP_differentiate_m13(), whose FIND branch lists CPS_DF_MBE_ALGORITHM_m13 & ranks candidate levels with
-	// CMP_RED_estimate_bytes_m13() off CMP_get_counts_m13() - which needs the RED-family count buffers &
-	// calls CMP_swap_RED_PRED_m13(). Nothing allocated them, so "set the MBE directive & call
-	// CMP_encode_m13()" died in the swap with "neither RED nor PRED buffers are allocated". Latent until
-	// CPS_DF_FIND_DERIVATIVE_LEVEL_m13 became the default (2026-08-02); found by
-	// dev/claude_tests/codec_file_test.c. RED-shaped, because that is what the ranking estimator reads.
-	// (Reverted 2026-08-05 while the CPS_PARAMS_m13 stack-garbage bug made every ASan run ambiguous;
-	// restored 2026-08-06 once CMP_init_params_m13() was fixed to zero the struct.)
-	if (compression == TRUE_m13 && (cps->direcs.flags & CPS_DF_MBE_ALGORITHM_m13)) {
-		if (cps->params.count == NULL) {
-			if ((cps->params.count = calloc_m13(CMP_RED_MAX_STATS_BINS_m13, sizeof(ui4))) == NULL)
-				return(FALSE_m13);
-			if ((cps->params.sorted_count = calloc_m13(CMP_RED_MAX_STATS_BINS_m13, sizeof(CMP_STATISTICS_BIN_m13))) == NULL)
-				return(FALSE_m13);
-			if ((cps->params.symbol_map = calloc_m13(CMP_RED_MAX_STATS_BINS_m13, sizeof(ui1))) == NULL)
-				return(FALSE_m13);
-		}
-	}
-
-	// derivative buffer: every compressing algorithm needs it, MBE included
-	if (compression == TRUE_m13 && cps->params.derivative_buffer == NULL)
-		if ((cps->params.derivative_buffer = (si4 *) malloc_m13((size_t) (block_samples << 2))) == NULL)
-			return(FALSE_m13);
-
-	// next_derivative_buffer: the derivative-level search & SRRED both walk two levels at once
-	if (compression == TRUE_m13 && ((cps->direcs.flags & CPS_DF_FIND_DERIVATIVE_LEVEL_m13) || (cps->direcs.flags & CPS_DF_SRRED_ALGORITHM_m13)))
-		if (cps->params.next_derivative_buffer == NULL)
-			if ((cps->params.next_derivative_buffer = (si4 *) malloc_m13((size_t) (block_samples << 2))) == NULL)
-				return(FALSE_m13);
-
-	// SRRED: residuals_buffer is read by DECODE as well as written by encode, which is precisely why gating
-	// it on the directive at construction time failed - see the header comment.
-	if (cps->direcs.flags & CPS_DF_SRRED_ALGORITHM_m13) {
-		if (cps->params.residuals_buffer == NULL)
-			if ((cps->params.residuals_buffer = (si4 *) malloc_m13((size_t) (block_samples << 2))) == NULL)
-				return(FALSE_m13);
-		if (compression == TRUE_m13 && cps->params.overflows_buffer == NULL)  // separated overflows for the count-domain scale search
-			if ((cps->params.overflows_buffer = (si4 *) malloc_m13((size_t) (block_samples << 2))) == NULL)
-				return(FALSE_m13);
-	}
-
-	// VDS work buffers
-	if (cps->direcs.flags & CPS_DF_VDS_ALGORITHM_m13) {
-		if (cps->params.VDS_input_buffers == NULL || cps->params.VDS_output_buffers == NULL) {
-			pad_samples = (compression == TRUE_m13) ? (CMP_VDS_LOWPASS_ORDER_m13 * 6) : CMP_MAK_PAD_SAMPLES_m13;
-			if (cps->params.VDS_input_buffers == NULL)
-				if ((cps->params.VDS_input_buffers = CMP_allocate_buffers_m13(NULL, CMP_VDS_INPUT_BUFFERS_m13, (si8) block_samples + pad_samples, sizeof(sf8), FALSE_m13, FALSE_m13)) == NULL)
-					return(FALSE_m13);
-			if (cps->params.VDS_output_buffers == NULL)
-				if ((cps->params.VDS_output_buffers = CMP_allocate_buffers_m13(NULL, CMP_VDS_OUTPUT_BUFFERS_m13, (si8) block_samples, sizeof(sf8), FALSE_m13, FALSE_m13)) == NULL)
-					return(FALSE_m13);
-		}
-	}
-
-	return(TRUE_m13);
-}
-
-
 CPS_m13	*CMP_allocate_CPS_m13(FPS_m13 *fps, ui4 mode, si8 data_samples, si8 compressed_data_bytes, si8 keysample_bytes, ui4 block_samples, CPS_DIRECS_m13 *directives, CPS_PARAMS_m13 *parameters)
 {
 	tern		need_compressed_data = FALSE_m13;
@@ -22611,7 +22847,8 @@ CPS_m13	*CMP_allocate_CPS_m13(FPS_m13 *fps, ui4 mode, si8 data_samples, si8 comp
 	cps->params.PRED_base_symbol_map = cps->params.symbol_map = NULL;
 	cps->params.PRED_base_cumulative_count = cps->params.cumulative_count = NULL;
 	cps->params.PRED_base_minimum_range = cps->params.minimum_range = NULL;
-	cps->params.derivative_buffer = NULL;
+	cps->params.derivative_bufs[0] = cps->params.derivative_bufs[1] = NULL;  // the owning handles
+	cps->params.derivative_buffer = NULL;  // views onto the above
 	cps->params.next_derivative_buffer = NULL;
 	cps->params.residuals_buffer = NULL;
 	cps->params.overflows_buffer = NULL;
@@ -22756,6 +22993,60 @@ CPS_m13	*CMP_allocate_CPS_m13(FPS_m13 *fps, ui4 mode, si8 data_samples, si8 comp
 	}
 
 	return_m13(cps);
+}
+
+
+// ---------------------------------------------------------------------------------------------------
+// Per-block SCRATCH fit: the one place that knows which scratch buffers the CURRENT algorithm needs, in the
+// current mode, and makes sure they exist.
+//
+// SCRATCH is per-block working memory whose contents are rebuilt from nothing every block - the RED/PRED
+// count family, the derivative buffers, SRRED's residuals & overflows, the VDS work buffers. Its lifetime
+// belongs to the library, so it can be created at any block boundary.
+//
+// That is deliberately NOT true of the DATA buffers (decompressed_data/cache & the FPS compressed data).
+// The caller sizes those up front - exactly, from a slice on read or block count x CMP_max_compressed_bytes
+// on write - and the library WALKS them by advancing decompressed_ptr / block_header. Growing one mid-walk
+// discards already-decoded blocks and resets the walk position, so they belong to CMP_realloc_CPS_m13()
+// alone and are never touched here.
+//
+// Called EVERY block by CMP_encode_m13() & CMP_decode_m13(), unguarded. On decode that is the only point at
+// which the right question can even be asked: the algorithm is not known until the block header has been
+// read. It early-outs whenever everything is already present, which is the normal case & what makes a
+// per-block call affordable - and being on the every-block path means it cannot rot the way a rarely-taken
+// branch does.
+//
+// ⭐ It exists because the old "allocate creates, realloc grows" split left a hole: realloc could only grow
+// a buffer that already existed (`if (residuals_buffer) {...}`), so a codec whose buffer had never been
+// created had no way to obtain one. Every SRRED block in a MED file dereferenced NULL on read for exactly
+// that reason. Buffers are only ever ADDED here, never freed: a stream may legitimately mix a codec with the
+// algorithms it redirects to (VDS -> PRED2/RED2, SRRED -> RED2, anything -> MBE), and freeing on each switch
+// would thrash.
+//
+// ⚠️ A NEW CODEC DECLARES ITS SCRATCH HERE. That is the whole point of the function.
+// ---------------------------------------------------------------------------------------------------
+static void	CMP_set_RED_PRED_side_m13(CPS_m13 *cps, tern red_side)
+{
+	CPS_PARAMS_m13	*p;
+
+	// Make the requested side of a dual-side CPS (one allocated under a PRED-family directive) CURRENT,
+	// pair by pair. The RED side of each 2D allocation is its row 0 (see CMP_swap_RED_PRED_m13()); a pair
+	// whose base was never allocated is left alone, which is what lets this run on DECODE CPSs - the count
+	// trio is never allocated there, so CMP_swap_RED_PRED_m13()'s count-keyed state detection has nothing
+	// to key on. Idempotent, so it lives on the every-block fit path. A CPS allocated under a RED-family
+	// directive has no base pointers & is untouched: its flat buffers ARE its only side.
+	p = &cps->params;
+	if (p->PRED_base_count != NULL) {
+		p->count = (red_side == TRUE_m13) ? *((void **) p->PRED_base_count) : p->PRED_base_count;
+		p->sorted_count = (red_side == TRUE_m13) ? *((void **) p->PRED_base_sorted_count) : p->PRED_base_sorted_count;
+		p->symbol_map = (red_side == TRUE_m13) ? *((void **) p->PRED_base_symbol_map) : p->PRED_base_symbol_map;
+	}
+	if (p->PRED_base_cumulative_count != NULL)
+		p->cumulative_count = (red_side == TRUE_m13) ? *((void **) p->PRED_base_cumulative_count) : p->PRED_base_cumulative_count;
+	if (p->PRED_base_minimum_range != NULL)
+		p->minimum_range = (red_side == TRUE_m13) ? *((void **) p->PRED_base_minimum_range) : p->PRED_base_minimum_range;
+
+	return;
 }
 
 
@@ -23121,13 +23412,26 @@ tern	CMP_calculate_noise_scores_m13(CPS_m13 *cps, si4 *data, si8 len)
 	// params.noise_scores[CMP_NS_LINE_NOISE_IDX_m13] before this call. Whatever is there is used as-is; every
 	// byte is reset to NO_ENTRY afterwards so a value cannot silently carry into the next block.
 
-	if (cps == NULL || data == NULL || len < 3) {
-		G_set_error_m13(E_CMP_m13, "noise scores need a CPS & at least 3 samples");
+	if (cps == NULL || data == NULL) {
+		G_set_error_m13(E_CMP_m13, "noise scores need a CPS & data");
 		return_m13(FALSE_m13);
 	}
 	if (CMP_BLOCK_PARAM_PRESENT_m13(cps, CMP_PF_NOISE_SCORES_IDX_m13) == 0) {
 		G_set_error_m13(E_CMP_m13, "noise score parameter is not present in this block");
 		return_m13(FALSE_m13);
+	}
+	// A block too short to score is NORMAL, not an error: a session's final partial block can be a
+	// couple of samples. This used to G_set_error() - & since the caller discards the return value,
+	// the error simply sat in globals until the exit reporter printed it, turning a clean shutdown
+	// into "Exit Status: system signal" (2026-08-14). Stamp the block's parameter as NO_ENTRY on the
+	// way out: the scratch is REUSED across blocks, so returning without writing would leave the
+	// PREVIOUS block's scores standing in this one's parameter.
+	if (len < 3) {
+		memset((void *) cps->params.noise_scores, CMP_NS_NO_ENTRY_m13, (size_t) CMP_NS_BYTES_m13);
+		for (packed = 0, i = CMP_NS_BYTES_m13; i--;)
+			packed = (packed << 8) | (ui4) cps->params.noise_scores[i];
+		CMP_BLOCK_PARAM_m13(cps, CMP_PF_NOISE_SCORES_IDX_m13, ui4) = packed;
+		return_m13(FALSE_m13);  // "no scores for this block", not "something went wrong"
 	}
 
 	// LINE NOISE (byte 0). A value the caller has already DEPOSITED wins - an application running the true
@@ -23374,6 +23678,106 @@ si4 CMP_compare_si8_m13(const void *a, const void * b)
 }
 
 
+tern	CMP_crypt_block_m13(UH_m13 *uh, PASSWORD_DATA_m13 *pwd, si1 enc_level, CMP_FIXED_BH_m13 *bh, tern encrypt)
+{
+	ui1	*base, *model_hdr;
+	ui4	algorithm;
+	ui2	sub_model_bytes;
+	si8	encryptable_bytes, hdr_bytes, stage_1_bytes, total_bytes;
+
+#ifdef FT_DEBUG_m13
+	G_push_function_m13();
+#endif
+
+	// SOLE owner of the block encryption span, in BOTH directions. It exists because this arithmetic was
+	// open-coded in four places (G_encrypt_time_series_m13(), G_decrypt_time_series_m13(), CMP_encrypt_m13(),
+	// CMP_decrypt_m13()) & they all carried the same defect: the MBE branch stayed correct while the
+	// RED/PRED branch silently corrupted every encrypted block. Same scar as CMP_MBE_estimate_bytes_m13() &
+	// CMP_overflow_bytes_for_extrema_m13(). Callers own only the CMP_BF_ENCRYPTED_m13 flag.
+	//
+	// See the block encryption map at CMP_BLOCK_ENCRYPTION_START_OFFSET_m13 for the region layout. Both
+	// directions issue the SAME sequence of AES calls over the SAME ranges: the cipher is ECB with
+	// ciphertext stealing, so a split at a different point would steal from a different block.
+
+	encryptable_bytes = (si8) bh->total_block_bytes - CMP_BLOCK_ENCRYPTION_START_OFFSET_m13;
+	if (encryptable_bytes <= 0) {
+		G_set_error_m13(E_CRYP_m13, "block total bytes (%u) leaves no encryptable region", bh->total_block_bytes);
+		return_m13(FALSE_m13);
+	}
+
+	// header region: exactly one AES block. total_header_bytes sits immediately above it & stays in the
+	// clear, because the span below is computed from it.
+	if (G_AES_crypt_m13(uh, pwd, enc_level, (ui1 *) bh + CMP_BLOCK_ENCRYPTION_HDR_START_OFFSET_m13, (si8) CMP_BLOCK_ENCRYPTION_HDR_BYTES_m13, encrypt) == FALSE_m13)
+		return_m13(FALSE_m13);
+
+	base = (ui1 *) bh + CMP_BLOCK_ENCRYPTION_START_OFFSET_m13;
+	algorithm = bh->block_flags & CMP_BF_ALGORITHMS_MASK_m13;
+
+	// MBE has no statistics model to hide behind - its samples are readable straight out of the payload -
+	// so the whole payload is covered. Its rule needs only block_flags & total_block_bytes, both clear.
+	if (algorithm & CMP_BF_MBE_ENCODING_m13)
+		return_m13(G_AES_crypt_m13(uh, pwd, enc_level, base, encryptable_bytes, encrypt));
+
+	hdr_bytes = (si8) bh->total_header_bytes - CMP_BLOCK_ENCRYPTION_START_OFFSET_m13;
+	if (hdr_bytes < 0 || (si8) bh->total_header_bytes > (si8) bh->total_block_bytes) {
+		G_set_error_m13(E_CRYP_m13, "block total header bytes (%u) is out of range for a block of %u bytes", bh->total_header_bytes, bh->total_block_bytes);
+		return_m13(FALSE_m13);
+	}
+
+	// SRRED & VDS split the payload into two sub-blocks, each with its OWN model region BEYOND
+	// total_header_bytes, so one span cannot reach the first sub-block's statistics. Stage 1 covers the
+	// outer header remainder - which ends in the 16-byte SRRED/VDS model header - & stage 2 extends through
+	// the first sub-block's model region + 16 bytes of its compressed data. Withholding that much is
+	// sufficient: the second sub-block (SRRED residuals / VDS times) reconstructs nothing on its own, & the
+	// first sub-block's range-coded bytes are undecodable without its statistics.
+	if (algorithm & (CMP_BF_SRRED_ENCODING_m13 | CMP_BF_VDS_ENCODING_m13)) {
+		stage_1_bytes = CMP_AES_ROUND_UP_m13(hdr_bytes);
+		if (stage_1_bytes > encryptable_bytes)
+			stage_1_bytes = encryptable_bytes;
+		if (hdr_bytes < (si8) CMP_SRRED_MODEL_FIXED_HDR_BYTES_m13) {  // == CMP_VDS_MODEL_FIXED_HDR_BYTES_m13
+			G_set_error_m13(E_CRYP_m13, "block header (%lld bytes past the encryption start) is too small to hold a two-sub-block model header", (long long) hdr_bytes);
+			return_m13(FALSE_m13);
+		}
+		// the sub-block model size lives at the SAME offset in both model headers
+		// (CMP_SRRED_MODEL_SCALED_BLOCK_MODEL_BYTES_OFFSET_m13 == CMP_VDS_MODEL_AMPLITUDE_BLOCK_MODEL_BYTES_OFFSET_m13)
+		model_hdr = (ui1 *) bh + bh->total_header_bytes - CMP_SRRED_MODEL_FIXED_HDR_BYTES_m13;
+
+		// on ENCRYPT the model header is still plaintext; on DECRYPT stage 1 is what exposes it. Read it on
+		// the correct side of the stage 1 call so both directions compute identical ranges.
+		if (encrypt == TRUE_m13)
+			sub_model_bytes = *((ui2 *) (model_hdr + CMP_SRRED_MODEL_SCALED_BLOCK_MODEL_BYTES_OFFSET_m13));
+		if (G_AES_crypt_m13(uh, pwd, enc_level, base, stage_1_bytes, encrypt) == FALSE_m13)
+			return_m13(FALSE_m13);
+		if (encrypt == FALSE_m13)
+			sub_model_bytes = *((ui2 *) (model_hdr + CMP_SRRED_MODEL_SCALED_BLOCK_MODEL_BYTES_OFFSET_m13));
+
+		// fail closed: on decrypt this value came out of ciphertext, & a wrong span here would land as
+		// corrupt samples rather than an error - the exact failure signature this rework exists to remove
+		if (sub_model_bytes == 0 || ((si8) bh->total_header_bytes + (si8) sub_model_bytes) > (si8) bh->total_block_bytes) {
+			G_set_error_m13(E_CRYP_m13, "sub-block model bytes (%u) is out of range for a block of %u bytes with a %u byte header", sub_model_bytes, bh->total_block_bytes, bh->total_header_bytes);
+			return_m13(FALSE_m13);
+		}
+
+		total_bytes = CMP_AES_ROUND_UP_m13(hdr_bytes + (si8) sub_model_bytes + ENCRYPTION_BLOCK_BYTES_m13);
+		if (total_bytes > encryptable_bytes)
+			total_bytes = encryptable_bytes;
+		if (total_bytes > stage_1_bytes)  // stage 2: resumes exactly where stage 1 stopped
+			if (G_AES_crypt_m13(uh, pwd, enc_level, base + stage_1_bytes, total_bytes - stage_1_bytes, encrypt) == FALSE_m13)
+				return_m13(FALSE_m13);
+
+		return_m13(TRUE_m13);
+	}
+
+	// RED / PRED / SSE: a single stream, model region inside total_header_bytes. Cover it plus at least
+	// 16 bytes of compressed data, so the coder's opening state is out of reach as well as its statistics.
+	total_bytes = CMP_AES_ROUND_UP_m13(hdr_bytes + ENCRYPTION_BLOCK_BYTES_m13);
+	if (total_bytes > encryptable_bytes)
+		total_bytes = encryptable_bytes;
+
+	return_m13(G_AES_crypt_m13(uh, pwd, enc_level, base, total_bytes, encrypt));
+}
+
+
 tern	CMP_decode_m13(FPS_m13 *fps)
 {
 	sf8			intercept, gradient;
@@ -23489,106 +23893,6 @@ tern	CMP_decode_m13(FPS_m13 *fps)
 }
 
 
-tern	CMP_crypt_block_m13(UH_m13 *uh, PASSWORD_DATA_m13 *pwd, si1 enc_level, CMP_FIXED_BH_m13 *bh, tern encrypt)
-{
-	ui1	*base, *model_hdr;
-	ui4	algorithm;
-	ui2	sub_model_bytes;
-	si8	encryptable_bytes, hdr_bytes, stage_1_bytes, total_bytes;
-
-#ifdef FT_DEBUG_m13
-	G_push_function_m13();
-#endif
-
-	// SOLE owner of the block encryption span, in BOTH directions. It exists because this arithmetic was
-	// open-coded in four places (G_encrypt_time_series_m13(), G_decrypt_time_series_m13(), CMP_encrypt_m13(),
-	// CMP_decrypt_m13()) & they all carried the same defect: the MBE branch stayed correct while the
-	// RED/PRED branch silently corrupted every encrypted block. Same scar as CMP_MBE_estimate_bytes_m13() &
-	// CMP_overflow_bytes_for_extrema_m13(). Callers own only the CMP_BF_ENCRYPTED_m13 flag.
-	//
-	// See the block encryption map at CMP_BLOCK_ENCRYPTION_START_OFFSET_m13 for the region layout. Both
-	// directions issue the SAME sequence of AES calls over the SAME ranges: the cipher is ECB with
-	// ciphertext stealing, so a split at a different point would steal from a different block.
-
-	encryptable_bytes = (si8) bh->total_block_bytes - CMP_BLOCK_ENCRYPTION_START_OFFSET_m13;
-	if (encryptable_bytes <= 0) {
-		G_set_error_m13(E_CRYP_m13, "block total bytes (%u) leaves no encryptable region", bh->total_block_bytes);
-		return_m13(FALSE_m13);
-	}
-
-	// header region: exactly one AES block. total_header_bytes sits immediately above it & stays in the
-	// clear, because the span below is computed from it.
-	if (G_AES_crypt_m13(uh, pwd, enc_level, (ui1 *) bh + CMP_BLOCK_ENCRYPTION_HDR_START_OFFSET_m13, (si8) CMP_BLOCK_ENCRYPTION_HDR_BYTES_m13, encrypt) == FALSE_m13)
-		return_m13(FALSE_m13);
-
-	base = (ui1 *) bh + CMP_BLOCK_ENCRYPTION_START_OFFSET_m13;
-	algorithm = bh->block_flags & CMP_BF_ALGORITHMS_MASK_m13;
-
-	// MBE has no statistics model to hide behind - its samples are readable straight out of the payload -
-	// so the whole payload is covered. Its rule needs only block_flags & total_block_bytes, both clear.
-	if (algorithm & CMP_BF_MBE_ENCODING_m13)
-		return_m13(G_AES_crypt_m13(uh, pwd, enc_level, base, encryptable_bytes, encrypt));
-
-	hdr_bytes = (si8) bh->total_header_bytes - CMP_BLOCK_ENCRYPTION_START_OFFSET_m13;
-	if (hdr_bytes < 0 || (si8) bh->total_header_bytes > (si8) bh->total_block_bytes) {
-		G_set_error_m13(E_CRYP_m13, "block total header bytes (%u) is out of range for a block of %u bytes", bh->total_header_bytes, bh->total_block_bytes);
-		return_m13(FALSE_m13);
-	}
-
-	// SRRED & VDS split the payload into two sub-blocks, each with its OWN model region BEYOND
-	// total_header_bytes, so one span cannot reach the first sub-block's statistics. Stage 1 covers the
-	// outer header remainder - which ends in the 16-byte SRRED/VDS model header - & stage 2 extends through
-	// the first sub-block's model region + 16 bytes of its compressed data. Withholding that much is
-	// sufficient: the second sub-block (SRRED residuals / VDS times) reconstructs nothing on its own, & the
-	// first sub-block's range-coded bytes are undecodable without its statistics.
-	if (algorithm & (CMP_BF_SRRED_ENCODING_m13 | CMP_BF_VDS_ENCODING_m13)) {
-		stage_1_bytes = CMP_AES_ROUND_UP_m13(hdr_bytes);
-		if (stage_1_bytes > encryptable_bytes)
-			stage_1_bytes = encryptable_bytes;
-		if (hdr_bytes < (si8) CMP_SRRED_MODEL_FIXED_HDR_BYTES_m13) {  // == CMP_VDS_MODEL_FIXED_HDR_BYTES_m13
-			G_set_error_m13(E_CRYP_m13, "block header (%lld bytes past the encryption start) is too small to hold a two-sub-block model header", (long long) hdr_bytes);
-			return_m13(FALSE_m13);
-		}
-		// the sub-block model size lives at the SAME offset in both model headers
-		// (CMP_SRRED_MODEL_SCALED_BLOCK_MODEL_BYTES_OFFSET_m13 == CMP_VDS_MODEL_AMPLITUDE_BLOCK_MODEL_BYTES_OFFSET_m13)
-		model_hdr = (ui1 *) bh + bh->total_header_bytes - CMP_SRRED_MODEL_FIXED_HDR_BYTES_m13;
-
-		// on ENCRYPT the model header is still plaintext; on DECRYPT stage 1 is what exposes it. Read it on
-		// the correct side of the stage 1 call so both directions compute identical ranges.
-		if (encrypt == TRUE_m13)
-			sub_model_bytes = *((ui2 *) (model_hdr + CMP_SRRED_MODEL_SCALED_BLOCK_MODEL_BYTES_OFFSET_m13));
-		if (G_AES_crypt_m13(uh, pwd, enc_level, base, stage_1_bytes, encrypt) == FALSE_m13)
-			return_m13(FALSE_m13);
-		if (encrypt == FALSE_m13)
-			sub_model_bytes = *((ui2 *) (model_hdr + CMP_SRRED_MODEL_SCALED_BLOCK_MODEL_BYTES_OFFSET_m13));
-
-		// fail closed: on decrypt this value came out of ciphertext, & a wrong span here would land as
-		// corrupt samples rather than an error - the exact failure signature this rework exists to remove
-		if (sub_model_bytes == 0 || ((si8) bh->total_header_bytes + (si8) sub_model_bytes) > (si8) bh->total_block_bytes) {
-			G_set_error_m13(E_CRYP_m13, "sub-block model bytes (%u) is out of range for a block of %u bytes with a %u byte header", sub_model_bytes, bh->total_block_bytes, bh->total_header_bytes);
-			return_m13(FALSE_m13);
-		}
-
-		total_bytes = CMP_AES_ROUND_UP_m13(hdr_bytes + (si8) sub_model_bytes + ENCRYPTION_BLOCK_BYTES_m13);
-		if (total_bytes > encryptable_bytes)
-			total_bytes = encryptable_bytes;
-		if (total_bytes > stage_1_bytes)  // stage 2: resumes exactly where stage 1 stopped
-			if (G_AES_crypt_m13(uh, pwd, enc_level, base + stage_1_bytes, total_bytes - stage_1_bytes, encrypt) == FALSE_m13)
-				return_m13(FALSE_m13);
-
-		return_m13(TRUE_m13);
-	}
-
-	// RED / PRED / SSE: a single stream, model region inside total_header_bytes. Cover it plus at least
-	// 16 bytes of compressed data, so the coder's opening state is out of reach as well as its statistics.
-	total_bytes = CMP_AES_ROUND_UP_m13(hdr_bytes + ENCRYPTION_BLOCK_BYTES_m13);
-	if (total_bytes > encryptable_bytes)
-		total_bytes = encryptable_bytes;
-
-	return_m13(G_AES_crypt_m13(uh, pwd, enc_level, base, total_bytes, encrypt));
-}
-
-
 tern	CMP_decrypt_m13(FPS_m13 *fps)
 {
 	si1			enc_level;
@@ -23631,6 +23935,43 @@ tern	CMP_decrypt_m13(FPS_m13 *fps)
 	bh->block_flags &= ~CMP_BF_ENCRYPTED_m13;
 
 	return_m13(TRUE_m13);
+}
+
+
+// ---------------------------------------------------------------------------------------------------
+// The RED coding window: 255 representable derivative values plus ONE byte value reserved as the overflow
+// flag. Only the window's PLACEMENT varies - today either -127..127 (flag -128) or, for promised-positive
+// derivatives, 1..255 (flag 0). A value inside the window costs one symbol; a value outside costs the flag
+// symbol plus 2-4 raw bytes, so placement is purely an overflow question.
+//
+// These two live together because the ENCODER and the ESTIMATOR must reach the SAME answer. The estimator
+// predicts what the encoder is about to do - nothing is stamped yet, so both resolve from the caller's
+// DIRECTIVES, never from a header. When they disagree the estimator prices a block that will never be
+// produced, which is the defect class behind the SRRED step-3 regression & the all-positive-derivative
+// divergence. One rule, one place to teach when the per-block derivative offset lands.
+//
+// The DECODER answers the same question from the header (what actually HAPPENED, not what was asked for)
+// & is deliberately not routed through here: its reconstruction loop walks the keysample buffer as ui1 in
+// the positive case & si1 otherwise, so it differs in structure, not just in bounds.
+// ---------------------------------------------------------------------------------------------------
+
+static void	CMP_derivative_window_m13(tern pos_derivs, si4 *low_d, si4 *high_d, ui1 *ks_flag)
+{
+	// The 255-value coding window. pos_derivs is the LEGACY all-positive model: RETIRED from the encoders
+	// 2026-08-06 (they all pass FALSE_m13 now), still honoured by the decoders for files in the wild.
+	// A per-block window OFFSET was built & measured 2026-08-06, then reverted: the derivative-level search
+	// already centres the distribution, so it rescued a mean of 9-17 values per 4096-sample block on real
+	// data, for 2.4% encode time & a permanent format bit. Bit 4 of both flag words is FREE - never shipped.
+	// See the cmp-derivative-offset-design note before rebuilding it.
+	if (pos_derivs == TRUE_m13) {
+		*low_d = 1; *high_d = 255;
+		*ks_flag = CMP_POS_DERIV_KEYSAMPLE_FLAG_m13;  // == 0 (non-overflow range: 1 to 255)
+	} else {
+		*low_d = -127; *high_d = 127;
+		*ks_flag = (ui1) CMP_UI1_KEYSAMPLE_FLAG_m13;  // == -128 (non-overflow range: -127 to +127)
+	}
+
+	return;
 }
 
 
@@ -23746,10 +24087,8 @@ ui1	CMP_differentiate_m13(CPS_m13 *cps)
 		cps->params.derivative_level = cps->params.minimum_difference_value = cps->params.maximum_difference_value = 0;
 		return_m13(0);
 	}
-	// (This used to allocate cps->params.scrap_buffers here. Nothing in the library ever read them - the
-	// derivative search uses params.next_derivative_buffer - so it was a per-call allocation for dead storage.
-	// The FIELD is deliberately kept, along with its free in CMP_free_CPS_m13(): applications use it as caller
-	// -owned scratch, so the library still cleans it up, it just no longer allocates it. Removed 2026-08-02.)
+	// (cps->params.scrap_buffers is deliberately NOT allocated here: the library never reads it. The field &
+	// its free in CMP_free_CPS_m13() remain - applications use it as caller-owned scratch the library cleans up.)
 	
 	// first derivative level (gets min & max sample values)
 	input_buffer = cps->input_buffer;
@@ -24133,6 +24472,35 @@ tern	CMP_encrypt_m13(FPS_m13 *fps)
 }
 
 
+sf8	CMP_entropy_deficit_m13(si4 *data, si8 len)
+{
+	sf8	scores[CMP_NS_BYTES_m13];
+
+#ifdef FT_DEBUG_m13
+	G_push_function_m13();
+#endif
+
+	// ENTROPY DEFICIT in [0,1]: how much LESS information the block carries than its own dynamic range could
+	// hold. 0 == the range is filled as evenly as the resolution can show; 1 == no information at all.
+	// An INFORMATION-LOSS measure - it catches dropout, a dead or stuck channel, and excessive quantization.
+	// It does NOT flag noise: a signal that fills its range is healthy by this measure, & the LLP score is what
+	// carries unpredictability. Reference points: flat 1.0, stuck on two values 0.875, gaussian filling its
+	// range 0.10, white uniform noise 0.004.
+	// The histogram spans the OBSERVED range so the score is scale invariant, & Hmax is log2 of the bins
+	// actually in play, so a signal that legitimately occupies few codes does not read as degraded.
+	// Deficit rather than raw entropy so this does not track the normality score: for a given variance the
+	// gaussian MAXIMIZES entropy, so raw entropy & normality would agree on exactly the clean data where
+	// resolution is wanted.
+	// ⭐ Side effect worth knowing: a large outlier inflates the range & collapses the bulk into few bins, so
+	// impulsive artifact registers here - the failure mode the KS score is weakest on.
+
+	scores[CMP_NS_ENTROPY_DEFICIT_IDX_m13] = (sf8) 1.0;
+	CMP_noise_scores_m13(data, len, scores, CMP_NS_ENTROPY_DEFICIT_SEL_m13);
+
+	return_m13(scores[CMP_NS_ENTROPY_DEFICIT_IDX_m13]);
+}
+
+
 tern	CMP_find_crits_2_m13(sf8 *data, si8 data_len, si8 *n_peaks, si8 *peak_xs, si8 *n_troughs, si8 *trough_xs)
 {
 	const si1	PEAK = 1, TROUGH = 2;
@@ -24361,6 +24729,146 @@ tern	CMP_find_extrema_m13(si4 *input_buffer, si8 len, si4 *minimum, si4 *maximum
 }
 
 
+static tern	CMP_fit_CPS_scratch_m13(CPS_m13 *cps, ui4 mode, ui4 block_samples)
+{
+	tern	compression, pred_family, red_family;
+	si8	pad_samples;
+
+	compression = (mode == CMP_COMPRESSION_MODE_m13) ? TRUE_m13 : FALSE_m13;
+	red_family = (cps->direcs.flags & (CPS_DF_RED1_ALGORITHM_m13 | CPS_DF_RED2_ALGORITHM_m13 | CPS_DF_SSE_ALGORITHM_m13)) ? TRUE_m13 : FALSE_m13;  // SSE uses flat (RED-style) count buffers
+	pred_family = (cps->direcs.flags & (CPS_DF_PRED1_ALGORITHM_m13 | CPS_DF_PRED2_ALGORITHM_m13 | CPS_DF_VDS_ALGORITHM_m13 | CPS_DF_SRRED_ALGORITHM_m13)) ? TRUE_m13 : FALSE_m13;  // VDS & SRRED use PRED-shaped buffers
+
+	// count family. Only COMPRESSION builds counts - a decoder reads its model out of the block - but both
+	// modes need cumulative_count & minimum_range for the range coder.
+	//
+	// SIDE DISCIPLINE (2026-08-13): the family's canonical side must be CURRENT when this returns, because
+	// the per-algorithm functions use the params pointers STRAIGHT - CMP_RED2_encode_m13() memsets
+	// params.count as a flat histogram & CMP_RED2_decode_m13() rebuilds params.cumulative_count as a flat
+	// array, while the PRED2 pair walk the same fields as 2D row-pointer tables. A dual-side CPS (allocated
+	// under a PRED-family directive) left on the wrong side had the RED encoder write its histogram OVER
+	// the row-pointer table; the next CMP_swap_RED_PRED_m13() then loaded two packed counts as a "row
+	// pointer" & CMP_get_counts_m13() memset garbage (the WRT non-default-codec first-block SIGSEGV,
+	// 2026-08-12 - WRT allocates its CPS with default directives & applies options.codec AFTER). The read
+	// side had the same latent defect for any file MIXING the families (a D28 mid-recording codec switch):
+	// a RED2 block's decode clobbered the table a later PRED2 block's decode dereferenced. This fit runs on
+	// the every-block path in both modes, after the algorithm is settled, so setting the side here cures
+	// both directions & both modes at one seam.
+	if (pred_family == TRUE_m13) {
+		if (compression == TRUE_m13 && cps->params.PRED_base_count == NULL) {
+			// a flat count trio here means the CPS was allocated under a RED-family directive & the
+			// codec has since switched families: PRED needs the 2D (per-category) shapes, so replace
+			if (cps->params.count != NULL) {
+				free_m13(cps->params.count);
+				free_m13(cps->params.sorted_count);
+				free_m13(cps->params.symbol_map);
+			}
+			if ((cps->params.PRED_base_count = cps->params.count = calloc_2D_m13((size_t) CMP_PRED_CATS_m13, CMP_RED_MAX_STATS_BINS_m13, sizeof(ui4))) == NULL)
+				return(FALSE_m13);
+			if ((cps->params.PRED_base_sorted_count = cps->params.sorted_count = calloc_2D_m13((size_t) CMP_PRED_CATS_m13, CMP_RED_MAX_STATS_BINS_m13, sizeof(CMP_STATISTICS_BIN_m13))) == NULL)
+				return(FALSE_m13);
+			if ((cps->params.PRED_base_symbol_map = cps->params.symbol_map = calloc_2D_m13((size_t) CMP_PRED_CATS_m13, CMP_RED_MAX_STATS_BINS_m13, sizeof(ui1))) == NULL)
+				return(FALSE_m13);
+		}
+		if (cps->params.PRED_base_cumulative_count == NULL) {  // guard on the BASE: the current pointer may hold a flat RED-family buffer (as above)
+			if (cps->params.cumulative_count != NULL)
+				free_m13(cps->params.cumulative_count);
+			if ((cps->params.PRED_base_cumulative_count = cps->params.cumulative_count = calloc_2D_m13((size_t) CMP_PRED_CATS_m13, CMP_RED_MAX_STATS_BINS_m13 + 1, sizeof(ui8))) == NULL)
+				return(FALSE_m13);
+		}
+		if (cps->params.PRED_base_minimum_range == NULL) {
+			if (cps->params.minimum_range != NULL)
+				free_m13(cps->params.minimum_range);
+			if ((cps->params.PRED_base_minimum_range = cps->params.minimum_range = calloc_2D_m13((size_t) CMP_PRED_CATS_m13, CMP_RED_MAX_STATS_BINS_m13, sizeof(ui8))) == NULL)
+				return(FALSE_m13);
+		}
+		CMP_set_RED_PRED_side_m13(cps, FALSE_m13);  // PRED side current (a RED-family block may have left row 0 current)
+	} else if (red_family == TRUE_m13) {
+		if (cps->params.PRED_base_count != NULL || cps->params.PRED_base_cumulative_count != NULL) {
+			// dual-side CPS: the RED family runs on the 2D allocations' row 0 (CMP_swap_RED_PRED_m13()'s
+			// RED side - the shapes match by construction), so allocate nothing; just make it current
+			CMP_set_RED_PRED_side_m13(cps, TRUE_m13);
+		} else {
+			if (compression == TRUE_m13 && cps->params.count == NULL) {
+				if ((cps->params.count = calloc_m13(CMP_RED_MAX_STATS_BINS_m13, sizeof(ui4))) == NULL)
+					return(FALSE_m13);
+				if ((cps->params.sorted_count = calloc_m13(CMP_RED_MAX_STATS_BINS_m13, sizeof(CMP_STATISTICS_BIN_m13))) == NULL)
+					return(FALSE_m13);
+				if ((cps->params.symbol_map = calloc_m13(CMP_RED_MAX_STATS_BINS_m13, sizeof(ui1))) == NULL)
+					return(FALSE_m13);
+			}
+			if (cps->params.cumulative_count == NULL)
+				if ((cps->params.cumulative_count = calloc_m13(CMP_RED_MAX_STATS_BINS_m13 + 1, sizeof(ui8))) == NULL)
+					return(FALSE_m13);
+			if (cps->params.minimum_range == NULL)
+				if ((cps->params.minimum_range = calloc_m13(CMP_RED_MAX_STATS_BINS_m13, sizeof(ui8))) == NULL)
+					return(FALSE_m13);
+		}
+	}
+	// MBE builds no model of its own, so as a FALL-THROUGH target it rides on whatever the redirecting
+	// algorithm allocated. But when MBE is the DIRECTED algorithm it still goes through
+	// CMP_differentiate_m13(), whose FIND branch lists CPS_DF_MBE_ALGORITHM_m13 & ranks candidate levels with
+	// CMP_RED_estimate_bytes_m13() off CMP_get_counts_m13() - which needs the RED-family count buffers &
+	// calls CMP_swap_RED_PRED_m13(). Nothing allocated them, so "set the MBE directive & call
+	// CMP_encode_m13()" died in the swap with "neither RED nor PRED buffers are allocated". Latent until
+	// CPS_DF_FIND_DERIVATIVE_LEVEL_m13 became the default (2026-08-02); found by
+	// dev/claude_tests/codec_file_test.c. RED-shaped, because that is what the ranking estimator reads.
+	// (Reverted 2026-08-05 while the CPS_PARAMS_m13 stack-garbage bug made every ASan run ambiguous;
+	// restored 2026-08-06 once CMP_init_params_m13() was fixed to zero the struct.)
+	if (compression == TRUE_m13 && (cps->direcs.flags & CPS_DF_MBE_ALGORITHM_m13)) {
+		if (cps->params.count == NULL) {
+			if ((cps->params.count = calloc_m13(CMP_RED_MAX_STATS_BINS_m13, sizeof(ui4))) == NULL)
+				return(FALSE_m13);
+			if ((cps->params.sorted_count = calloc_m13(CMP_RED_MAX_STATS_BINS_m13, sizeof(CMP_STATISTICS_BIN_m13))) == NULL)
+				return(FALSE_m13);
+			if ((cps->params.symbol_map = calloc_m13(CMP_RED_MAX_STATS_BINS_m13, sizeof(ui1))) == NULL)
+				return(FALSE_m13);
+		}
+	}
+
+	// derivative buffer: every compressing algorithm needs it, MBE included
+	// (allocate through the OWNING handle, then publish the view - see the CPS_PARAMS_m13 comment)
+	if (compression == TRUE_m13 && cps->params.derivative_bufs[0] == NULL) {
+		if ((cps->params.derivative_bufs[0] = (si4 *) malloc_m13((size_t) (block_samples << 2))) == NULL)
+			return(FALSE_m13);
+		cps->params.derivative_buffer = cps->params.derivative_bufs[0];
+	}
+
+	// next_derivative_buffer: the derivative-level search & SRRED both walk two levels at once
+	if (compression == TRUE_m13 && ((cps->direcs.flags & CPS_DF_FIND_DERIVATIVE_LEVEL_m13) || (cps->direcs.flags & CPS_DF_SRRED_ALGORITHM_m13)))
+		if (cps->params.derivative_bufs[1] == NULL) {
+			if ((cps->params.derivative_bufs[1] = (si4 *) malloc_m13((size_t) (block_samples << 2))) == NULL)
+				return(FALSE_m13);
+			cps->params.next_derivative_buffer = cps->params.derivative_bufs[1];
+		}
+
+	// SRRED: residuals_buffer is read by DECODE as well as written by encode, which is precisely why gating
+	// it on the directive at construction time failed - see the header comment.
+	if (cps->direcs.flags & CPS_DF_SRRED_ALGORITHM_m13) {
+		if (cps->params.residuals_buffer == NULL)
+			if ((cps->params.residuals_buffer = (si4 *) malloc_m13((size_t) (block_samples << 2))) == NULL)
+				return(FALSE_m13);
+		if (compression == TRUE_m13 && cps->params.overflows_buffer == NULL)  // separated overflows for the count-domain scale search
+			if ((cps->params.overflows_buffer = (si4 *) malloc_m13((size_t) (block_samples << 2))) == NULL)
+				return(FALSE_m13);
+	}
+
+	// VDS work buffers
+	if (cps->direcs.flags & CPS_DF_VDS_ALGORITHM_m13) {
+		if (cps->params.VDS_input_buffers == NULL || cps->params.VDS_output_buffers == NULL) {
+			pad_samples = (compression == TRUE_m13) ? (CMP_VDS_LOWPASS_ORDER_m13 * 6) : CMP_MAK_PAD_SAMPLES_m13;
+			if (cps->params.VDS_input_buffers == NULL)
+				if ((cps->params.VDS_input_buffers = CMP_allocate_buffers_m13(NULL, CMP_VDS_INPUT_BUFFERS_m13, (si8) block_samples + pad_samples, sizeof(sf8), FALSE_m13, FALSE_m13)) == NULL)
+					return(FALSE_m13);
+			if (cps->params.VDS_output_buffers == NULL)
+				if ((cps->params.VDS_output_buffers = CMP_allocate_buffers_m13(NULL, CMP_VDS_OUTPUT_BUFFERS_m13, (si8) block_samples, sizeof(sf8), FALSE_m13, FALSE_m13)) == NULL)
+					return(FALSE_m13);
+		}
+	}
+
+	return(TRUE_m13);
+}
+
+
 void	CMP_free_buffer_depot_m13(void)
 {
 	si8			i;
@@ -24470,11 +24978,16 @@ tern	CMP_free_CPS_m13(CPS_m13 *cps, tern free_structure)
 	if (cps->params.keysample_buffer)
 		free_m13(cps->params.keysample_buffer);
 	
-	if (cps->params.derivative_buffer)
-		free_m13(cps->params.derivative_buffer);
-	
-	if (cps->params.next_derivative_buffer)
-		free_m13(cps->params.next_derivative_buffer);
+	// derivative pair: free the OWNING handles, never the views. The views are retasked by the derivative
+	// search & by SRRED, so freeing through them double-freed whichever allocation they had both landed on.
+	if (cps->params.derivative_bufs[0])
+		free_m13(cps->params.derivative_bufs[0]);
+
+	if (cps->params.derivative_bufs[1])
+		free_m13(cps->params.derivative_bufs[1]);
+
+	cps->params.derivative_bufs[0] = cps->params.derivative_bufs[1] = NULL;
+	cps->params.derivative_buffer = cps->params.next_derivative_buffer = NULL;
 
 	if (cps->params.residuals_buffer)
 		free_m13(cps->params.residuals_buffer);
@@ -24497,6 +25010,13 @@ tern	CMP_free_CPS_m13(CPS_m13 *cps, tern free_structure)
 	if (cps->params.scrap_buffers)
 		CMP_free_buffers_m13(&cps->params.scrap_buffers);
 
+	// dual-side CPS: free by the PRED side - the current-side pointers may be the 2D allocation's
+	// INTERIOR row 0 if a holder left the RED side current (e.g. a D28 codec switch to the RED family).
+	// The pair-wise setter, NOT CMP_swap_RED_PRED_m13(): a DECODE CPS never allocates the count trio, so
+	// the swap's count-keyed state detection can't run there - but its cumulative_count/minimum_range can
+	// legitimately be on the RED side (last block decoded was RED-family), & freeing row 0 aborts.
+	CMP_set_RED_PRED_side_m13(cps, FALSE_m13);
+
 	if (cps->params.count)
 		free_m13(cps->params.count);
 	
@@ -24514,6 +25034,8 @@ tern	CMP_free_CPS_m13(CPS_m13 *cps, tern free_structure)
 	
 	if (cps->params.noise_score_buffers)
 		CMP_free_buffers_m13(&cps->params.noise_score_buffers);
+	if (cps->params.SRRED_scan_buffers)
+		CMP_free_buffers_m13(&cps->params.SRRED_scan_buffers);
 	if (cps->params.line_noise_buffers)
 		CMP_free_buffers_m13(&cps->params.line_noise_buffers);
 	if (cps->params.VDS_input_buffers)
@@ -24803,43 +25325,6 @@ tern	CMP_generate_parameter_map_m13(CPS_m13 *cps)
 }
 
 
-// ---------------------------------------------------------------------------------------------------
-// The RED coding window: 255 representable derivative values plus ONE byte value reserved as the overflow
-// flag. Only the window's PLACEMENT varies - today either -127..127 (flag -128) or, for promised-positive
-// derivatives, 1..255 (flag 0). A value inside the window costs one symbol; a value outside costs the flag
-// symbol plus 2-4 raw bytes, so placement is purely an overflow question.
-//
-// These two live together because the ENCODER and the ESTIMATOR must reach the SAME answer. The estimator
-// predicts what the encoder is about to do - nothing is stamped yet, so both resolve from the caller's
-// DIRECTIVES, never from a header. When they disagree the estimator prices a block that will never be
-// produced, which is the defect class behind the SRRED step-3 regression & the all-positive-derivative
-// divergence. One rule, one place to teach when the per-block derivative offset lands.
-//
-// The DECODER answers the same question from the header (what actually HAPPENED, not what was asked for)
-// & is deliberately not routed through here: its reconstruction loop walks the keysample buffer as ui1 in
-// the positive case & si1 otherwise, so it differs in structure, not just in bounds.
-// ---------------------------------------------------------------------------------------------------
-
-static void	CMP_derivative_window_m13(tern pos_derivs, si4 *low_d, si4 *high_d, ui1 *ks_flag)
-{
-	// The 255-value coding window. pos_derivs is the LEGACY all-positive model: RETIRED from the encoders
-	// 2026-08-06 (they all pass FALSE_m13 now), still honoured by the decoders for files in the wild.
-	// A per-block window OFFSET was built & measured 2026-08-06, then reverted: the derivative-level search
-	// already centres the distribution, so it rescued a mean of 9-17 values per 4096-sample block on real
-	// data, for 2.4% encode time & a permanent format bit. Bit 4 of both flag words is FREE - never shipped.
-	// See the cmp-derivative-offset-design note before rebuilding it.
-	if (pos_derivs == TRUE_m13) {
-		*low_d = 1; *high_d = 255;
-		*ks_flag = CMP_POS_DERIV_KEYSAMPLE_FLAG_m13;  // == 0 (non-overflow range: 1 to 255)
-	} else {
-		*low_d = -127; *high_d = 127;
-		*ks_flag = (ui1) CMP_UI1_KEYSAMPLE_FLAG_m13;  // == -128 (non-overflow range: -127 to +127)
-	}
-
-	return;
-}
-
-
 void	CMP_get_counts_m13(CPS_m13 *cps, tern overflows)
 {
 	ui1		*key_p, *ui1_p, ks_flag;
@@ -24861,13 +25346,9 @@ void	CMP_get_counts_m13(CPS_m13 *cps, tern overflows)
 	deriv_level = (si4) cps->params.derivative_level;
 	n_deriv_samps = cps->block_header->number_of_samples - deriv_level;  // skip initial values
 
-	// PRECONDITION: the caller holds the RED-side buffers. This function used to swap to RED itself &
-	// swap BACK on exit - which meant that under a PRED directive, params.count no longer aimed at the
-	// histogram just built the moment this returned, & the derivative-level search scored uninitialized/
-	// stale PRED-side memory (bug #12, fixed 2026-08-09: position/process-nondeterministic compressed
-	// sizes). Every caller now holds the RED side across the count+estimate PAIR (CMP_differentiate_m13()
-	// explicitly; the SRRED paths run swapped for the whole search & CMP_SRRED_find_parameters_m13() - see
-	// the note at the SRRED search-entry swap), so the silent side-switch is retired & misuse fails loudly:
+	// PRECONDITION: the caller holds the RED-side buffers ACROSS the count+estimate PAIR - a swap inside
+	// this function would leave params.count aimed away from the histogram just built (the derivative-level
+	// search would then score stale PRED-side memory: nondeterministic compressed sizes). Misuse fails loudly:
 	if (cps->params.PRED_base_count != NULL && cps->params.count == cps->params.PRED_base_count) {
 		G_set_error_m13(E_CMP_m13, "caller must hold the RED-side buffers (CMP_swap_RED_PRED_m13)");
 		return_void_m13;
@@ -25283,6 +25764,7 @@ CPS_PARAMS_m13	*CMP_init_params_m13(CPS_PARAMS_m13 *params)
 	params->cumulative_count = NULL;
 	params->minimum_range = NULL;
 	params->symbol_map = NULL;
+	params->SRRED_scan_buffers = NULL;  // scale-scan overflow histogram: lazily built per block
 	params->VDS_input_buffers = NULL;
 	params->VDS_output_buffers = NULL;
 	params->filtps = NULL;
@@ -25437,35 +25919,6 @@ tern	CMP_lad_reg_2_sf8_m13(sf8 *x_input_buffer, sf8 *y_input_buffer, si8 len, sf
 	free(buf);
 
 	return_m13(TRUE_m13);
-}
-
-
-sf8	CMP_entropy_deficit_m13(si4 *data, si8 len)
-{
-	sf8	scores[CMP_NS_BYTES_m13];
-
-#ifdef FT_DEBUG_m13
-	G_push_function_m13();
-#endif
-
-	// ENTROPY DEFICIT in [0,1]: how much LESS information the block carries than its own dynamic range could
-	// hold. 0 == the range is filled as evenly as the resolution can show; 1 == no information at all.
-	// An INFORMATION-LOSS measure - it catches dropout, a dead or stuck channel, and excessive quantization.
-	// It does NOT flag noise: a signal that fills its range is healthy by this measure, & the LLP score is what
-	// carries unpredictability. Reference points: flat 1.0, stuck on two values 0.875, gaussian filling its
-	// range 0.10, white uniform noise 0.004.
-	// The histogram spans the OBSERVED range so the score is scale invariant, & Hmax is log2 of the bins
-	// actually in play, so a signal that legitimately occupies few codes does not read as degraded.
-	// Deficit rather than raw entropy so this does not track the normality score: for a given variance the
-	// gaussian MAXIMIZES entropy, so raw entropy & normality would agree on exactly the clean data where
-	// resolution is wanted.
-	// ⭐ Side effect worth knowing: a large outlier inflates the range & collapses the bulk into few bins, so
-	// impulsive artifact registers here - the failure mode the KS score is weakest on.
-
-	scores[CMP_NS_ENTROPY_DEFICIT_IDX_m13] = (sf8) 1.0;
-	CMP_noise_scores_m13(data, len, scores, CMP_NS_ENTROPY_DEFICIT_SEL_m13);
-
-	return_m13(scores[CMP_NS_ENTROPY_DEFICIT_IDX_m13]);
 }
 
 
@@ -25990,6 +26443,49 @@ tern	CMP_lin_reg_si4_m13(si4 *input_buffer, si8 len, sf8 *m, sf8 *b)
 }
 
 
+sf8	CMP_LLP_score_m13(si4 *data, si8 len)
+{
+	sf8	scores[CMP_NS_BYTES_m13];
+
+#ifdef FT_DEBUG_m13
+	G_push_function_m13();
+#endif
+
+	// LOCAL LINEAR PREDICTION. The second difference is exactly the residual of predicting each sample by
+	// linear extrapolation from the two before it; normalizing by the first difference makes the statistic
+	// scale free. Returns [0,1]: 0 == perfectly predictable, 1 == at least as unpredictable as white noise.
+	//
+	// NORMALIZED BY sqrt(3), which is EXACT, not calibrated: for an iid sequence of variance v, Var(d1x) = 2v
+	// & Var(d2x) = 6v, so the white-noise ratio of standard deviations is sqrt(6/2) = sqrt(3).
+	//
+	// ⚠️ SUMS OF SQUARES, not absolute values. Under the absolute form the white-noise reference drifts with
+	// distribution shape - MEASURED gaussian 1.731, laplace 1.742, uniform 1.751, heavy-tailed 1.813, bimodal
+	// 1.940 - so merely non-gaussian data reads as noisier than white noise & clips. Under the RMS form the
+	// reference is sqrt(3) for ANY iid finite-variance sequence. On real data it matters: dataset y reads
+	// 1.579 under the absolute form but 1.500 under RMS. (An earlier MATLAB prototype used 1.75, which is
+	// sqrt(3) measured on UNIFORM white noise - rand, not randn.)
+	//
+	// The clip at 1 is meaningful: strong sample-to-sample alternation IS less predictable than white noise.
+	// A flat block returns 0 - perfectly predictable, which is true. The ENTROPY score is what separates
+	// flat-and-dead from smooth-and-real; these bytes are meant to be read as a vector.
+	// ⚠️ A random walk scores 0.816 (sqrt(2)/sqrt(3)), not near 0: its increments are unpredictable even though
+	// it looks smooth. And on a signal whose second difference falls below one quantization step, this measures
+	// the QUANTIZATION FLOOR rather than the signal.
+	//
+	// ⭐ USEFUL SIDE EFFECT: this ratio is a SPECTRAL SLOPE proxy, computed for free. Var(d2)/Var(d1) is
+	// 4*integral(sin^4 . S) / integral(sin^2 . S), which is 3 for a flat spectrum & falls as the spectrum
+	// steepens. MEASURED on synthetic noise at 1 kHz: white (f^0) 254, pink (1/f) 232, brown (1/f^2) 207.
+	// The background slope of neural data shifts in physiologically meaningful ways (state, depth of
+	// anaesthesia, pathology), so this byte carries more than a noise verdict - it tracks that slope, and
+	// nothing else in the block does.
+
+	scores[CMP_NS_LLP_IDX_m13] = (sf8) 0.0;
+	CMP_noise_scores_m13(data, len, scores, CMP_NS_LLP_SEL_m13);
+
+	return_m13(scores[CMP_NS_LLP_IDX_m13]);
+}
+
+
 tern	CMP_noise_scores_m13(si4 *data, si8 len, sf8 *scores, ui4 which)
 {
 	const sf8	*norm_cdf;
@@ -26133,49 +26629,6 @@ tern	CMP_noise_scores_m13(si4 *data, si8 len, sf8 *scores, ui4 which)
 	}
 
 	return_m13(TRUE_m13);
-}
-
-
-sf8	CMP_LLP_score_m13(si4 *data, si8 len)
-{
-	sf8	scores[CMP_NS_BYTES_m13];
-
-#ifdef FT_DEBUG_m13
-	G_push_function_m13();
-#endif
-
-	// LOCAL LINEAR PREDICTION. The second difference is exactly the residual of predicting each sample by
-	// linear extrapolation from the two before it; normalizing by the first difference makes the statistic
-	// scale free. Returns [0,1]: 0 == perfectly predictable, 1 == at least as unpredictable as white noise.
-	//
-	// NORMALIZED BY sqrt(3), which is EXACT, not calibrated: for an iid sequence of variance v, Var(d1x) = 2v
-	// & Var(d2x) = 6v, so the white-noise ratio of standard deviations is sqrt(6/2) = sqrt(3).
-	//
-	// ⚠️ SUMS OF SQUARES, not absolute values. Under the absolute form the white-noise reference drifts with
-	// distribution shape - MEASURED gaussian 1.731, laplace 1.742, uniform 1.751, heavy-tailed 1.813, bimodal
-	// 1.940 - so merely non-gaussian data reads as noisier than white noise & clips. Under the RMS form the
-	// reference is sqrt(3) for ANY iid finite-variance sequence. On real data it matters: dataset y reads
-	// 1.579 under the absolute form but 1.500 under RMS. (An earlier MATLAB prototype used 1.75, which is
-	// sqrt(3) measured on UNIFORM white noise - rand, not randn.)
-	//
-	// The clip at 1 is meaningful: strong sample-to-sample alternation IS less predictable than white noise.
-	// A flat block returns 0 - perfectly predictable, which is true. The ENTROPY score is what separates
-	// flat-and-dead from smooth-and-real; these bytes are meant to be read as a vector.
-	// ⚠️ A random walk scores 0.816 (sqrt(2)/sqrt(3)), not near 0: its increments are unpredictable even though
-	// it looks smooth. And on a signal whose second difference falls below one quantization step, this measures
-	// the QUANTIZATION FLOOR rather than the signal.
-	//
-	// ⭐ USEFUL SIDE EFFECT: this ratio is a SPECTRAL SLOPE proxy, computed for free. Var(d2)/Var(d1) is
-	// 4*integral(sin^4 . S) / integral(sin^2 . S), which is 3 for a flat spectrum & falls as the spectrum
-	// steepens. MEASURED on synthetic noise at 1 kHz: white (f^0) 254, pink (1/f) 232, brown (1/f^2) 207.
-	// The background slope of neural data shifts in physiologically meaningful ways (state, depth of
-	// anaesthesia, pathology), so this byte carries more than a noise verdict - it tracks that slope, and
-	// nothing else in the block does.
-
-	scores[CMP_NS_LLP_IDX_m13] = (sf8) 0.0;
-	CMP_noise_scores_m13(data, len, scores, CMP_NS_LLP_SEL_m13);
-
-	return_m13(scores[CMP_NS_LLP_IDX_m13]);
 }
 
 
@@ -28037,16 +28490,22 @@ CPS_m13		*CMP_realloc_CPS_m13(FPS_m13 *fps, ui4 compression_mode, si8 data_sampl
 		// derivative & SRRED buffers: malloc, not calloc, matching CMP_allocate_CPS_m13(). They are fully written
 		// before they are read on every block (the derivative anchors at indices 0..level-1 included, since the
 		// 2026-08-02 anchor fix), so zeroing them buys nothing but a pass over the memory every realloc.
-		if (cps->params.derivative_buffer) {
-			free_m13((void * ) cps->params.derivative_buffer);
-			if ((cps->params.derivative_buffer = (si4 *) malloc_m13((size_t) (block_samples << 2))) == NULL)
+		// derivative pair: resize through the OWNING handles & re-publish the views. Doing this through the
+		// views double-freed mid-recording whenever the search had left them aliased (this runs on every
+		// block that grows past allocated_block_samples, not just at teardown).
+		if (cps->params.derivative_bufs[0]) {
+			free_m13((void * ) cps->params.derivative_bufs[0]);
+			if ((cps->params.derivative_bufs[0] = (si4 *) malloc_m13((size_t) (block_samples << 2))) == NULL)
 				goto CMP_REALLOC_CPS_FAIL_m13;
 		}
-		if (cps->params.next_derivative_buffer) {
-			free_m13((void * ) cps->params.next_derivative_buffer);
-			if ((cps->params.next_derivative_buffer = (si4 *) malloc_m13((size_t) (block_samples << 2))) == NULL)
+		if (cps->params.derivative_bufs[1]) {
+			free_m13((void * ) cps->params.derivative_bufs[1]);
+			if ((cps->params.derivative_bufs[1] = (si4 *) malloc_m13((size_t) (block_samples << 2))) == NULL)
 				goto CMP_REALLOC_CPS_FAIL_m13;
 		}
+		// views follow the allocations: the old targets are gone, & the search re-establishes roles per block
+		cps->params.derivative_buffer = cps->params.derivative_bufs[0];
+		cps->params.next_derivative_buffer = cps->params.derivative_bufs[1];
 		// SRRED residuals/overflows: these were NOT being reallocated at all, so a caller that encoded a larger
 		// block later (CMP_encode_m13() reallocs on a bigger n_samples) wrote block_samples si4 into a buffer
 		// sized for the previous, smaller block.
@@ -30459,46 +30918,102 @@ sf8	CMP_SRRED_estimate_bytes_m13(CPS_m13 *cps, sf8 scale)
 		}
 	}
 
-	// add scaled overflows to divided counts
-	si4_p = cps->params.overflows_buffer;
-	for (i = cps->params.SRRED_overflow_samples; i--;) {
-		// get scaled overflow value
-		tmp_sf8  = (sf8) *si4_p * scale;
-		if (tmp_sf8 >= (sf8) 0.0)  // avoid round() overhead
-			tmp_sf8 += (sf8) 0.5;
-		else
-			tmp_sf8 -= (sf8) 0.5;
-		scaled_val = (si4) tmp_sf8;
-		
-		// enter scaled value into scaled counts
-		if (scaled_val < LOW_D || scaled_val > HIGH_D) {
-			ui1_p = (ui1 *) &scaled_val;
-			++scaled_cnts[KS_FLAG];
-			j = scaled_ovf_bytes; do {
-				++scaled_cnts[*ui1_p++];
-			} while (--j);
-		} else {
-			++scaled_cnts[(ui1) scaled_val];
-		}
+	// add scaled overflows to divided counts. When CMP_SRRED_find_parameters_m13() has built the per-block
+	// overflow-VALUE histogram (SRRED_ovf_hist_span > 0), iterate DISTINCT VALUES weighted by their counts -
+	// arithmetic-identical to the raw walk (the math is a pure function of the value), but each scale step
+	// costs O(distinct values) instead of O(overflow samples), which on wide (noise-like) data is the
+	// difference between ~3k and ~50k iterations per step. Raw walk kept for callers without a histogram
+	// (derivative-level ranking, over-wide spans).
+	if (cps->params.SRRED_ovf_hist_span > 0) {
+		ui4	*hist = (ui4 *) cps->params.SRRED_scan_buffers->buffer[0];
+		si4	hbase = cps->params.SRRED_ovf_hist_base, hspan = cps->params.SRRED_ovf_hist_span, hidx;
+		ui4	vcnt;
 
-		// get residual overflow value
-		tmp_sf8 = (sf8) scaled_val * inv_scale;
-		if (tmp_sf8 >= (sf8) 0.0)  // avoid round() overhead
-			tmp_sf8 += (sf8) 0.5;
-		else
-			tmp_sf8 -= (sf8) 0.5;
-		unscaled_val = (si4) tmp_sf8;
-		residual_val = *si4_p++ - unscaled_val;
-		
-		// enter residual value into residual counts
-		if (residual_val < LOW_D || residual_val > HIGH_D) {
-			ui1_p = (ui1 *) &residual_val;
-			++residual_cnts[KS_FLAG];
-			j = OVERFLOW_BYTES; do {
-				++residual_cnts[*ui1_p++];
-			} while (--j);
-		} else {
-			++residual_cnts[(ui1) residual_val];
+		for (hidx = 0; hidx < hspan; ++hidx) {
+			vcnt = hist[hidx];
+			if (vcnt == 0)
+				continue;
+
+			// get scaled overflow value
+			tmp_sf8 = (sf8) (hbase + hidx) * scale;
+			if (tmp_sf8 >= (sf8) 0.0)  // avoid round() overhead
+				tmp_sf8 += (sf8) 0.5;
+			else
+				tmp_sf8 -= (sf8) 0.5;
+			scaled_val = (si4) tmp_sf8;
+
+			// enter scaled value into scaled counts
+			if (scaled_val < LOW_D || scaled_val > HIGH_D) {
+				ui1_p = (ui1 *) &scaled_val;
+				scaled_cnts[KS_FLAG] += vcnt;
+				j = scaled_ovf_bytes; do {
+					scaled_cnts[*ui1_p++] += vcnt;
+				} while (--j);
+			} else {
+				scaled_cnts[(ui1) scaled_val] += vcnt;
+			}
+
+			// get residual overflow value
+			tmp_sf8 = (sf8) scaled_val * inv_scale;
+			if (tmp_sf8 >= (sf8) 0.0)  // avoid round() overhead
+				tmp_sf8 += (sf8) 0.5;
+			else
+				tmp_sf8 -= (sf8) 0.5;
+			unscaled_val = (si4) tmp_sf8;
+			residual_val = (hbase + hidx) - unscaled_val;
+
+			// enter residual value into residual counts
+			if (residual_val < LOW_D || residual_val > HIGH_D) {
+				ui1_p = (ui1 *) &residual_val;
+				residual_cnts[KS_FLAG] += vcnt;
+				j = OVERFLOW_BYTES; do {
+					residual_cnts[*ui1_p++] += vcnt;
+				} while (--j);
+			} else {
+				residual_cnts[(ui1) residual_val] += vcnt;
+			}
+		}
+	} else {
+		si4_p = cps->params.overflows_buffer;
+		for (i = cps->params.SRRED_overflow_samples; i--;) {
+			// get scaled overflow value
+			tmp_sf8  = (sf8) *si4_p * scale;
+			if (tmp_sf8 >= (sf8) 0.0)  // avoid round() overhead
+				tmp_sf8 += (sf8) 0.5;
+			else
+				tmp_sf8 -= (sf8) 0.5;
+			scaled_val = (si4) tmp_sf8;
+
+			// enter scaled value into scaled counts
+			if (scaled_val < LOW_D || scaled_val > HIGH_D) {
+				ui1_p = (ui1 *) &scaled_val;
+				++scaled_cnts[KS_FLAG];
+				j = scaled_ovf_bytes; do {
+					++scaled_cnts[*ui1_p++];
+				} while (--j);
+			} else {
+				++scaled_cnts[(ui1) scaled_val];
+			}
+
+			// get residual overflow value
+			tmp_sf8 = (sf8) scaled_val * inv_scale;
+			if (tmp_sf8 >= (sf8) 0.0)  // avoid round() overhead
+				tmp_sf8 += (sf8) 0.5;
+			else
+				tmp_sf8 -= (sf8) 0.5;
+			unscaled_val = (si4) tmp_sf8;
+			residual_val = *si4_p++ - unscaled_val;
+
+			// enter residual value into residual counts
+			if (residual_val < LOW_D || residual_val > HIGH_D) {
+				ui1_p = (ui1 *) &residual_val;
+				++residual_cnts[KS_FLAG];
+				j = OVERFLOW_BYTES; do {
+					++residual_cnts[*ui1_p++];
+				} while (--j);
+			} else {
+				++residual_cnts[(ui1) residual_val];
+			}
 		}
 	}
 	
@@ -30574,7 +31089,27 @@ tern	CMP_SRRED_find_parameters_m13(CPS_m13 *cps)
 	cps->direcs.flags &= ~CPS_DF_FIND_DERIVATIVE_LEVEL_m13;
 	cps->direcs.flags |= CPS_DF_SET_DERIVATIVE_LEVEL_m13;
 	cps->params.goal_derivative_level = n_derivs;  // set cps set_derivative level (RED block header derivative level set by RED_encode_m13()
-	
+
+	// NO-SCALE state (center == 0.0): the last full ANCHOR scan concluded nothing beats the unscaled
+	// baseline - the signature of wide, smooth (noise-like) derivative distributions, where H(scaled) +
+	// H(residual) ~ H(original) at EVERY scale & SRRED's overhead makes the ladder unwinnable. Scanning
+	// such a channel is the pathological case: the bailout never arms (no minimum is ever found), the
+	// tracker never engages (no center < 1.0 to track), & each estimator step walks the full overflow
+	// array (on noise ~ every derivative), so every block paid the whole ladder at worst-case step cost
+	// (measured 20x a real-data block; it saturated the DHN_Acq pool, 2026-08-13). Give the conclusion
+	// the SAME memory the tracker gives a scaled channel: skip the ladder & redirect to RED2 (whose own
+	// estimate-vs-MBE decision still runs per block), re-checking with a full anchor scan every
+	// SRRED_scale_refresh blocks - the identical staleness exposure the refresh already accepts for
+	// scale jumps on scaled channels. Only the ANCHOR scan can enter this state (a windowed-tracker miss
+	// keeps its existing leave-the-center behavior); only the refresh leaves it.
+	if (cps->params.SRRED_scale_window > 0 && cps->params.SRRED_scale_center == (sf8) 0.0 &&
+	    cps->params.SRRED_scale_refresh_ctr < cps->params.SRRED_scale_refresh) {
+		++cps->params.SRRED_scale_refresh_ctr;
+		SRRED_header = (CMP_SRRED_MODEL_FIXED_HDR_m13 *) cps->params.model_region;
+		SRRED_header->scale = (sf4) 1.0;  // degenerate scale => CMP_SRRED_encode_m13() redirects to RED2
+		return_m13(TRUE_m13);
+	}
+
 	// find optimal scale
 	
 	// Get the minimum (unscaled) score = estimated TOTAL bytes of the plain RED2 block this baseline stands for
@@ -30623,6 +31158,35 @@ tern	CMP_SRRED_find_parameters_m13(CPS_m13 *cps)
 
 	// get counts with separated overflows
 	CMP_get_counts_m13(cps, TRUE_m13);
+
+	// Build the overflow-VALUE histogram ONCE for the whole scan. Every scale step used to re-walk the raw
+	// overflow array, which on wide (noise-like) derivative distributions is nearly every sample - the
+	// scan's dominant cost (~97%, measured when the log table landed; this is the "caching the overflow
+	// re-processing across scales" lever anticipated there — it saturated the DHN_Acq pool on noisy
+	// channels, 2026-08-13). Aggregating identical values first is arithmetic-identical: the estimator's
+	// math is a pure function of the VALUE, weighted by its count, so scores & outputs are byte-identical;
+	// each step now iterates DISTINCT VALUES instead of samples. Skipped (span 0 => estimator walks raw)
+	// when the value range is too wide to be worth the pass or wider than the sample count.
+	cps->params.SRRED_ovf_hist_span = 0;
+	if (cps->params.SRRED_overflow_samples > 0) {
+		si8	span = (si8) cps->params.maximum_difference_value - (si8) cps->params.minimum_difference_value + 1;
+
+		if (span > 0 && span <= CMP_SRRED_OVF_HIST_MAX_SPAN_m13 && span < (si8) cps->params.SRRED_overflow_samples) {
+			cps->params.SRRED_scan_buffers = CMP_allocate_buffers_m13(cps->params.SRRED_scan_buffers, 1, span, sizeof(ui4), FALSE_m13, FALSE_m13);
+			if (cps->params.SRRED_scan_buffers != NULL) {
+				ui4	*hist = (ui4 *) cps->params.SRRED_scan_buffers->buffer[0];
+				si4	*ovf = cps->params.overflows_buffer;
+				si4	base = cps->params.minimum_difference_value;
+				si8	oi;
+
+				memset(hist, 0, (size_t) span * sizeof(ui4));
+				for (oi = cps->params.SRRED_overflow_samples; oi--;)
+					++hist[*ovf++ - base];
+				cps->params.SRRED_ovf_hist_base = base;
+				cps->params.SRRED_ovf_hist_span = (si4) span;
+			}
+		}
+	}
 
 	// Per-block scan floor: below scale = 0.5 / max|derivative| every scaled derivative rounds to zero, so the
 	// scaled stream is identically zero & SRRED cannot beat the unscaled baseline by construction - scanning there
@@ -30705,9 +31269,13 @@ tern	CMP_SRRED_find_parameters_m13(CPS_m13 *cps)
 			}
 		}
 		cps->params.SRRED_scale_refresh_ctr = 0;
+		if (min_scale >= (sf8) 1.0)  // a FULL scan found nothing better than unscaled => enter the
+			cps->params.SRRED_scale_center = (sf8) 0.0;  // NO-SCALE state (see the fast path above)
 	}
 	if (min_scale < (sf8) 1.0)  // a scanned scale beat the unscaled baseline => track it (baseline 1.0 => leave center; that block redirects to RED)
 		cps->params.SRRED_scale_center = min_scale;
+	cps->params.SRRED_ovf_hist_span = 0;  // the histogram describes THIS block's overflow array only - invalidate so
+		// no other estimator call (e.g. the derivative-level ranking, whose overflows differ per level) reads it stale
 
 	// set scale in SRRED header
 	SRRED_header = (CMP_SRRED_MODEL_FIXED_HDR_m13 *) cps->params.model_region;
@@ -31585,10 +32153,30 @@ tern	CMP_VDS_encode_m13(CPS_m13 *cps)
 	bh = cps->block_header;
 	block_samps = (si8) bh->number_of_samples;
 	if (block_samps < CMP_VDS_MINIMUM_SAMPLES_m13) {
+		tern	redirect_r_val;
+
 		bh->block_flags &= ~CMP_BF_ALGORITHMS_MASK_m13;
 		bh->block_flags |= CMP_BF_MBE_ENCODING_m13;
-		CMP_MBE_encode_m13(cps);
-		return_m13(TRUE_m13);
+		// The DIRECTIVE must move too, not just the block flags. CMP_MBE_encode_m13() calls
+		// CMP_differentiate_m13(), which reads cps->direcs & rejects VDS outright ("VDS is not
+		// designed to work with derivatives") - so this redirect killed the encode & took the pool
+		// worker with it. Same swap-and-restore the lossless PRED2 redirect above does, & for the
+		// same reason: the CPS is reused block to block, so a directive left changed leaks forward.
+		// Only decimating sessions hit this: DHN_Acq staggers block phases across 512 channels
+		// (D12), & at a decimated output rate the first blocks are a couple of SAMPLES - under
+		// CMP_VDS_MINIMUM_SAMPLES_m13. Undecimated the same stagger is ~98 samples & never trips it
+		// (found by a 512ch LNF+AA+decimate+VDS stress run, 2026-08-14).
+		//
+		// NOTE the SET/FIND derivative bits are deliberately NOT touched: MBE differentiates through
+		// CMP_differentiate_m13(), which honours CPS_DF_SET_DERIVATIVE_LEVEL_m13 & goal_derivative_level.
+		// Swapping only the ALGORITHM bits leaves whatever derivative policy is in force intact.
+		cps->direcs.flags &= ~CPS_DF_ALGORITHM_MASK_m13;
+		cps->direcs.flags |= CPS_DF_MBE_ALGORITHM_m13;
+		redirect_r_val = CMP_MBE_encode_m13(cps);
+		cps->direcs.flags &= ~CPS_DF_ALGORITHM_MASK_m13;
+		cps->direcs.flags |= CPS_DF_VDS_ALGORITHM_m13;
+
+		return_m13(redirect_r_val);  // was an unconditional TRUE: a failed MBE reported success
 	}
 	
 	// allocate
@@ -32002,7 +32590,10 @@ tern	CMP_VDS_encode_m13(CPS_m13 *cps)
 	// It also did not deliver: in the reference set (read_MED/compression_comparison.medd) the _SB channels are
 	// LARGER than their unscaled counterparts (632 vs 624 KB, 924 vs 864 KB) against an rc note claiming ~30%
 	// better compression. CPS_DF_VDS_SCALE_BY_BASELINE_m13 was left INERT at the time & is now DELETED
-	// (2026-08-07); the "VDS Scale by Baseline" rc field should go at the next pass over the app rc files.
+	// (2026-08-07). 2026-08-10 (Matt): the feature is deleted EVERYWHERE - converter code & rc files
+	// (no wild-type files exist). "Was based on the notion that baseline width connotes true
+	// resolution - not entirely true - was a bad idea." DHN_Acq (m12, live) still carries its GUI
+	// toggle; that goes with the DHN_Acq m13 migration.
 	// If more compression is wanted, raise the threshold: that is one accountable knob with a stated bound.
 	
 	// copy data to input buffer
@@ -33369,7 +33960,7 @@ pthread_rval_m13	DM_channel_thread_m13(void *ptr)
 
 	// FAST PATH: output geometry equals input (ratio 1) and no per-sample processing is requested => copy the decompressed
 	// samples straight into the caller's matrix, skipping the sf8 conversion, (identity) interpolation, & restore.  Converting
-	// as CONV((sf8) sample) reproduces the general path bit-for-bit (si4->sf8 is exact; ratio-1 interpolation is identity).
+	// as round/cast((sf8) sample) reproduces the general path bit-for-bit (si4->sf8 is exact; ratio-1 interpolation is identity).
 	if (dm->valid_sample_count == n_raw_samps && filter == FALSE_m13 && trace_ranges == FALSE_m13 &&
 	    (dm->flags & (DM_TRACE_EXTREMA_m13 | DM_DETREND_m13)) == 0 &&
 	    ((dm->flags & DM_SCALE_m13) == 0 || dm->scale_factor == (sf8) 1.0)) {
@@ -33380,11 +33971,76 @@ pthread_rval_m13	DM_channel_thread_m13(void *ptr)
 			chan_offset = chan_idx * dm->sample_count;
 		else  // DM_FMT_SAMPLE_MAJOR_m13
 			samp_offset = dm->channel_count;
+		// one unrolled copy per element type (channel- vs sample-major layout handled inside each)
 		switch (dm->flags & DM_TYPE_MASK_m13) {
-			case DM_TYPE_SI2_m13: DM_PASSTHRU_m13(si2, CMP_round_si2_m13); break;
-			case DM_TYPE_SI4_m13: DM_PASSTHRU_m13(si4, CMP_round_si4_m13); break;
-			case DM_TYPE_SF4_m13: DM_PASSTHRU_m13(sf4, (sf4)); break;
-			case DM_TYPE_SF8_m13: DM_PASSTHRU_m13(sf8, (sf8)); break;
+			case DM_TYPE_SI2_m13: {
+				if (dm->flags & DM_FMT_CHANNEL_MAJOR_m13) {  // contiguous per channel
+					si2	*_d = (si2 *) pt_base + chan_offset;
+					for (i = 0, j = seg_idx; i < slice->n_segs; ++i, ++j) {
+						si4	*_s = chan->segs[j]->ts_data_fps->params.cps->decompressed_data;
+						for (k = SLICE_IDX_COUNT_S_m13(chan->segs[j]->slice); k--;)
+							*_d++ = CMP_round_si2_m13((sf8) *_s++);
+					}
+				} else {  // DM_FMT_SAMPLE_MAJOR_m13: stride by channel_count
+					si2	*_d = ((si2 *) pt_base + chan_idx) - samp_offset;
+					for (i = 0, j = seg_idx; i < slice->n_segs; ++i, ++j) {
+						si4	*_s = chan->segs[j]->ts_data_fps->params.cps->decompressed_data;
+						for (k = SLICE_IDX_COUNT_S_m13(chan->segs[j]->slice); k--;)
+							*(_d += samp_offset) = CMP_round_si2_m13((sf8) *_s++);
+					}
+				}
+			} break;
+			case DM_TYPE_SI4_m13: {
+				if (dm->flags & DM_FMT_CHANNEL_MAJOR_m13) {  // contiguous per channel
+					si4	*_d = (si4 *) pt_base + chan_offset;
+					for (i = 0, j = seg_idx; i < slice->n_segs; ++i, ++j) {
+						si4	*_s = chan->segs[j]->ts_data_fps->params.cps->decompressed_data;
+						for (k = SLICE_IDX_COUNT_S_m13(chan->segs[j]->slice); k--;)
+							*_d++ = CMP_round_si4_m13((sf8) *_s++);
+					}
+				} else {  // DM_FMT_SAMPLE_MAJOR_m13: stride by channel_count
+					si4	*_d = ((si4 *) pt_base + chan_idx) - samp_offset;
+					for (i = 0, j = seg_idx; i < slice->n_segs; ++i, ++j) {
+						si4	*_s = chan->segs[j]->ts_data_fps->params.cps->decompressed_data;
+						for (k = SLICE_IDX_COUNT_S_m13(chan->segs[j]->slice); k--;)
+							*(_d += samp_offset) = CMP_round_si4_m13((sf8) *_s++);
+					}
+				}
+			} break;
+			case DM_TYPE_SF4_m13: {
+				if (dm->flags & DM_FMT_CHANNEL_MAJOR_m13) {  // contiguous per channel
+					sf4	*_d = (sf4 *) pt_base + chan_offset;
+					for (i = 0, j = seg_idx; i < slice->n_segs; ++i, ++j) {
+						si4	*_s = chan->segs[j]->ts_data_fps->params.cps->decompressed_data;
+						for (k = SLICE_IDX_COUNT_S_m13(chan->segs[j]->slice); k--;)
+							*_d++ = (sf4)((sf8) *_s++);
+					}
+				} else {  // DM_FMT_SAMPLE_MAJOR_m13: stride by channel_count
+					sf4	*_d = ((sf4 *) pt_base + chan_idx) - samp_offset;
+					for (i = 0, j = seg_idx; i < slice->n_segs; ++i, ++j) {
+						si4	*_s = chan->segs[j]->ts_data_fps->params.cps->decompressed_data;
+						for (k = SLICE_IDX_COUNT_S_m13(chan->segs[j]->slice); k--;)
+							*(_d += samp_offset) = (sf4)((sf8) *_s++);
+					}
+				}
+			} break;
+			case DM_TYPE_SF8_m13: {
+				if (dm->flags & DM_FMT_CHANNEL_MAJOR_m13) {  // contiguous per channel
+					sf8	*_d = (sf8 *) pt_base + chan_offset;
+					for (i = 0, j = seg_idx; i < slice->n_segs; ++i, ++j) {
+						si4	*_s = chan->segs[j]->ts_data_fps->params.cps->decompressed_data;
+						for (k = SLICE_IDX_COUNT_S_m13(chan->segs[j]->slice); k--;)
+							*_d++ = (sf8)((sf8) *_s++);
+					}
+				} else {  // DM_FMT_SAMPLE_MAJOR_m13: stride by channel_count
+					sf8	*_d = ((sf8 *) pt_base + chan_idx) - samp_offset;
+					for (i = 0, j = seg_idx; i < slice->n_segs; ++i, ++j) {
+						si4	*_s = chan->segs[j]->ts_data_fps->params.cps->decompressed_data;
+						for (k = SLICE_IDX_COUNT_S_m13(chan->segs[j]->slice); k--;)
+							*(_d += samp_offset) = (sf8)((sf8) *_s++);
+					}
+				}
+			} break;
 		}
 		job->status = PROC_THREAD_SUCCEEDED_m13;
 		goto DM_CHANNEL_THREAD_RETURN_m13;
@@ -33650,25 +34306,149 @@ pthread_rval_m13	DM_channel_thread_m13(void *ptr)
 	else  // DM_FMT_SAMPLE_MAJOR_m13
 		samp_offset = dm->channel_count;
 	
-	// Store out_buf (+ optional trace min/max) into the caller's matrix in the requested element type & layout.
-	// One pattern per type; channel- vs sample-major and trace-ranges are handled inside the macro.  CONV converts sf8 -> TYPE
-	// (a round function for integers, a cast for floats).  sf8 channel-major was written straight into dm->data during
+	// Store out_buf (+ optional trace min/max) into the caller's matrix in the requested element type & layout -
+	// one unrolled copy per type (round functions for integers, casts for floats); channel- vs sample-major &
+	// trace-ranges are handled inside each.  sf8 channel-major was written straight into dm->data during
 	// interpolation, so it is the one case that needs no copy here.
 
 	switch (dm->flags & DM_TYPE_MASK_m13) {
 		case DM_TYPE_SI2_m13:
-			DM_STORE_m13(si2, CMP_round_si2_m13);
+			{
+				sf8	*_o = out_buf;
+				if (dm->flags & DM_FMT_CHANNEL_MAJOR_m13) {  // contiguous per channel
+					si2	*_d = (si2 *) data_base + chan_offset;
+					if (trace_ranges == TRUE_m13) {
+						sf8	*_omn = out_mins, *_omx = out_maxs;
+						si2	*_dmn = (si2 *) min_base + chan_offset, *_dmx = (si2 *) max_base + chan_offset;
+						for (i = dm->valid_sample_count; i--;) {
+							*_d++ = CMP_round_si2_m13(*_o++);
+							*_dmn++ = CMP_round_si2_m13(*_omn++);
+							*_dmx++ = CMP_round_si2_m13(*_omx++);
+						}
+					} else {
+						for (i = dm->valid_sample_count; i--;)
+							*_d++ = CMP_round_si2_m13(*_o++);
+					}
+				} else {  // DM_FMT_SAMPLE_MAJOR_m13: stride by channel_count
+					si2	*_d = ((si2 *) data_base + chan_idx) - samp_offset;
+					if (trace_ranges == TRUE_m13) {
+						sf8	*_omn = out_mins, *_omx = out_maxs;
+						si2	*_dmn = ((si2 *) min_base + chan_idx) - samp_offset, *_dmx = ((si2 *) max_base + chan_idx) - samp_offset;
+						for (i = dm->valid_sample_count; i--;) {
+							*(_d += samp_offset) = CMP_round_si2_m13(*_o++);
+							*(_dmn += samp_offset) = CMP_round_si2_m13(*_omn++);
+							*(_dmx += samp_offset) = CMP_round_si2_m13(*_omx++);
+						}
+					} else {
+						for (i = dm->valid_sample_count; i--;)
+							*(_d += samp_offset) = CMP_round_si2_m13(*_o++);
+					}
+				}
+			}
 			break;
 		case DM_TYPE_SI4_m13:
-			DM_STORE_m13(si4, CMP_round_si4_m13);
+			{
+				sf8	*_o = out_buf;
+				if (dm->flags & DM_FMT_CHANNEL_MAJOR_m13) {  // contiguous per channel
+					si4	*_d = (si4 *) data_base + chan_offset;
+					if (trace_ranges == TRUE_m13) {
+						sf8	*_omn = out_mins, *_omx = out_maxs;
+						si4	*_dmn = (si4 *) min_base + chan_offset, *_dmx = (si4 *) max_base + chan_offset;
+						for (i = dm->valid_sample_count; i--;) {
+							*_d++ = CMP_round_si4_m13(*_o++);
+							*_dmn++ = CMP_round_si4_m13(*_omn++);
+							*_dmx++ = CMP_round_si4_m13(*_omx++);
+						}
+					} else {
+						for (i = dm->valid_sample_count; i--;)
+							*_d++ = CMP_round_si4_m13(*_o++);
+					}
+				} else {  // DM_FMT_SAMPLE_MAJOR_m13: stride by channel_count
+					si4	*_d = ((si4 *) data_base + chan_idx) - samp_offset;
+					if (trace_ranges == TRUE_m13) {
+						sf8	*_omn = out_mins, *_omx = out_maxs;
+						si4	*_dmn = ((si4 *) min_base + chan_idx) - samp_offset, *_dmx = ((si4 *) max_base + chan_idx) - samp_offset;
+						for (i = dm->valid_sample_count; i--;) {
+							*(_d += samp_offset) = CMP_round_si4_m13(*_o++);
+							*(_dmn += samp_offset) = CMP_round_si4_m13(*_omn++);
+							*(_dmx += samp_offset) = CMP_round_si4_m13(*_omx++);
+						}
+					} else {
+						for (i = dm->valid_sample_count; i--;)
+							*(_d += samp_offset) = CMP_round_si4_m13(*_o++);
+					}
+				}
+			}
 			break;
 		case DM_TYPE_SF4_m13:
-			DM_STORE_m13(sf4, (sf4));
+			{
+				sf8	*_o = out_buf;
+				if (dm->flags & DM_FMT_CHANNEL_MAJOR_m13) {  // contiguous per channel
+					sf4	*_d = (sf4 *) data_base + chan_offset;
+					if (trace_ranges == TRUE_m13) {
+						sf8	*_omn = out_mins, *_omx = out_maxs;
+						sf4	*_dmn = (sf4 *) min_base + chan_offset, *_dmx = (sf4 *) max_base + chan_offset;
+						for (i = dm->valid_sample_count; i--;) {
+							*_d++ = (sf4)(*_o++);
+							*_dmn++ = (sf4)(*_omn++);
+							*_dmx++ = (sf4)(*_omx++);
+						}
+					} else {
+						for (i = dm->valid_sample_count; i--;)
+							*_d++ = (sf4)(*_o++);
+					}
+				} else {  // DM_FMT_SAMPLE_MAJOR_m13: stride by channel_count
+					sf4	*_d = ((sf4 *) data_base + chan_idx) - samp_offset;
+					if (trace_ranges == TRUE_m13) {
+						sf8	*_omn = out_mins, *_omx = out_maxs;
+						sf4	*_dmn = ((sf4 *) min_base + chan_idx) - samp_offset, *_dmx = ((sf4 *) max_base + chan_idx) - samp_offset;
+						for (i = dm->valid_sample_count; i--;) {
+							*(_d += samp_offset) = (sf4)(*_o++);
+							*(_dmn += samp_offset) = (sf4)(*_omn++);
+							*(_dmx += samp_offset) = (sf4)(*_omx++);
+						}
+					} else {
+						for (i = dm->valid_sample_count; i--;)
+							*(_d += samp_offset) = (sf4)(*_o++);
+					}
+				}
+			}
 			break;
 		case DM_TYPE_SF8_m13:
 			// channel-major sf8 already written directly into dm->data during interpolation; only sample-major needs a copy
 			if (dm->flags & DM_FMT_SAMPLE_MAJOR_m13)
-				DM_STORE_m13(sf8, (sf8));
+				{
+					sf8	*_o = out_buf;
+					if (dm->flags & DM_FMT_CHANNEL_MAJOR_m13) {  // contiguous per channel
+						sf8	*_d = (sf8 *) data_base + chan_offset;
+						if (trace_ranges == TRUE_m13) {
+							sf8	*_omn = out_mins, *_omx = out_maxs;
+							sf8	*_dmn = (sf8 *) min_base + chan_offset, *_dmx = (sf8 *) max_base + chan_offset;
+							for (i = dm->valid_sample_count; i--;) {
+								*_d++ = (sf8)(*_o++);
+								*_dmn++ = (sf8)(*_omn++);
+								*_dmx++ = (sf8)(*_omx++);
+							}
+						} else {
+							for (i = dm->valid_sample_count; i--;)
+								*_d++ = (sf8)(*_o++);
+						}
+					} else {  // DM_FMT_SAMPLE_MAJOR_m13: stride by channel_count
+						sf8	*_d = ((sf8 *) data_base + chan_idx) - samp_offset;
+						if (trace_ranges == TRUE_m13) {
+							sf8	*_omn = out_mins, *_omx = out_maxs;
+							sf8	*_dmn = ((sf8 *) min_base + chan_idx) - samp_offset, *_dmx = ((sf8 *) max_base + chan_idx) - samp_offset;
+							for (i = dm->valid_sample_count; i--;) {
+								*(_d += samp_offset) = (sf8)(*_o++);
+								*(_dmn += samp_offset) = (sf8)(*_omn++);
+								*(_dmx += samp_offset) = (sf8)(*_omx++);
+							}
+						} else {
+							for (i = dm->valid_sample_count; i--;)
+								*(_d += samp_offset) = (sf8)(*_o++);
+						}
+					}
+				}
 			break;
 	}
 
@@ -36977,6 +37757,105 @@ tern	FILT_invert_matrix_m13(sf8 **a, sf8 **inv_a, si4 order)  // done in place i
 }
 
 
+sf8	FILT_line_noise_estimate_m13(si4 *data, si8 len, sf8 samp_freq, sf8 line_freq, CMP_BUFFERS_m13 *est_buffers)
+{
+	tern	free_buffers;
+	si8	i, k, best_k, lag, q, n_cycles;
+	sf8	samps_per_cycle, a, p0, p1, err, best_err, num, den, r_full, r_lo, r_hi, est, *hp;
+
+#ifdef FT_DEBUG_m13
+	G_push_function_m13();
+#endif
+
+	// FAST ESTIMATE of the line-noise score - the same 0-1 quantity FILT_line_noise_m13() returns with
+	// calculate_score, at ~1/45th the cost (one recursive pass + three lag dot products; no filtfilt, no
+	// template, no upsampling). See the FILT_LINE_NOISE_EST_* macro note for the method & its systematics.
+	// Returns -1 when the block holds too few mains cycles to estimate (same minimum as the true score).
+
+	if (data == NULL || len < 3 || samp_freq <= (sf8) 0.0 || line_freq <= (sf8) 0.0) {
+		G_set_error_m13(E_GEN_m13, "invalid line-noise estimate arguments");
+		return_m13((sf8) -1.0);
+	}
+	samps_per_cycle = samp_freq / line_freq;
+	n_cycles = (si8) ((sf8) len / samps_per_cycle);
+	if (n_cycles < FILT_LINE_NOISE_MIN_CYCLES_m13)
+		return_m13((sf8) -1.0);  // no estimate (not an error): same cycle minimum as the true score
+
+	// measurement lag: whole cycles, k chosen to minimize fractional-lag error (harmonic phase error scales
+	// with the fraction times the harmonic number, so a nearly integer multiple matters more than a small k)
+	best_k = 1;
+	best_err = (sf8) 1e30;
+	for (k = 1; k <= FILT_LINE_NOISE_EST_MAX_CYCLE_MULT_m13 && k <= (n_cycles >> 1); ++k) {
+		err = fabs(((sf8) k * samps_per_cycle) - round((sf8) k * samps_per_cycle));
+		if (err < best_err) {
+			best_err = err;
+			best_k = k;
+		}
+	}
+	lag = (si8) round((sf8) best_k * samps_per_cycle);
+	q = (si8) round(samps_per_cycle / (sf8) 4.0);
+	if (q < 1)
+		q = 1;
+
+	free_buffers = FALSE_m13;
+	if (est_buffers == NULL)
+		free_buffers = TRUE_m13;
+	est_buffers = CMP_allocate_buffers_m13(est_buffers, 1, len, sizeof(sf8), FALSE_m13, FALSE_m13);  // also reallocates
+	if (est_buffers == NULL)
+		return_m13((sf8) -1.0);
+	hp = (sf8 *) est_buffers->buffer[0];
+
+	// two-pole high-pass at line_freq / 2 (cascaded one-poles, 12 dB/oct; zero-phase is irrelevant for a
+	// power ratio, so no filtfilt is needed). Two poles matter: a single pole's 6 dB/oct skirt lets enough
+	// 1/f background into the power-ratio denominator on real physiological data that the calibration
+	// absorbed background spectrum instead of just the amplitude-convention curvature.
+	a = exp((sf8) -2.0 * (sf8) M_PI * (line_freq / (sf8) 2.0) / samp_freq);
+	p1 = hp[0] = (sf8) 0.0;
+	for (i = 1; i < len; ++i) {
+		p0 = a * (p1 + (sf8) (data[i] - data[i - 1]));
+		hp[i] = a * (hp[i - 1] + p0 - p1);
+		p1 = p0;
+	}
+
+	// autocorrelation at the whole-cycle lag & a quarter cycle either side (background estimate)
+	num = den = (sf8) 0.0;
+	for (i = lag; i < len; ++i) {
+		num += hp[i] * hp[i - lag];
+		den += hp[i] * hp[i];
+	}
+	r_full = (den > (sf8) 0.0) ? (num / den) : (sf8) 0.0;
+	num = den = (sf8) 0.0;
+	for (i = lag - q; i < len; ++i) {
+		num += hp[i] * hp[i - (lag - q)];
+		den += hp[i] * hp[i];
+	}
+	r_lo = (den > (sf8) 0.0) ? (num / den) : (sf8) 0.0;
+	num = den = (sf8) 0.0;
+	for (i = lag + q; i < len; ++i) {
+		num += hp[i] * hp[i - (lag + q)];
+		den += hp[i] * hp[i];
+	}
+	r_hi = (den > (sf8) 0.0) ? (num / den) : (sf8) 0.0;
+
+	// mains power fraction -> amplitude convention -> calibration map to the true score's scale
+	// (floor/gain/gamma fitted on real data - see the FILT_LINE_NOISE_EST_* macro note)
+	est = (r_full - ((r_lo + r_hi) / (sf8) 2.0)) / (sf8) FILT_LINE_NOISE_EST_COMB_FACTOR_m13;
+	est = (est > (sf8) 0.0) ? sqrt(est) : (sf8) 0.0;
+	est = (est - (sf8) FILT_LINE_NOISE_EST_NULL_FLOOR_m13) / ((sf8) 1.0 - (sf8) FILT_LINE_NOISE_EST_NULL_FLOOR_m13);
+	if (est <= (sf8) 0.0)
+		est = (sf8) 0.0;
+	else
+		est = (sf8) FILT_LINE_NOISE_EST_GAIN_m13 * pow(est, (sf8) FILT_LINE_NOISE_EST_GAMMA_m13);
+	if (est > (sf8) 1.0)
+		est = (sf8) 1.0;
+
+	if (free_buffers == TRUE_m13)
+		CMP_free_buffers_m13(&est_buffers);
+
+	return_m13(est);
+}
+
+
 // Special thanks to Tej Stead for his work on this algorithm
 sf8	FILT_line_noise_m13(sf8 *y, sf8 *fy, si8 len, sf8 samp_freq, sf8 line_freq, si8 cycles_per_template, tern calculate_score, tern fast_mode, CMP_BUFFERS_m13 *lnf_buffers)
 {
@@ -37232,105 +38111,6 @@ sf8	FILT_line_noise_m13(sf8 *y, sf8 *fy, si8 len, sf8 samp_freq, sf8 line_freq, 
 		CMP_free_buffers_m13(&lnf_buffers);
 
 	return_m13(score);
-}
-
-
-sf8	FILT_line_noise_estimate_m13(si4 *data, si8 len, sf8 samp_freq, sf8 line_freq, CMP_BUFFERS_m13 *est_buffers)
-{
-	tern	free_buffers;
-	si8	i, k, best_k, lag, q, n_cycles;
-	sf8	samps_per_cycle, a, p0, p1, err, best_err, num, den, r_full, r_lo, r_hi, est, *hp;
-
-#ifdef FT_DEBUG_m13
-	G_push_function_m13();
-#endif
-
-	// FAST ESTIMATE of the line-noise score - the same 0-1 quantity FILT_line_noise_m13() returns with
-	// calculate_score, at ~1/45th the cost (one recursive pass + three lag dot products; no filtfilt, no
-	// template, no upsampling). See the FILT_LINE_NOISE_EST_* macro note for the method & its systematics.
-	// Returns -1 when the block holds too few mains cycles to estimate (same minimum as the true score).
-
-	if (data == NULL || len < 3 || samp_freq <= (sf8) 0.0 || line_freq <= (sf8) 0.0) {
-		G_set_error_m13(E_GEN_m13, "invalid line-noise estimate arguments");
-		return_m13((sf8) -1.0);
-	}
-	samps_per_cycle = samp_freq / line_freq;
-	n_cycles = (si8) ((sf8) len / samps_per_cycle);
-	if (n_cycles < FILT_LINE_NOISE_MIN_CYCLES_m13)
-		return_m13((sf8) -1.0);  // no estimate (not an error): same cycle minimum as the true score
-
-	// measurement lag: whole cycles, k chosen to minimize fractional-lag error (harmonic phase error scales
-	// with the fraction times the harmonic number, so a nearly integer multiple matters more than a small k)
-	best_k = 1;
-	best_err = (sf8) 1e30;
-	for (k = 1; k <= FILT_LINE_NOISE_EST_MAX_CYCLE_MULT_m13 && k <= (n_cycles >> 1); ++k) {
-		err = fabs(((sf8) k * samps_per_cycle) - round((sf8) k * samps_per_cycle));
-		if (err < best_err) {
-			best_err = err;
-			best_k = k;
-		}
-	}
-	lag = (si8) round((sf8) best_k * samps_per_cycle);
-	q = (si8) round(samps_per_cycle / (sf8) 4.0);
-	if (q < 1)
-		q = 1;
-
-	free_buffers = FALSE_m13;
-	if (est_buffers == NULL)
-		free_buffers = TRUE_m13;
-	est_buffers = CMP_allocate_buffers_m13(est_buffers, 1, len, sizeof(sf8), FALSE_m13, FALSE_m13);  // also reallocates
-	if (est_buffers == NULL)
-		return_m13((sf8) -1.0);
-	hp = (sf8 *) est_buffers->buffer[0];
-
-	// two-pole high-pass at line_freq / 2 (cascaded one-poles, 12 dB/oct; zero-phase is irrelevant for a
-	// power ratio, so no filtfilt is needed). Two poles matter: a single pole's 6 dB/oct skirt lets enough
-	// 1/f background into the power-ratio denominator on real physiological data that the calibration
-	// absorbed background spectrum instead of just the amplitude-convention curvature.
-	a = exp((sf8) -2.0 * (sf8) M_PI * (line_freq / (sf8) 2.0) / samp_freq);
-	p1 = hp[0] = (sf8) 0.0;
-	for (i = 1; i < len; ++i) {
-		p0 = a * (p1 + (sf8) (data[i] - data[i - 1]));
-		hp[i] = a * (hp[i - 1] + p0 - p1);
-		p1 = p0;
-	}
-
-	// autocorrelation at the whole-cycle lag & a quarter cycle either side (background estimate)
-	num = den = (sf8) 0.0;
-	for (i = lag; i < len; ++i) {
-		num += hp[i] * hp[i - lag];
-		den += hp[i] * hp[i];
-	}
-	r_full = (den > (sf8) 0.0) ? (num / den) : (sf8) 0.0;
-	num = den = (sf8) 0.0;
-	for (i = lag - q; i < len; ++i) {
-		num += hp[i] * hp[i - (lag - q)];
-		den += hp[i] * hp[i];
-	}
-	r_lo = (den > (sf8) 0.0) ? (num / den) : (sf8) 0.0;
-	num = den = (sf8) 0.0;
-	for (i = lag + q; i < len; ++i) {
-		num += hp[i] * hp[i - (lag + q)];
-		den += hp[i] * hp[i];
-	}
-	r_hi = (den > (sf8) 0.0) ? (num / den) : (sf8) 0.0;
-
-	// mains power fraction -> amplitude convention -> calibration map to the true score's scale
-	// (floor/gain/gamma fitted on real data - see the FILT_LINE_NOISE_EST_* macro note)
-	est = (r_full - ((r_lo + r_hi) / (sf8) 2.0)) / (sf8) FILT_LINE_NOISE_EST_COMB_FACTOR_m13;
-	est = (est > (sf8) 0.0) ? sqrt(est) : (sf8) 0.0;
-	est = (est - (sf8) FILT_LINE_NOISE_EST_NULL_FLOOR_m13) / ((sf8) 1.0 - (sf8) FILT_LINE_NOISE_EST_NULL_FLOOR_m13);
-	if (est <= (sf8) 0.0)
-		est = (sf8) 0.0;
-	else
-		est = (sf8) FILT_LINE_NOISE_EST_GAIN_m13 * pow(est, (sf8) FILT_LINE_NOISE_EST_GAMMA_m13);
-	if (est > (sf8) 1.0)
-		est = (sf8) 1.0;
-
-	if (free_buffers == TRUE_m13)
-		CMP_free_buffers_m13(&est_buffers);
-
-	return_m13(est);
 }
 
 
@@ -40722,7 +41502,11 @@ tern	FPS_write_m13(FPS_m13 *fps, si8 offset, si8 n_bytes, si8 n_items, ...)	// v
 	tern		write_header, header_only, full_file, data_written, leave_decrypted;
 	ui4		type_code;
 	si8		rel_bytes, bytes_to_write, nw, len, header_offset;
-	void		*encrypted_data, *decrypted_data;
+	void		*decrypted_data;
+	si1		saved_enc_levels[6];	// UH encryption bytes (section 2/3, ts/vid data, max record, reserved):
+						// the encryptors FLIP them negative->positive ("currently encrypted") as they
+						// encrypt - LEAVE_DECRYPTED must restore them with the body or the next write
+						// of this FPS (or a clone - the WRT segment roll) silently skips encryption
 	PROC_GLOBS_m13	*pg;
 	UH_m13		*uh;
 	va_list		v_arg;
@@ -40869,14 +41653,18 @@ tern	FPS_write_m13(FPS_m13 *fps, si8 offset, si8 n_bytes, si8 n_items, ...)	// v
 				case VID_DATA_TYPE_CODE_m13:
 				case VID_METADATA_TYPE_CODE_m13:
 				case REC_DATA_TYPE_CODE_m13:  // this mechanism assumes copying is faster than decrypting, but possible it's not
-					encrypted_data = malloc((size_t) n_bytes);
-					if (encrypted_data == NULL) {
+					// stage the PLAINTEXT aside & encrypt IN PLACE: the type-specific encryptors
+					// work through STORED pointers (fps->metadata, CPS block headers), so swapping
+					// data_ptrs to a staging buffer encrypted the ORIGINAL & wrote the staged
+					// PLAINTEXT under a header claiming encryption (2026-08-12: every rolled
+					// segment's cloned metadata prototype - see encrypted_roll_test)
+					decrypted_data = malloc((size_t) n_bytes);
+					if (decrypted_data == NULL) {
 						G_set_error_m13(E_ALLOC_m13, NULL);
 						return_m13(FALSE_m13);
 					}
-					decrypted_data = (void *) fps->data_ptrs;  // save pointer
-					fps->data_ptrs = (ui1 *) encrypted_data;  // swap memory for encryption & write
-					memcpy(encrypted_data, decrypted_data, (size_t) n_bytes);  // encrypted below
+					memcpy(decrypted_data, fps->data_ptrs, (size_t) n_bytes);  // plaintext copy (restored after the write)
+					memcpy((void *) saved_enc_levels, (void *) &uh->metadata_section_2_encryption, sizeof(saved_enc_levels));
 					leave_decrypted = TRUE_m13;
 					break;
 			}
@@ -40904,8 +41692,9 @@ tern	FPS_write_m13(FPS_m13 *fps, si8 offset, si8 n_bytes, si8 n_items, ...)	// v
 			}
 			if (encrypted == FALSE_m13) {
 				if (leave_decrypted == TRUE_m13) {  // restore the caller's decrypted buffer before bailing
-					fps->data_ptrs = (ui1 *) decrypted_data;
-					free(encrypted_data);
+					memcpy(fps->data_ptrs, decrypted_data, (size_t) n_bytes);
+					memcpy((void *) &uh->metadata_section_2_encryption, (void *) saved_enc_levels, sizeof(saved_enc_levels));
+					free(decrypted_data);
 				}
 				return_m13(FALSE_m13);
 			}
@@ -40948,7 +41737,7 @@ tern	FPS_write_m13(FPS_m13 *fps, si8 offset, si8 n_bytes, si8 n_items, ...)	// v
 		// write universal header
 		header_offset = FPS_header_offset_m13(fps, NULL);
 		if (header_offset == FALSE_m13) {
-			if (leave_decrypted == TRUE_m13) { fps->data_ptrs = (ui1 *) decrypted_data; free(encrypted_data); }  // restore before bailing (don't leak the encryption copy / leave data_ptrs dangling)
+			if (leave_decrypted == TRUE_m13) { memcpy(fps->data_ptrs, decrypted_data, (size_t) n_bytes); memcpy((void *) &uh->metadata_section_2_encryption, (void *) saved_enc_levels, sizeof(saved_enc_levels)); free(decrypted_data); }  // restore before bailing (don't leak the plaintext copy)
 			return_m13(FALSE_m13);
 		}
 		
@@ -40962,7 +41751,7 @@ tern	FPS_write_m13(FPS_m13 *fps, si8 offset, si8 n_bytes, si8 n_items, ...)	// v
 		nw = fwrite_m13(uh, sizeof(ui1), (size_t) bytes_to_write, fps->params.fp);
 		if (nw != bytes_to_write) {
 			G_set_error_m13(E_FWRITE_m13, "error writing universal header");
-			if (leave_decrypted == TRUE_m13) { fps->data_ptrs = (ui1 *) decrypted_data; free(encrypted_data); }
+			if (leave_decrypted == TRUE_m13) { memcpy(fps->data_ptrs, decrypted_data, (size_t) n_bytes); memcpy((void *) &uh->metadata_section_2_encryption, (void *) saved_enc_levels, sizeof(saved_enc_levels)); free(decrypted_data); }
 			return_m13(FALSE_m13);
 		}
 		
@@ -40975,7 +41764,7 @@ tern	FPS_write_m13(FPS_m13 *fps, si8 offset, si8 n_bytes, si8 n_items, ...)	// v
 		FPS_seek_m13(fps, offset);
 		nw = fwrite_m13(fps->data_ptrs, sizeof(ui1), (size_t) n_bytes, fps->params.fp);
 		if (nw != n_bytes) {
-			if (leave_decrypted == TRUE_m13) { fps->data_ptrs = (ui1 *) decrypted_data; free(encrypted_data); }
+			if (leave_decrypted == TRUE_m13) { memcpy(fps->data_ptrs, decrypted_data, (size_t) n_bytes); memcpy((void *) &uh->metadata_section_2_encryption, (void *) saved_enc_levels, sizeof(saved_enc_levels)); free(decrypted_data); }
 			return_m13(FALSE_m13);
 		}
 	}
@@ -40990,15 +41779,294 @@ tern	FPS_write_m13(FPS_m13 *fps, si8 offset, si8 n_bytes, si8 n_items, ...)	// v
 		FPS_close_m13(fps);
 
 	// restore decrypted data
-	if (leave_decrypted == TRUE_m13) {
-		fps->data_ptrs = (ui1 *) decrypted_data;
-		free(encrypted_data);
+	if (leave_decrypted == TRUE_m13) {  // restore the plaintext over the in-place-encrypted bytes (body AND the UH level bytes the encryptors flipped)
+		memcpy(fps->data_ptrs, decrypted_data, (size_t) n_bytes);
+		memcpy((void *) &uh->metadata_section_2_encryption, (void *) saved_enc_levels, sizeof(saved_enc_levels));
+		free(decrypted_data);
 	}
 
 	if (globals_m13->miscellaneous.access_times == TRUE_m13)
 		G_update_access_time_m13((LH_m13 *) fps);
 	
 	return_m13(TRUE_m13);
+}
+
+
+// D31: live CPU monitor - kernel-direct sources (Linux /proc/stat & hwmon sysfs; macOS Mach host
+// ticks). No forked utilities: a fork+exec perturbs the very cores being measured (& drags in
+// sysstat/lm-sensors dependencies + chip-name guessing). Loads are BUSY fractions (non-idle,
+// including kernel/softirq time - what a throttle actually cares about), computed as deltas
+// between successive reads on the same monitor; the first read spans since boot.
+#ifdef LINUX_m13
+typedef struct {  // hwmon temperature source paths (resolved once at open)
+	si1	package_path[256]; // "Package id 0" (coretemp) or Tdie/Tctl (k10temp); empty if none
+	si1	(*core_paths)[256]; // [n_physical]; empty entries where no sensor
+} HW_TEMP_PATHS_m13;
+#endif
+
+HW_CPU_MONITOR_m13	*HW_cpu_monitor_open_m13(void)
+{
+	HW_CPU_MONITOR_m13	*mon;
+	HW_PARAMS_m13		*hw_params;
+
+#ifdef FT_DEBUG_m13
+	G_push_function_m13();
+#endif
+
+	hw_params = &globals_m13->tables->HW_params;
+	if (hw_params->logical_cores == 0)
+		HW_get_core_info_m13();
+
+	mon = (HW_CPU_MONITOR_m13 *) calloc((size_t) 1, sizeof(HW_CPU_MONITOR_m13));
+	mon->n_logical = hw_params->logical_cores;
+	mon->n_physical = hw_params->physical_cores;
+	mon->loads = (sf8 *) calloc((size_t) mon->n_logical, sizeof(sf8));
+	mon->temps = (sf8 *) malloc((size_t) mon->n_physical * sizeof(sf8));
+	mon->prev_busy = (ui8 *) calloc((size_t) mon->n_logical, sizeof(ui8));
+	mon->prev_total = (ui8 *) calloc((size_t) mon->n_logical, sizeof(ui8));
+	{
+		si4	i;
+		for (i = 0; i < mon->n_physical; ++i)
+			mon->temps[i] = (sf8) NAN;
+	}
+	mon->temp = (sf8) NAN;
+	mon->temp_max = (sf8) NAN;
+
+#ifdef LINUX_m13
+	{	// resolve hwmon temperature paths once: match device NAME, not the sensors-utility alias
+		si1			name_path[128], name[64], label_path[192], label[64];
+		si4			h, t, core;
+		FILE			*fp;
+		HW_TEMP_PATHS_m13	*tp;
+
+		tp = (HW_TEMP_PATHS_m13 *) calloc((size_t) 1, sizeof(HW_TEMP_PATHS_m13));
+		tp->core_paths = calloc((size_t) mon->n_physical, sizeof(*tp->core_paths));
+		for (h = 0; h < 32; ++h) {
+			sprintf(name_path, "/sys/class/hwmon/hwmon%d/name", h);
+			fp = fopen(name_path, "r");
+			if (fp == NULL)
+				continue;
+			*name = 0;
+			if (fscanf(fp, "%63s", name) != 1)
+				*name = 0;
+			fclose(fp);
+			if (strcmp(name, "coretemp") == 0) {  // Intel: per-core + package
+				si4	slot = 0;
+
+				// "Core N" labels carry the chip's CORE IDS, which are SPARSE on hybrid parts
+				// (i9-13900K: 0,4,8..28 for P, 32..47 for E - and E-core MODULES share one sensor,
+				// so there are fewer sensors than cores). Using N as the slot index dropped every
+				// id >= n_physical & scattered the rest - six sensors in 24 slots, and a NAN-as-zero
+				// average downstream read 17.5 C on a box running at 89 (found 2026-08-14, DHN-1).
+				// Assign sensors to DENSE slots in encounter order (label order is core-id order).
+				for (t = 1; t < (mon->n_physical * 4) + 8; ++t) {
+					sprintf(label_path, "/sys/class/hwmon/hwmon%d/temp%d_label", h, t);
+					fp = fopen(label_path, "r");
+					if (fp == NULL)
+						continue;
+					*label = 0;
+					if (fgets(label, sizeof(label), fp) == NULL)
+						*label = 0;
+					fclose(fp);
+					if (strncmp(label, "Package id", 10) == 0)
+						sprintf(tp->package_path, "/sys/class/hwmon/hwmon%d/temp%d_input", h, t);
+					else if (sscanf(label, "Core %d", &core) == 1 && slot < mon->n_physical)
+						sprintf(tp->core_paths[slot++], "/sys/class/hwmon/hwmon%d/temp%d_input", h, t);
+				}
+				break;
+			} else if (strcmp(name, "k10temp") == 0 || strcmp(name, "zenpower") == 0) {  // AMD: die temp only
+				for (t = 1; t < 8; ++t) {
+					sprintf(label_path, "/sys/class/hwmon/hwmon%d/temp%d_label", h, t);
+					fp = fopen(label_path, "r");
+					if (fp == NULL)
+						continue;
+					*label = 0;
+					if (fgets(label, sizeof(label), fp) == NULL)
+						*label = 0;
+					fclose(fp);
+					if (strncmp(label, "Tdie", 4) == 0 || strncmp(label, "Tctl", 4) == 0) {
+						sprintf(tp->package_path, "/sys/class/hwmon/hwmon%d/temp%d_input", h, t);
+						break;
+					}
+				}
+				break;
+			}
+		}
+		{	// TjMax: the chip's own limit, from the package sensor's sibling crit (fallback max) file
+			si1	crit_path[288], *dot;
+			si4	mdeg;
+			FILE	*cfp;
+
+			if (*tp->package_path) {
+				strcpy(crit_path, tp->package_path);
+				dot = strstr(crit_path, "_input");
+				if (dot != NULL) {
+					strcpy(dot, "_crit");
+					cfp = fopen(crit_path, "r");
+					if (cfp == NULL) {
+						strcpy(dot, "_max");
+						cfp = fopen(crit_path, "r");
+					}
+					if (cfp != NULL) {
+						if (fscanf(cfp, "%d", &mdeg) == 1 && mdeg > 0)
+							mon->temp_max = (sf8) mdeg / (sf8) 1000.0;
+						fclose(cfp);
+					}
+				}
+			}
+		}
+		mon->temp_paths = (void *) tp;
+	}
+#endif
+
+	HW_cpu_monitor_read_m13(mon);  // baseline snapshot (loads read as since-boot; discarded by convention)
+
+	return_m13(mon);
+}
+
+
+tern	HW_cpu_monitor_read_m13(HW_CPU_MONITOR_m13 *mon)
+{
+#ifdef FT_DEBUG_m13
+	G_push_function_m13();
+#endif
+
+	if (mon == NULL) {
+		G_set_error_m13(E_GEN_m13, "NULL monitor");
+		return_m13(FALSE_m13);
+	}
+
+#ifdef LINUX_m13
+	{	// loads: /proc/stat cumulative jiffies (the same source sar/top read, without the fork)
+		si1	line[256];
+		si4	i, cpu;
+		ui8	u, n, s, idle, io, irq, sirq, steal, busy, total, d_busy, d_total;
+		FILE	*fp;
+
+		fp = fopen("/proc/stat", "r");
+		if (fp == NULL) {
+			G_set_error_m13(E_GEN_m13, "cannot read /proc/stat");
+			return_m13(FALSE_m13);
+		}
+		mon->load = (sf8) 0.0;
+		while (fgets(line, sizeof(line), fp) != NULL) {
+			if (strncmp(line, "cpu", 3) != 0)
+				break;
+			if (line[3] == ' ')
+				continue;  // aggregate line: mean computed from the per-core values below
+			steal = 0;  // absent on non-virtualized kernels
+			if (sscanf(line, "cpu%d %lu %lu %lu %lu %lu %lu %lu %lu", &cpu, &u, &n, &s, &idle, &io, &irq, &sirq, &steal) < 8)
+				continue;
+			if (cpu < 0 || cpu >= mon->n_logical)
+				continue;
+			busy = u + n + s + irq + sirq + steal;
+			total = busy + idle + io;
+			d_busy = busy - mon->prev_busy[cpu];
+			d_total = total - mon->prev_total[cpu];
+			mon->loads[cpu] = (d_total > 0) ? ((sf8) d_busy / (sf8) d_total) : (sf8) 0.0;
+			mon->prev_busy[cpu] = busy;
+			mon->prev_total[cpu] = total;
+		}
+		fclose(fp);
+		for (i = 0; i < mon->n_logical; ++i)
+			mon->load += mon->loads[i];
+		mon->load /= (sf8) mon->n_logical;
+	}
+	{	// temperatures: hwmon sysfs (millidegrees C, plain integer files)
+		si4			i, mdeg, n_read;
+		sf8			sum;
+		FILE			*fp;
+		HW_TEMP_PATHS_m13	*tp;
+
+		tp = (HW_TEMP_PATHS_m13 *) mon->temp_paths;
+		n_read = 0;
+		sum = (sf8) 0.0;
+		for (i = 0; i < mon->n_physical; ++i) {
+			mon->temps[i] = (sf8) NAN;
+			if (*tp->core_paths[i] == 0)
+				continue;
+			fp = fopen(tp->core_paths[i], "r");
+			if (fp == NULL)
+				continue;
+			if (fscanf(fp, "%d", &mdeg) == 1) {
+				mon->temps[i] = (sf8) mdeg / (sf8) 1000.0;
+				sum += mon->temps[i];
+				++n_read;
+			}
+			fclose(fp);
+		}
+		mon->temp = (sf8) NAN;
+		if (*tp->package_path) {
+			fp = fopen(tp->package_path, "r");
+			if (fp != NULL) {
+				if (fscanf(fp, "%d", &mdeg) == 1)
+					mon->temp = (sf8) mdeg / (sf8) 1000.0;
+				fclose(fp);
+			}
+		}
+		if (isnan(mon->temp) && n_read)
+			mon->temp = sum / (sf8) n_read;
+	}
+#endif
+
+#ifdef MACOS_m13
+	{	// loads: Mach per-core cumulative ticks (no temperatures without the SMC - left NAN)
+		natural_t			n_cpus;
+		mach_msg_type_number_t		info_cnt;
+		processor_cpu_load_info_t	info;
+		si4				i;
+		ui8				busy, total, d_busy, d_total;
+
+		if (host_processor_info(mach_host_self(), PROCESSOR_CPU_LOAD_INFO, &n_cpus, (processor_info_array_t *) &info, &info_cnt) != KERN_SUCCESS) {
+			G_set_error_m13(E_GEN_m13, "host_processor_info() error");
+			return_m13(FALSE_m13);
+		}
+		mon->load = (sf8) 0.0;
+		for (i = 0; i < (si4) n_cpus && i < mon->n_logical; ++i) {
+			busy = (ui8) info[i].cpu_ticks[CPU_STATE_USER] + (ui8) info[i].cpu_ticks[CPU_STATE_SYSTEM] + (ui8) info[i].cpu_ticks[CPU_STATE_NICE];
+			total = busy + (ui8) info[i].cpu_ticks[CPU_STATE_IDLE];
+			d_busy = busy - mon->prev_busy[i];
+			d_total = total - mon->prev_total[i];
+			mon->loads[i] = (d_total > 0) ? ((sf8) d_busy / (sf8) d_total) : (sf8) 0.0;
+			mon->prev_busy[i] = busy;
+			mon->prev_total[i] = total;
+			mon->load += mon->loads[i];
+		}
+		mon->load /= (sf8) mon->n_logical;
+		vm_deallocate(mach_task_self(), (vm_address_t) info, (vm_size_t) info_cnt * sizeof(natural_t));
+	}
+#endif
+
+#ifdef WINDOWS_m13
+	G_set_error_m13(E_GEN_m13, "HW_cpu_monitor not yet implemented on Windows");
+	return_m13(FALSE_m13);
+#endif
+
+	return_m13(TRUE_m13);
+}
+
+
+void	HW_cpu_monitor_close_m13(HW_CPU_MONITOR_m13 **mon_ptr)
+{
+	HW_CPU_MONITOR_m13	*mon;
+
+	if (mon_ptr == NULL || *mon_ptr == NULL)
+		return;
+	mon = *mon_ptr;
+#ifdef LINUX_m13
+	if (mon->temp_paths != NULL) {
+		free(((HW_TEMP_PATHS_m13 *) mon->temp_paths)->core_paths);
+		free(mon->temp_paths);
+	}
+#endif
+	free(mon->loads);
+	free(mon->temps);
+	free(mon->prev_busy);
+	free(mon->prev_total);
+	free(mon);
+	*mon_ptr = NULL;
+
+	return;
 }
 
 
@@ -41098,18 +42166,41 @@ tern	HW_get_core_info_m13()
 		return_m13(TRUE_m13);
 	}
 
+	// Topology maps start UNKNOWN on every platform (2026-08-17): only the Linux block below populates
+	// them, & the zeroed globals otherwise read as a VALID map claiming every logical lives on physical
+	// core 0 - the consumer guard is physical_core_ids[0] >= 0, so -1 must be set, not assumed
+	// (core_types == "" & physical_core_ids == -1 are the documented "unknown" values)
+	{
+		si4	i2;
+
+		memset(hw_params->core_types, 0, sizeof(hw_params->core_types));
+		for (i2 = 0; i2 < HW_MAX_LOGICAL_CORES_m13; ++i2)
+			hw_params->physical_core_ids[i2] = -1;
+	}
+
 #ifdef LINUX_m13
 	si1	*buf = NULL, *c;
 
 	if (system_pipe_m13(&buf, 0, "/usr/bin/lscpu", SP_DEFAULT_m13)) {
 		hw_params->logical_cores = (si4) get_nprocs_conf();
 	} else {
-		si4	threads_per_core, cores_per_socket, sockets;
+		si4	threads_per_core, cores_per_socket, sockets, lscpu_logical;
 		sf8	scaling, min_mhz, max_mhz;
-		
-		threads_per_core = cores_per_socket = sockets = 0;
+
+		threads_per_core = cores_per_socket = sockets = lscpu_logical = 0;
 		scaling = min_mhz = max_mhz = (sf8) 0.0;
-		
+
+		// the true logical count, from lscpu's own "CPU(s):" line (precedes Vendor ID in the output).
+		// physical x threads_per_core is WRONG on hybrid parts: "Thread(s) per core" describes only the
+		// SMT-capable performance cores, so an i9-13900K (8 P x 2 + 16 sibling-less E = 32 logical)
+		// computed as 24 x 2 = 48 - phantom cores that broke every affinity consumer downstream.
+		c = STR_match_end_m13("CPU(s):", buf);
+		if (c != NULL) {
+			while (*c == ' ')
+				++c;
+			sscanf_m13(c, "%d", &lscpu_logical);
+		}
+
 		c = STR_match_end_m13("Vendor ID:", buf);
 		if (c == NULL) {
 			c = buf;
@@ -41176,8 +42267,11 @@ tern	HW_get_core_info_m13()
 		}
 		
 		hw_params->physical_cores = sockets * cores_per_socket;
-		hw_params->logical_cores = hw_params->physical_cores * threads_per_core;
-		if (threads_per_core > 1)
+		if (lscpu_logical > 0)  // authoritative (hybrid-safe); arithmetic below only as fallback
+			hw_params->logical_cores = lscpu_logical;
+		else
+			hw_params->logical_cores = hw_params->physical_cores * threads_per_core;
+		if (hw_params->logical_cores > hw_params->physical_cores)
 			hw_params->hyperthreading = TRUE_m13;
 		else
 			hw_params->hyperthreading = FALSE_m13;
@@ -41187,9 +42281,97 @@ tern	HW_get_core_info_m13()
 		hw_params->current_speed = hw_params->maximum_speed * (scaling / (sf8) 100.0);
 	}
 
-	// P/E core detection not implemented in Linux => uniform CPU assumed
-	hw_params->performance_cores = hw_params->physical_cores;
-	hw_params->efficiency_cores = 0;
+	// Per-LOGICAL topology maps: core_types ("PPP..EEE") & physical_core_ids (dense physical index), plus
+	// true physical P/E counts. Type source is /sys/devices/cpu_core/cpus + cpu_atom/cpus - authoritative
+	// on Intel hybrid parts; absent (uniform CPUs, AMD, older kernels) => all 'P'. Core ids from per-cpu
+	// sysfs topology (package << 32 | core_id, collapsed to a dense first-seen index so SMT siblings share
+	// an id). These maps are what affinity consumers should reason from (PROC_encode_cpu_set_m13() does).
+	{
+		si4	lc, i2, k, n_keys, pkg, core;
+		si8	keys[HW_MAX_LOGICAL_CORES_m13], key;
+		si1	tpath[128], list[512], *p2;
+		tern	ids_ok;
+		FILE	*tfp;
+
+		lc = hw_params->logical_cores;
+		if (lc > HW_MAX_LOGICAL_CORES_m13)
+			lc = HW_MAX_LOGICAL_CORES_m13;
+		for (i2 = 0; i2 < HW_MAX_LOGICAL_CORES_m13; ++i2)
+			hw_params->physical_core_ids[i2] = -1;
+		memset(hw_params->core_types, 0, sizeof(hw_params->core_types));
+		for (i2 = 0; i2 < lc; ++i2)
+			hw_params->core_types[i2] = 'P';  // uniform until the atom list says otherwise
+		tfp = fopen("/sys/devices/cpu_atom/cpus", "r");  // E-core logical list, e.g. "16-31" or comma ranges
+		if (tfp != NULL) {
+			if (fgets(list, sizeof(list), tfp) != NULL) {
+				p2 = list;
+				while (*p2 >= '0' && *p2 <= '9') {
+					si4	a = (si4) strtol(p2, &p2, 10), b = a;
+
+					if (*p2 == '-')
+						b = (si4) strtol(p2 + 1, &p2, 10);
+					for (; a <= b && a < lc; ++a)
+						hw_params->core_types[a] = 'E';
+					if (*p2 == ',')
+						++p2;
+					else
+						break;
+				}
+			}
+			fclose(tfp);
+		}
+		ids_ok = TRUE_m13;
+		n_keys = 0;
+		for (i2 = 0; i2 < lc; ++i2) {
+			sprintf(tpath, "/sys/devices/system/cpu/cpu%d/topology/physical_package_id", i2);
+			tfp = fopen(tpath, "r");
+			if (tfp == NULL || fscanf(tfp, "%d", &pkg) != 1) {
+				if (tfp != NULL)
+					fclose(tfp);
+				ids_ok = FALSE_m13;
+				break;
+			}
+			fclose(tfp);
+			sprintf(tpath, "/sys/devices/system/cpu/cpu%d/topology/core_id", i2);
+			tfp = fopen(tpath, "r");
+			if (tfp == NULL || fscanf(tfp, "%d", &core) != 1) {
+				if (tfp != NULL)
+					fclose(tfp);
+				ids_ok = FALSE_m13;
+				break;
+			}
+			fclose(tfp);
+			key = ((si8) pkg << 32) | (si8) core;
+			for (k = 0; k < n_keys; ++k)
+				if (keys[k] == key)
+					break;
+			if (k == n_keys)
+				keys[n_keys++] = key;
+			hw_params->physical_core_ids[i2] = k;
+		}
+		if (ids_ok == FALSE_m13) {
+			for (i2 = 0; i2 < lc; ++i2)
+				hw_params->physical_core_ids[i2] = -1;
+			hw_params->performance_cores = hw_params->physical_cores;
+			hw_params->efficiency_cores = 0;
+		} else {  // physical P/E counts from the maps (count each physical core once, typed by its first logical)
+			ui1	seen[HW_MAX_LOGICAL_CORES_m13] = {0};
+			si4	p_cnt = 0, e_cnt = 0, cid;
+
+			for (i2 = 0; i2 < lc; ++i2) {
+				cid = hw_params->physical_core_ids[i2];
+				if (seen[cid])
+					continue;
+				seen[cid] = 1;
+				if (hw_params->core_types[i2] == 'E')
+					++e_cnt;
+				else
+					++p_cnt;
+			}
+			hw_params->performance_cores = p_cnt;
+			hw_params->efficiency_cores = e_cnt;
+		}
+	}
 
 	if (buf)
 		free_m13(buf);
@@ -41680,6 +42862,7 @@ tern	HW_get_memory_info_m13(void)
 
 	hw_params->system_memory_size = (ui8) (pages * page_size);
 	hw_params->system_page_size = (ui4) page_size;
+	hw_params->map_granularity = (ui4) page_size;  // Unix: mapping placement is page-granular
 #endif
 	
 #ifdef WINDOWS_m13
@@ -41696,6 +42879,7 @@ tern	HW_get_memory_info_m13(void)
 	
 	GetNativeSystemInfo(&system_info);
 	hw_params->system_page_size = (ui4) system_info.dwPageSize;
+	hw_params->map_granularity = (ui4) system_info.dwAllocationGranularity;  // 64 KB on every Windows to date: mapping PLACEMENT granularity, not the page
 #endif
 	
 	// Heap address range for freeable_m13() (Linux/Windows). heap_max stays BELOW the stack region (stack lives
@@ -41708,7 +42892,7 @@ tern	HW_get_memory_info_m13(void)
 	hw_params->heap_max_address = (hw_params->heap_base_address + hw_params->system_memory_size) - 1;  // address space is virtual so addresses can in theory be larger than physical system memory size
 	
 	pthread_mutex_unlock_m13(&globals_m13->tables->mutex);
-	
+
 	return_m13(TRUE_m13);
 }
 
@@ -42008,6 +43192,109 @@ tern	HW_init_tables_m13(void)
 }
 
 
+tern	HW_memory_usage_m13(sf8 *system_used_fraction, ui8 *process_rss_bytes)
+{
+	// stateless; either argument may be NULL. System fraction excludes reclaimable cache
+	// (Linux MemAvailable semantics); process figure is resident set size.
+#ifdef FT_DEBUG_m13
+	G_push_function_m13();
+#endif
+
+#ifdef LINUX_m13
+	{
+		si1	line[128];
+		ui8	total_kib, avail_kib, rss_kib;
+		FILE	*fp;
+
+		if (system_used_fraction != NULL) {
+			*system_used_fraction = (sf8) 0.0;
+			total_kib = avail_kib = 0;
+			fp = fopen("/proc/meminfo", "r");
+			if (fp == NULL) {
+				G_set_error_m13(E_GEN_m13, "cannot read /proc/meminfo");
+				return_m13(FALSE_m13);
+			}
+			while (fgets(line, sizeof(line), fp) != NULL) {
+				if (strncmp(line, "MemTotal:", 9) == 0)
+					sscanf(line + 9, "%lu", &total_kib);
+				else if (strncmp(line, "MemAvailable:", 13) == 0)
+					sscanf(line + 13, "%lu", &avail_kib);
+				if (total_kib && avail_kib)
+					break;
+			}
+			fclose(fp);
+			if (total_kib)
+				*system_used_fraction = (sf8) (total_kib - avail_kib) / (sf8) total_kib;
+		}
+		if (process_rss_bytes != NULL) {
+			*process_rss_bytes = 0;
+			fp = fopen("/proc/self/status", "r");
+			if (fp == NULL) {
+				G_set_error_m13(E_GEN_m13, "cannot read /proc/self/status");
+				return_m13(FALSE_m13);
+			}
+			while (fgets(line, sizeof(line), fp) != NULL) {
+				if (strncmp(line, "VmRSS:", 6) == 0) {
+					if (sscanf(line + 6, "%lu", &rss_kib) == 1)
+						*process_rss_bytes = rss_kib << 10;
+					break;
+				}
+			}
+			fclose(fp);
+		}
+	}
+#endif
+
+#ifdef MACOS_m13
+	{
+		if (system_used_fraction != NULL) {
+			vm_statistics64_data_t		vs;
+			mach_msg_type_number_t		cnt = HOST_VM_INFO64_COUNT;
+			ui8				page_size, used, total;
+
+			if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t) &vs, &cnt) != KERN_SUCCESS) {
+				G_set_error_m13(E_GEN_m13, "host_statistics64() error");
+				return_m13(FALSE_m13);
+			}
+			page_size = (ui8) G_page_size_m13();
+			used = ((ui8) vs.active_count + (ui8) vs.wire_count + (ui8) vs.compressor_page_count) * page_size;
+			total = globals_m13->tables->HW_params.system_memory_size;
+			*system_used_fraction = (total > 0) ? ((sf8) used / (sf8) total) : (sf8) 0.0;
+		}
+		if (process_rss_bytes != NULL) {
+			mach_task_basic_info_data_t	ti;
+			mach_msg_type_number_t		cnt = MACH_TASK_BASIC_INFO_COUNT;
+
+			if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t) &ti, &cnt) != KERN_SUCCESS) {
+				G_set_error_m13(E_GEN_m13, "task_info() error");
+				return_m13(FALSE_m13);
+			}
+			*process_rss_bytes = (ui8) ti.resident_size;
+		}
+	}
+#endif
+
+#ifdef WINDOWS_m13
+	{
+		if (system_used_fraction != NULL) {
+			MEMORYSTATUSEX	ms;
+
+			ms.dwLength = sizeof(ms);
+			if (GlobalMemoryStatusEx(&ms) == 0) {
+				G_set_error_m13(E_GEN_m13, "GlobalMemoryStatusEx() error");
+				return_m13(FALSE_m13);
+			}
+			*system_used_fraction = (sf8) (ms.ullTotalPhys - ms.ullAvailPhys) / (sf8) ms.ullTotalPhys;
+		}
+		if (process_rss_bytes != NULL)
+			*process_rss_bytes = 0;  // (PROCESS_MEMORY_COUNTERS needs psapi; add when a Windows app wants it)
+	}
+#endif
+
+	return_m13(TRUE_m13);
+}
+
+
 tern	HW_show_info_m13(void)
 {
 	si1		size_str[SIZE_STRING_BYTES_m13];
@@ -42131,6 +43418,20 @@ tern	HW_show_info_m13(void)
 // MARK: NETWORK FUNCTIONS  (NET)
 //*******************************//
 
+// static prototypes (alphabetical order can place callers before callees)
+#ifdef LINUX_m13
+static tern	NET_ethtool_ioctl_m13(const si1 *iface, si1 *speed_str, si1 *duplex_str);
+#endif
+static si8	NET_http_get_m13(const si1 *host, const si1 *path, si1 *response, si8 response_bytes, si4 timeout_ms);
+#if defined MACOS_m13 || defined LINUX_m13
+static tern	NET_ifaddrs_fill_m13(NET_PARAMS_m13 *np);
+static si4	NET_mtu_ioctl_m13(const si1 *iface);
+#endif
+#ifdef MACOS_m13
+static tern	NET_media_duplex_m13(const si1 *iface, si1 *duplex_str);
+#endif
+
+
 tern	NET_addr_set_m13(NET_ADDR_m13 *addr, const si1 *addr_str)
 {
 	ui1	tmp[NET_ADDR_BYTES_m13];
@@ -42242,6 +43543,51 @@ tern	NET_domain_to_ip_m13(const si1 *domain_name, si1 *ip)
 
 	return_m13(TRUE_m13);
 }
+
+
+#ifdef LINUX_m13
+static tern	NET_ethtool_ioctl_m13(const si1 *iface, si1 *speed_str, si1 *duplex_str)
+{
+	si4			fd;
+	ui4			speed;
+	struct ifreq		ifr;
+	struct ethtool_cmd	ecmd;
+
+	// what the ethtool binary asks the kernel, asked directly (SIOCETHTOOL) - the binary
+	// need not be installed.  ETHTOOL_GSET is the one-call legacy op: universally supported
+	// & ABI-stable (ETHTOOL_GLINKSETTINGS needs a two-call link-mode-mask handshake for
+	// nothing this table stores).  Wireless drivers do not implement the op - both outputs
+	// then read "unknown", as with the ethtool binary before.
+	strcpy(speed_str, "unknown");
+	strcpy(duplex_str, "unknown");
+	fd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (fd < 0)
+		return(FALSE_m13);
+	memset((void *) &ifr, 0, sizeof(ifr));
+	strncpy(ifr.ifr_name, iface, IFNAMSIZ - 1);
+	memset((void *) &ecmd, 0, sizeof(ecmd));
+	ecmd.cmd = ETHTOOL_GSET;
+	ifr.ifr_data = (void *) &ecmd;
+	if (ioctl(fd, SIOCETHTOOL, &ifr) < 0) {
+		close(fd);
+		return(FALSE_m13);
+	}
+	close(fd);
+	speed = ((ui4) ecmd.speed_hi << 16) | (ui4) ecmd.speed;
+	if (speed && speed != (ui4) 0xFFFF && speed != (ui4) 0xFFFFFFFF) {  // SPEED_UNKNOWN in half & full width
+		if (speed >= 1000 && (speed % 1000) == 0)
+			sprintf_m13(speed_str, "%u Gbps", speed / 1000);
+		else
+			sprintf_m13(speed_str, "%u Mbps", speed);
+	}
+	if (ecmd.duplex == DUPLEX_FULL)
+		strcpy(duplex_str, "full");
+	else if (ecmd.duplex == DUPLEX_HALF)
+		strcpy(duplex_str, "half");
+
+	return(TRUE_m13);
+}
+#endif  // LINUX_m13
 
 
 ui1	NET_family_from_af_m13(si4 af)
@@ -42377,23 +43723,30 @@ tern	NET_get_adapter_m13(NET_PARAMS_m13 *np, tern copy_global)
 				}
 			}
 			np->MTU = (si4) pCurrAddress->Mtu;
-			if (pCurrAddress->Flags & IP_ADAPTER_RECEIVE_ONLY)
-				strcpy_m13(np->duplex, "false");
-			else
-				strcpy_m13(np->duplex, "true");
-			if (pCurrAddress->ReceiveLinkSpeed >= 1000000000)
-				sprintf_m13(np->link_speed, "1 Gbps");
-			else if (pCurrAddress->ReceiveLinkSpeed >= 100000000)
-				sprintf_m13(np->link_speed, "100 Mbps");
-			else if (pCurrAddress->ReceiveLinkSpeed >= 10000000)
-				sprintf_m13(np->link_speed, "10 Mbps");
+			{	// true duplex state (the old code stored "true"/"false" from the
+				// RECEIVE_ONLY flag here, which is not duplex at all)
+				MIB_IF_ROW2	row;
+
+				memset((void *) &row, 0, sizeof(row));
+				row.InterfaceIndex = pCurrAddress->IfIndex;
+				strcpy(np->duplex, "unknown");
+				if (GetIfEntry2(&row) == NO_ERROR) {
+					if (row.MediaDuplexState == MediaDuplexStateFull)
+						strcpy(np->duplex, "full");
+					else if (row.MediaDuplexState == MediaDuplexStateHalf)
+						strcpy(np->duplex, "half");
+				}
+			}
+			if (pCurrAddress->ReceiveLinkSpeed >= 1000000000)  // normalized format (matches the Unix backends)
+				sprintf_m13(np->link_speed, "%g Gbps", (sf8) pCurrAddress->ReceiveLinkSpeed / (sf8) 1e9);
+			else if (pCurrAddress->ReceiveLinkSpeed)
+				sprintf_m13(np->link_speed, "%g Mbps", (sf8) pCurrAddress->ReceiveLinkSpeed / (sf8) 1e6);
 			else
 				strcpy(np->link_speed, "unknown");
-			if (pCurrAddress->OperStatus == 1)
+			if (pCurrAddress->OperStatus == IfOperStatusUp)
 				np->active = TRUE_m13;
-			else if
-				(pCurrAddress->OperStatus == 2)
-				np->active = TRUE_m13;
+			else if (pCurrAddress->OperStatus == IfOperStatusDown)
+				np->active = FALSE_m13;  // was TRUE_m13: OperStatus 2 is DOWN - reported active for down adapters
 			else
 				np->active = UNKNOWN_m13;
 			break;  // found correct entry - exit loop
@@ -42421,20 +43774,21 @@ tern	NET_get_adapter_m13(NET_PARAMS_m13 *np, tern copy_global)
 }
 
 
-#ifdef LINUX_m13
+#if defined MACOS_m13 || defined LINUX_m13
 tern	NET_get_config_m13(NET_PARAMS_m13 *np, tern copy_global)
 {
 	tern	global_np;
-	si1	tmp_str[256], *buffer, *c, *c2, *pattern;
-	ui1	mask[NET_IPV4_ADDRESS_BYTES_m13];
 
 #ifdef FT_DEBUG_m13
 	G_push_function_m13();
 #endif
 
-	// (get all info present in same buffers regardless of which was requested)
+	// (get all info present in same pass regardless of which was requested)
 	//
-	// called for mtu, MAC_address, LAN_IPv4, plugged_in, & active in Linux
+	// called for mtu, MAC_address, LAN address, plugged_in, & active on Linux & MacOS;
+	// link_speed & duplex additionally on MacOS (Linux fills those in NET_get_ethtool_m13()).
+	// All fields come from the kernel natively (getifaddrs/ioctl) - ifconfig was only ever
+	// a client of the same data, & parsing its output cost a shell per query.
 
 	if (*np->interface_name == 0) {
 		G_warning_message_m13("%s(): no interface name\n", __FUNCTION__);
@@ -42453,257 +43807,21 @@ tern	NET_get_config_m13(NET_PARAMS_m13 *np, tern copy_global)
 			return_m13(TRUE_m13);
 		}
 	}
-	
-	// get ifconfig() output
-	sprintf_m13(tmp_str, "/usr/sbin/ifconfig %s", np->interface_name);
-	buffer = NULL;
-	if (system_pipe_m13(&buffer, 0, tmp_str, SP_BEHAVIOR_PASSED_m13, RETURN_ON_FAIL_m13 | SUPPRESS_ERROR_OUTPUT_m13)) {
-		if (buffer)
-			free_m13(buffer);
+
+	if (NET_ifaddrs_fill_m13(np) == FALSE_m13) {
 		if (global_np == TRUE_m13)
 			pthread_mutex_unlock_m13(&globals_m13->tables->mutex);
 		return_m13(FALSE_m13);
 	}
 
-	// mtu
-	pattern = "mtu ";
-	if ((c = STR_match_end_m13(pattern, buffer)) == NULL) {
-		G_warning_message_m13("%s(): Could not match pattern \"%s\" in output of ifconfig() for interface \"%s\"\n", __FUNCTION__, pattern, np->interface_name);
-		np->MTU = 0;
-	} else {
-		sscanf(c, "%d", &np->MTU);
-	}
-	
-	// MAC address
-	pattern = "ether ";
-	np->MAC_address_num = 0;
-	if ((c = STR_match_end_m13(pattern, buffer)) == NULL) {
-		G_warning_message_m13("%s(): Could not match pattern \"%s\" in output of ifconfig() for interface \"%s\"\n", __FUNCTION__, pattern, np->interface_name);
-		strcpy(np->MAC_address_string, "unknown");
-	} else {
-		sscanf(c, "%17s", np->MAC_address_string);
-		STR_to_upper_m13(np->MAC_address_string);
-		sscanf(np->MAC_address_string, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx", np->MAC_address_bytes, np->MAC_address_bytes + 1, np->MAC_address_bytes + 2, np->MAC_address_bytes + 3, np->MAC_address_bytes + 4, np->MAC_address_bytes + 5);  // network byte order
-	}
-
-	// LAN address (IPv4 first)
-	if (*np->LAN_address.string == 0) {
-		pattern = "inet ";
-		if ((c = STR_match_end_m13(pattern, buffer)) == NULL) {
-			// no IPv4 on this interface; leave family NONE so the IPv6 pass below can fill it
-			np->LAN_address.family = NET_ADDR_FAM_NONE_m13;
-			*np->LAN_address.string = 0;
-		} else {
-			sscanf(c, "%255s", tmp_str);  // dotted-quad literal
-			NET_addr_set_m13(&np->LAN_address, tmp_str);  // fills family + bytes (network order) + canonical string
-		}
-	}
-
-	// subnet mask (IPv4) -> CIDR prefix length; only meaningful when LAN_address is IPv4
-	pattern = "netmask ";
-	if ((c = STR_match_end_m13(pattern, buffer)) == NULL) {
-		np->LAN_address.prefix_len = NET_ADDR_PREFIX_NO_ENTRY_m13;
-	} else {
-		mask[0] = mask[1] = mask[2] = mask[3] = 0;
-		sscanf(c, "%hhu.%hhu.%hhu.%hhu", mask, mask + 1, mask + 2, mask + 3);
-		np->LAN_address.prefix_len = NET_v4_prefix_from_mask_m13(mask);
-	}
-
-	// MED dual-stack: LAN IPv6 discovery. If no IPv4 was found, capture the first global (non-link-local) IPv6 address.
-	// ifconfig lines look like "inet6 2001:db8::1 prefixlen 64 ..." or "inet6 fe80::1%eth0 prefixlen 64 scopeid ...".
-	if (np->LAN_address.family == NET_ADDR_FAM_NONE_m13) {
-		pattern = "inet6 ";
-		c = buffer;
-		while ((c = STR_match_end_m13(pattern, c)) != NULL) {
-			sscanf(c, "%255s", tmp_str);  // e.g. "2001:db8::1" or "fe80::1%eth0" or "2001:db8::1/64"
-			// strip any "%iface" zone id and any "/prefix" suffix
-			for (c2 = tmp_str; *c2; ++c2) {
-				if (*c2 == '%' || *c2 == '/') {
-					*c2 = 0;
-					break;
-				}
-			}
-			// skip link-local (fe80::/10 -> fe8, fe9, fea, feb prefixes)
-			if (strncasecmp(tmp_str, "fe8", 3) && strncasecmp(tmp_str, "fe9", 3) && strncasecmp(tmp_str, "fea", 3) && strncasecmp(tmp_str, "feb", 3)) {
-				if (NET_addr_set_m13(&np->LAN_address, tmp_str) == TRUE_m13) {
-					np->LAN_address.prefix_len = NET_ADDR_PREFIX_NO_ENTRY_m13;  // v4 netmask does not apply to a v6 address
-					break;  // keep the first global IPv6 address
-				}
-			}
-		}
-	}
-
-	// status
-	pattern = "UP";
-	if ((c = STR_match_end_m13(pattern, buffer)) == NULL)
-		np->active = FALSE_m13;
-	else
-		np->active = TRUE_m13;
- 
-	pattern = "RUNNING";
-	if ((c = STR_match_end_m13(pattern, buffer)) == NULL)
-		np->plugged_in = FALSE_m13;
-	else
-		np->plugged_in = TRUE_m13;
-
-	// clean up
-	free_m13(buffer);  // buffer from system_pipe_m13() => allocation-tracked
-
-	if (copy_global == TRUE_m13) {
-		pthread_mutex_lock_m13(&globals_m13->tables->mutex);
-		globals_m13->tables->NET_params.MTU = np->MTU;
-		strcpy(globals_m13->tables->NET_params.MAC_address_string, np->MAC_address_string);
-		globals_m13->tables->NET_params.MAC_address_num = np->MAC_address_num;
-		globals_m13->tables->NET_params.LAN_address = np->LAN_address;  // whole-struct copy (family + bytes + string + prefix_len)
-		globals_m13->tables->NET_params.plugged_in = np->plugged_in;
-		globals_m13->tables->NET_params.active = np->active;
-		pthread_mutex_unlock_m13(&globals_m13->tables->mutex);
-	} else if (global_np == TRUE_m13) {
-		pthread_mutex_unlock_m13(&globals_m13->tables->mutex);
-	}
-
-	return_m13(TRUE_m13);
-}
-#endif  // LINUX_m13
-
-
-#ifdef MACOS_m13
-tern	NET_get_config_m13(NET_PARAMS_m13 *np, tern copy_global)
-{
-	tern	global_np;
-	si1	tmp_str[256], *buffer, *c, *c2, *pattern;
-	ui1	mask[NET_IPV4_ADDRESS_BYTES_m13];
-
-#ifdef FT_DEBUG_m13
-	G_push_function_m13();
-#endif
-
-	// (get all info present in same buffer regardless of which was requested)
-	//
-	// called for mtu, MAC_address, LAN_IPv4, plugged_in, active, link_speed, & duplex fields in MacOS
-
-	if (*np->interface_name == 0) {
-		G_warning_message_m13("%s(): no interface name\n", __FUNCTION__);
-		return_m13(FALSE_m13);
-	}
-
-	global_np = FALSE_m13;
-	if (copy_global == FALSE_m13)
-		if (np == &globals_m13->tables->NET_params)
-			global_np = TRUE_m13;
-
-	if (global_np == TRUE_m13) {
-		pthread_mutex_lock_m13(&globals_m13->tables->mutex);
-		if (*np->MAC_address_string)  {  // may have been done by another thread while waiting
-			pthread_mutex_unlock_m13(&globals_m13->tables->mutex);
-			return_m13(TRUE_m13);
-		}
-	}
-	
-	// get ifconfig() output
-	sprintf_m13(tmp_str, "/sbin/ifconfig %s", np->interface_name);
-	buffer = NULL;
-	if (system_pipe_m13(&buffer, 0, tmp_str, SP_BEHAVIOR_PASSED_m13, (RETURN_ON_FAIL_m13 | SUPPRESS_ERROR_OUTPUT_m13))) {
-		if (buffer)
-			free_m13(buffer);
-		if (global_np == TRUE_m13)
-			pthread_mutex_unlock_m13(&globals_m13->tables->mutex);
-		return_m13(FALSE_m13);
-	}
-
-	// parse ifconfig() output
-	pattern = "mtu ";
-	if ((c = STR_match_end_m13(pattern, buffer)) == NULL) {
-		G_warning_message_m13("%s(): Could not match pattern \"%s\" in output of ifconfig() for interface \"%s\"\n", __FUNCTION__, pattern, np->interface_name);
-		np->MTU = 0;
-	} else {
-		sscanf(c, "%d", &np->MTU);
-	}
-	
-	pattern = "ether ";
-	if ((c = STR_match_end_m13(pattern, buffer)) == NULL) {
-		G_warning_message_m13("%s(): Could not match pattern \"%s\" in output of ifconfig() for interface \"%s\"\n", __FUNCTION__, pattern, np->interface_name);
-		np->MAC_address_num = 0;
-		strcpy(np->MAC_address_string, "unknown");
-	} else {
-		sscanf(c, "%17s", np->MAC_address_string);
-		STR_to_upper_m13(np->MAC_address_string);
-		sscanf(np->MAC_address_string, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx", np->MAC_address_bytes, np->MAC_address_bytes + 1, np->MAC_address_bytes + 2, np->MAC_address_bytes + 3, np->MAC_address_bytes + 4, np->MAC_address_bytes + 5);  // network byte order
-	}
-
-	// MED dual-stack: mirrored from Linux path, UNVERIFIED on this OS
-	if (*np->LAN_address.string == 0) {  // may have been filled in by NET_get_lan_ipv4_address_m13()
-		pattern = "inet ";
-		if ((c = STR_match_end_m13(pattern, buffer)) == NULL) {
-			// no IPv4 on this interface; leave family NONE so the IPv6 pass below can fill it
-			np->LAN_address.family = NET_ADDR_FAM_NONE_m13;
-			*np->LAN_address.string = 0;
-		} else {
-			sscanf(c, "%255s", tmp_str);  // dotted-quad literal
-			NET_addr_set_m13(&np->LAN_address, tmp_str);  // fills family + bytes (network order) + canonical string
-		}
-	}
-
-	// subnet mask (IPv4, hex on MacOS) -> CIDR prefix length; only meaningful when LAN_address is IPv4
-	pattern = "netmask 0x";
-	if ((c = STR_match_end_m13(pattern, buffer)) == NULL) {
-		np->LAN_address.prefix_len = NET_ADDR_PREFIX_NO_ENTRY_m13;
-	} else {
-		mask[0] = mask[1] = mask[2] = mask[3] = 0;
-		sscanf(c, "%02hhx%02hhx%02hhx%02hhx", mask, mask + 1, mask + 2, mask + 3);  // network byte order
-		np->LAN_address.prefix_len = NET_v4_prefix_from_mask_m13(mask);
-	}
-
-	// MED dual-stack: mirrored from Linux path, UNVERIFIED on this OS
-	// LAN IPv6 discovery: if no IPv4 was found, capture the first global (non-link-local) IPv6 address.
-	// MacOS ifconfig lines look like "inet6 2001:db8::1 prefixlen 64 ..." or "inet6 fe80::1%en0 prefixlen 64 scopeid ...".
-	if (np->LAN_address.family == NET_ADDR_FAM_NONE_m13) {
-		pattern = "inet6 ";
-		c = buffer;
-		while ((c = STR_match_end_m13(pattern, c)) != NULL) {
-			sscanf(c, "%255s", tmp_str);  // e.g. "2001:db8::1" or "fe80::1%en0"
-			for (c2 = tmp_str; *c2; ++c2) {  // strip "%iface" zone id and "/prefix" suffix
-				if (*c2 == '%' || *c2 == '/') {
-					*c2 = 0;
-					break;
-				}
-			}
-			if (strncasecmp(tmp_str, "fe8", 3) && strncasecmp(tmp_str, "fe9", 3) && strncasecmp(tmp_str, "fea", 3) && strncasecmp(tmp_str, "feb", 3)) {  // skip link-local
-				if (NET_addr_set_m13(&np->LAN_address, tmp_str) == TRUE_m13) {
-					np->LAN_address.prefix_len = NET_ADDR_PREFIX_NO_ENTRY_m13;  // v4 netmask does not apply to a v6 address
-					break;  // keep the first global IPv6 address
-				}
-			}
-		}
-	}
-
-	pattern = "media: ";
-	if ((c = STR_match_end_m13(pattern, buffer)) == NULL) {
-		G_warning_message_m13("%s(): Could not match pattern \"%s\" in output of ifconfig() for interface \"%s\"\n", __FUNCTION__, pattern, np->interface_name);
+	#ifdef MACOS_m13
+	// link speed was set from if_data.ifi_baudrate in NET_ifaddrs_fill_m13() (drivers that
+	// report none leave it empty); duplex comes from the media word
+	if (*np->link_speed == 0)
 		strcpy(np->link_speed, "unknown");
-		strcpy(np->duplex, "unknown");
-	} else {
-		sscanf(c, "%15s %15s", np->link_speed, np->duplex);
-	}
-
-	pattern = "status: ";
-	if ((c = STR_match_end_m13(pattern, buffer)) == NULL) {
-		G_warning_message_m13("%s(): Could not match pattern \"%s\" in output of ifconfig() for interface \"%s\"\n", __FUNCTION__, pattern, np->interface_name);
-		np->active = UNKNOWN_m13;
-	} else {
-		sscanf(c, "%255s", tmp_str);
-		if (strcmp_m13(tmp_str, "active") == 0)
-			np->active = TRUE_m13;
-		else if (strcmp_m13(tmp_str, "inactive") == 0)
-			np->active = FALSE_m13;
-		else {
-			G_warning_message_m13("%s(): Unrecognized value (\"%s\") for field \"%s\" in output of ifconfig() for interface \"%s\"\n", __FUNCTION__, tmp_str, pattern, np->interface_name);
-			np->active = UNKNOWN_m13;
-		}
-	}
-	
-	// clean up
-	free_m13(buffer);  // buffer from system_pipe_m13() => allocation-tracked
+	strcpy(np->duplex, "unknown");
+	NET_media_duplex_m13(np->interface_name, np->duplex);
+	#endif
 
 	if (copy_global == TRUE_m13) {
 		pthread_mutex_lock_m13(&globals_m13->tables->mutex);
@@ -42713,8 +43831,10 @@ tern	NET_get_config_m13(NET_PARAMS_m13 *np, tern copy_global)
 		globals_m13->tables->NET_params.LAN_address = np->LAN_address;  // whole-struct copy (family + bytes + string + prefix_len)
 		globals_m13->tables->NET_params.plugged_in = np->plugged_in;
 		globals_m13->tables->NET_params.active = np->active;
+		#ifdef MACOS_m13
 		strcpy(globals_m13->tables->NET_params.link_speed, np->link_speed);
 		strcpy(globals_m13->tables->NET_params.duplex, np->duplex);
+		#endif
 		pthread_mutex_unlock_m13(&globals_m13->tables->mutex);
 	} else if (global_np == TRUE_m13) {
 		pthread_mutex_unlock_m13(&globals_m13->tables->mutex);
@@ -42722,31 +43842,34 @@ tern	NET_get_config_m13(NET_PARAMS_m13 *np, tern copy_global)
 
 	return_m13(TRUE_m13);
 }
-#endif  // MACOS_m13
+#endif  // MACOS_m13 || LINUX_m13
 
 
 #ifdef WINDOWS_m13
 tern	NET_get_config_m13(NET_PARAMS_m13 *np, tern copy_global)
 {
-	tern		global_np;
-	si1 	tmp_str[256], *buffer, *iface_start, *c, *c2, *pattern;
-	si4 	i, r_val, attempts;
-	ui1	mask[NET_IPV4_ADDRESS_BYTES_m13];
-	ui1			*b;
-	DWORD 			dwSize, dwRetVal;
-	ULONG			flags, family, outBufLen;
-	LPVOID 			lpMsgBuf;
+	tern				global_np;
+	si1				fname[64], tmp_str[NET_ADDR_STR_BYTES_m13];
+	ui1				*b;
+	si4				i;
+	DWORD				dwRetVal;
+	ULONG				outBufLen;
 	PIP_ADAPTER_ADDRESSES		pAddresses, pCurrAddress;
 	PIP_ADAPTER_UNICAST_ADDRESS	pUnicast;
+	struct sockaddr_in		*s4;
 	struct sockaddr_in6		*s6;
+	NET_ADDR_m13			v6_addr;
 
 #ifdef FT_DEBUG_m13
 	G_push_function_m13();
 #endif
 
-	// (get all info present in same buffers regardless of which was requested)
+	// (get all info present in same pass regardless of which was requested)
 	//
-	// called for host_name, MAC_address, LAN_IPv4, & plugged_in fields in Windows
+	// called for host_name, MAC_address, LAN address, & plugged_in fields in Windows.
+	// Native GetAdaptersAddresses() replaces parsing "ipconfig /all"; the interface_name
+	// is the adapter FriendlyName - the same name ipconfig printed after "adapter".
+	// MED dual-stack: mirrored from the Unix path, UNVERIFIED on this OS
 
 	if (*np->interface_name == 0) {
 		G_warning_message_m13("%s(): no interface name\n", __FUNCTION__);
@@ -42765,172 +43888,74 @@ tern	NET_get_config_m13(NET_PARAMS_m13 *np, tern copy_global)
 			return_m13(TRUE_m13);
 		}
 	}
-		
-	// get ipconfig() output
-	buffer = NULL;
-	if (system_pipe_m13(&buffer, 0, "ipconfig /all", SP_BEHAVIOR_PASSED_m13, (RETURN_ON_FAIL_m13 | SUPPRESS_ERROR_OUTPUT_m13))) {
-		if (buffer)
-			free_m13(buffer);
-		if (global_np == TRUE_m13)
-			pthread_mutex_unlock_m13(&globals_m13->tables->mutex);
-		return_m13(FALSE_m13);
-	}
 
-	// parse ipconfig() output
-	if (*np->host_name == 0) {
-		pattern = "Host Name";
-		if ((c = STR_match_end_m13(pattern, buffer)) == NULL) {
-			if (gethostname(np->host_name, sizeof(np->host_name)) == -1) {
-				G_warning_message_m13("%s(): Could not match pattern \"%s\" in output of ipconfig() for interface \"%s\"\n", __FUNCTION__, pattern, np->interface_name);
-				strcpy(np->host_name, "unknown");
-			}
-		} else {
-			while (*c++ != ':');
-			++c;
-			c2 = np->host_name;
-			while (*c != '\r' && *c != '\n' && *c != 0)
-				*c2++ = *c++;
-			*c2 = 0;
+	if (*np->host_name == 0)
+		if (gethostname(np->host_name, sizeof(np->host_name)) == -1)
+			strcpy(np->host_name, "unknown");
+
+	outBufLen = 15000;  // MS-recommended starting size
+	pAddresses = NULL;
+	dwRetVal = ERROR_BUFFER_OVERFLOW;
+	for (i = 0; i < 3 && dwRetVal == ERROR_BUFFER_OVERFLOW; ++i) {
+		pAddresses = (PIP_ADAPTER_ADDRESSES) malloc((size_t) outBufLen);
+		dwRetVal = GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_INCLUDE_PREFIX, NULL, pAddresses, &outBufLen);
+		if (dwRetVal == ERROR_BUFFER_OVERFLOW) {
+			free(pAddresses);
+			pAddresses = NULL;
 		}
 	}
-	
-	// search for interface entry
-	sprintf_m13(tmp_str, "LAN adapter %s:", np->interface_name);  // pattern
-	if ((c = STR_match_end_m13(tmp_str, buffer)) == NULL) {
-		G_warning_message_m13("%s(): Could not find interface \"%s\" in output of ipconfig()\n", __FUNCTION__, np->interface_name);
-		if (global_np == TRUE_m13)
-			pthread_mutex_unlock_m13(&globals_m13->tables->mutex);
-		return_m13(FALSE_m13);
-	}
-	iface_start = c;  // start all subsequent searches fro this point
-
-	// find next network adapter
-	pattern = "adapter";
-	if ((c = STR_match_start_m13(pattern, iface_start)))
-		*c = 0;  // terminate all subsequent searches here
-
-	np->plugged_in = TRUE_m13;
-	pattern = "Media disconnected";
-	if ((c = STR_match_end_m13(pattern, iface_start)))
-		np->plugged_in = FALSE_m13;
-
-	pattern = "Physical Address";
-	if ((c = STR_match_end_m13(pattern, iface_start)) == NULL) {
-		G_warning_message_m13("%s(): Could not match pattern \"%s\" in output of ipconfig() for interface \"%s\"\n", __FUNCTION__, pattern, np->interface_name);
-		np->MAC_address_num = 0;
-		strcpy(np->MAC_address_string, "unknown");
-	} else {
-		while (*c++ != ':');
-		++c;
-		c2 = np->MAC_address_string;
-		while (*c != '\r' && *c != '\n' && *c != 0)
-			*c2++ = *c++;
-		*c2 = 0;
-		STR_replace_char_m13('-', ':', np->MAC_address_string);
-		STR_to_upper_m13(np->MAC_address_string);
-		sscanf(np->MAC_address_string, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx", np->MAC_address_bytes, np->MAC_address_bytes + 1, np->MAC_address_bytes + 2, np->MAC_address_bytes + 3, np->MAC_address_bytes + 4, np->MAC_address_bytes + 5);  // network byte order
-	}
-
-	// MED dual-stack: mirrored from Linux path, UNVERIFIED on this OS
-	if (*np->LAN_address.string == 0) {  // may have been filled in above
-		pattern = "IPv4 Address";
-		if ((c = STR_match_end_m13(pattern, iface_start)) == NULL) {
-			// no IPv4 for this interface
-			np->LAN_address.family = NET_ADDR_FAM_NONE_m13;
-			*np->LAN_address.string = 0;
-		} else {
-			while (*c++ != ':');
-			++c;
-			c2 = tmp_str;
-			while (*c != '\r' && *c != '\n' && *c != '(' && *c != 0)  // MS attaches "(Preferred)" with no space to default interface
-				*c2++ = *c++;
-			*c2 = 0;
-			NET_addr_set_m13(&np->LAN_address, tmp_str);  // fills family + bytes (network order) + canonical string
-		}
-	}
-	// (IPv6 LAN discovery follows the subnet-mask parse below, via GetAdaptersAddresses(), to match the Linux/macOS ordering)
-
-	// subnet mask (IPv4) -> CIDR prefix length; only meaningful when LAN_address is IPv4
-	pattern = "Subnet Mask";
-	if ((c = STR_match_end_m13(pattern, iface_start)) == NULL) {
-		np->LAN_address.prefix_len = NET_ADDR_PREFIX_NO_ENTRY_m13;
-	} else {
-		while (*c++ != ':');
-		++c;
-		c2 = tmp_str;
-		while (*c != '\r' && *c != '\n' && *c != 0)
-			*c2++ = *c++;
-		*c2 = 0;
-		mask[0] = mask[1] = mask[2] = mask[3] = 0;
-		sscanf(tmp_str, "%hhu.%hhu.%hhu.%hhu", mask, mask + 1, mask + 2, mask + 3);
-		np->LAN_address.prefix_len = NET_v4_prefix_from_mask_m13(mask);
-	}
-
-	// MED dual-stack: Windows IPv6 LAN discovery via GetAdaptersAddresses().  UNVERIFIED on this OS.
-	// Mirrors the Linux/macOS behavior: only fill in an IPv6 address if no IPv4 was found for this interface.
-	// Matches the adapter by MAC (as NET_get_adapter_m13() does), then takes the first global unicast IPv6
-	// address (skipping link-local fe80::/10, multicast ff00::/8, and loopback/unspecified).
-	if (np->LAN_address.family == NET_ADDR_FAM_NONE_m13) {
-		flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
-		family = AF_INET6;
-		pAddresses = NULL;
-		outBufLen = 16384;
-		attempts = 0;
-		do {
-			pAddresses = (IP_ADAPTER_ADDRESSES *) malloc_m13(outBufLen);
-			dwRetVal = GetAdaptersAddresses(family, flags, NULL, pAddresses, &outBufLen);
-			if (dwRetVal == ERROR_BUFFER_OVERFLOW) {
-				free(pAddresses);
-				pAddresses = NULL;
-			} else {
-				break;
-			}
-			++attempts;
-		} while ((dwRetVal == ERROR_BUFFER_OVERFLOW) && (attempts < 3));
-
-		if (dwRetVal == NO_ERROR) {
-			for (pCurrAddress = pAddresses; pCurrAddress; pCurrAddress = pCurrAddress->Next) {
-				// match this adapter to the interface by MAC address
-				if (pCurrAddress->PhysicalAddressLength != (DWORD) NET_MAC_ADDRESS_BYTES_m13)
-					continue;
-				for (i = 0; i < (si4) pCurrAddress->PhysicalAddressLength; ++i)
-					if (pCurrAddress->PhysicalAddress[i] != np->MAC_address_bytes[i])
-						break;
-				if (i != (si4) pCurrAddress->PhysicalAddressLength)
-					continue;  // not this adapter
-
-				// walk the adapter's unicast addresses; take the first global IPv6
-				for (pUnicast = pCurrAddress->FirstUnicastAddress; pUnicast; pUnicast = pUnicast->Next) {
-					if (pUnicast->Address.lpSockaddr == NULL)
-						continue;
-					if (pUnicast->Address.lpSockaddr->sa_family != AF_INET6)
-						continue;
-					s6 = (struct sockaddr_in6 *) pUnicast->Address.lpSockaddr;
-					b = (ui1 *) &s6->sin6_addr;  // 16 bytes, network byte order
-					if (b[0] == 0xFE && (b[1] & 0xC0) == 0x80)
-						continue;  // link-local fe80::/10
-					if (b[0] == 0xFF)
-						continue;  // multicast ff00::/8
-					for (i = 0; i < 15; ++i)  // detect loopback (::1) / unspecified (::)
-						if (b[i])
-							break;
-					if (i == 15 && (b[15] == 0 || b[15] == 1))
-						continue;
-					if (inet_ntop(AF_INET6, (void *) &s6->sin6_addr, tmp_str, (socklen_t) sizeof(tmp_str)) == NULL)
-						continue;
-					if (NET_addr_set_m13(&np->LAN_address, tmp_str) == TRUE_m13) {
-						np->LAN_address.prefix_len = NET_ADDR_PREFIX_NO_ENTRY_m13;  // v4 netmask does not apply to a v6 address
-						break;  // keep the first global IPv6 address
-					}
-				}
-				break;  // matched the adapter (whether or not a global IPv6 was found) - stop searching
-			}
-		}
+	if (dwRetVal != NO_ERROR) {
 		if (pAddresses)
 			free(pAddresses);
+		G_set_error_m13(E_NET_m13, "GetAdaptersAddresses() failed");
+		if (global_np == TRUE_m13)
+			pthread_mutex_unlock_m13(&globals_m13->tables->mutex);
+		return_m13(FALSE_m13);
 	}
 
-	free_m13(buffer);
+	v6_addr.family = NET_ADDR_FAM_NONE_m13;
+	v6_addr.prefix_len = NET_ADDR_PREFIX_NO_ENTRY_m13;
+	for (pCurrAddress = pAddresses; pCurrAddress; pCurrAddress = pCurrAddress->Next) {
+		wcstombs(fname, pCurrAddress->FriendlyName, sizeof(fname) - 1);
+		fname[sizeof(fname) - 1] = 0;
+		if (strcmp_m13(fname, np->interface_name))
+			continue;
+		if (pCurrAddress->PhysicalAddressLength == NET_MAC_ADDRESS_BYTES_m13) {
+			memcpy((void *) np->MAC_address_bytes, (void *) pCurrAddress->PhysicalAddress, (size_t) NET_MAC_ADDRESS_BYTES_m13);  // network byte order
+			sprintf_m13(np->MAC_address_string, "%02X:%02X:%02X:%02X:%02X:%02X", np->MAC_address_bytes[0], np->MAC_address_bytes[1], np->MAC_address_bytes[2], np->MAC_address_bytes[3], np->MAC_address_bytes[4], np->MAC_address_bytes[5]);
+		}
+		np->plugged_in = (pCurrAddress->OperStatus == IfOperStatusUp) ? TRUE_m13 : FALSE_m13;  // carrier / media connected
+		for (pUnicast = pCurrAddress->FirstUnicastAddress; pUnicast; pUnicast = pUnicast->Next) {
+			if (pUnicast->Address.lpSockaddr->sa_family == AF_INET) {
+				if (np->LAN_address.family == NET_ADDR_FAM_IPV4_m13)
+					continue;  // honor a preset / first-found IPv4 address
+				s4 = (struct sockaddr_in *) pUnicast->Address.lpSockaddr;
+				if (inet_ntop(AF_INET, (void *) &s4->sin_addr, tmp_str, (socklen_t) sizeof(tmp_str)) == NULL)
+					continue;
+				if (NET_addr_set_m13(&np->LAN_address, tmp_str) == TRUE_m13)
+					np->LAN_address.prefix_len = (ui1) pUnicast->OnLinkPrefixLength;
+			} else if (pUnicast->Address.lpSockaddr->sa_family == AF_INET6) {
+				if (v6_addr.family != NET_ADDR_FAM_NONE_m13)
+					continue;  // keep the first global IPv6 address
+				s6 = (struct sockaddr_in6 *) pUnicast->Address.lpSockaddr;
+				b = (ui1 *) &s6->sin6_addr;
+				if (b[0] == 0xFE && (b[1] & 0xC0) == 0x80)  // link-local (fe80::/10)
+					continue;
+				if (inet_ntop(AF_INET6, (void *) &s6->sin6_addr, tmp_str, (socklen_t) sizeof(tmp_str)) == NULL)
+					continue;
+				if (NET_addr_set_m13(&v6_addr, tmp_str) == TRUE_m13)
+					v6_addr.prefix_len = (ui1) pUnicast->OnLinkPrefixLength;
+			}
+		}
+		break;  // matched the adapter
+	}
+	if (pAddresses)
+		free(pAddresses);
+
+	if (np->LAN_address.family == NET_ADDR_FAM_NONE_m13 && v6_addr.family == NET_ADDR_FAM_IPV6_m13)
+		np->LAN_address = v6_addr;  // no IPv4 on this adapter - use the first global IPv6 address
+	if (*np->MAC_address_string == 0)
+		strcpy(np->MAC_address_string, "unknown");
 
 	if (copy_global == TRUE_m13) {
 		pthread_mutex_lock_m13(&globals_m13->tables->mutex);
@@ -42952,8 +43977,7 @@ tern	NET_get_config_m13(NET_PARAMS_m13 *np, tern copy_global)
 NET_PARAMS_m13	*NET_get_default_interface_m13(NET_PARAMS_m13 *np)
 {
 	tern	global_np, free_np;
-	si1	*command, *buffer, *c;
-	
+
 #ifdef FT_DEBUG_m13
 	G_push_function_m13();
 #endif
@@ -42980,63 +44004,116 @@ NET_PARAMS_m13	*NET_get_default_interface_m13(NET_PARAMS_m13 *np)
 		}
 	}
 
-	#ifdef MACOS_m13
-	command = "/sbin/route -n get default";
-	#endif
-	#ifdef LINUX_m13
-	command = "/usr/sbin/ip route get 8.8.8.8";
-	#endif
-	#ifdef WINDOWS_m13
-	command = "route PRINT -4 0.0.0.0";
-	#endif
-	buffer = NULL;
-	if (system_pipe_m13(&buffer, 0, command, SP_BEHAVIOR_PASSED_m13, (RETURN_ON_FAIL_m13 | SUPPRESS_ERROR_OUTPUT_m13))) {
-		if (buffer)
-			free_m13(buffer);
-		if (global_np == TRUE_m13)
-			pthread_mutex_unlock_m13(&globals_m13->tables->mutex);
-		if (free_np == TRUE_m13)
-			free(np);
-		return_m13(NULL);
+	// the kernel's own route lookup, no shell & no parsing: connect() on a UDP socket
+	// resolves the route (nothing is transmitted - UDP connect only sets the peer) &
+	// getsockname() then reveals the source address the kernel chose.  v4 tried first,
+	// then v6, so either stack alone suffices.  8.8.8.8 / 2001:4860:4860::8888 are
+	// route-lookup TARGETS only - no packet leaves the machine, so this is safe on
+	// air-gapped systems (it simply finds no route & fails as before).
+	{
+		si1			addr_str[NET_ADDR_STR_BYTES_m13];
+#if defined MACOS_m13 || defined LINUX_m13
+		si4			fd;
+		socklen_t		sl;
+		struct sockaddr_in	dst4, src4;
+		struct sockaddr_in6	dst6, src6;
+
+		*addr_str = 0;
+		fd = socket(AF_INET, SOCK_DGRAM, 0);
+		if (fd >= 0) {
+			memset((void *) &dst4, 0, sizeof(dst4));
+			dst4.sin_family = AF_INET;
+			dst4.sin_port = htons(53);
+			inet_pton(AF_INET, "8.8.8.8", (void *) &dst4.sin_addr);
+			sl = (socklen_t) sizeof(src4);
+			if (connect(fd, (struct sockaddr *) &dst4, (socklen_t) sizeof(dst4)) == 0 && getsockname(fd, (struct sockaddr *) &src4, &sl) == 0)
+				inet_ntop(AF_INET, (void *) &src4.sin_addr, addr_str, (socklen_t) sizeof(addr_str));
+			close(fd);
+		}
+		if (*addr_str == 0) {  // no v4 route - try v6
+			fd = socket(AF_INET6, SOCK_DGRAM, 0);
+			if (fd >= 0) {
+				memset((void *) &dst6, 0, sizeof(dst6));
+				dst6.sin6_family = AF_INET6;
+				dst6.sin6_port = htons(53);
+				inet_pton(AF_INET6, "2001:4860:4860::8888", (void *) &dst6.sin6_addr);
+				sl = (socklen_t) sizeof(src6);
+				if (connect(fd, (struct sockaddr *) &dst6, (socklen_t) sizeof(dst6)) == 0 && getsockname(fd, (struct sockaddr *) &src6, &sl) == 0)
+					inet_ntop(AF_INET6, (void *) &src6.sin6_addr, addr_str, (socklen_t) sizeof(addr_str));
+				close(fd);
+			}
+		}
+		if (*addr_str) {
+			NET_addr_set_m13(&np->LAN_address, addr_str);  // fills family + bytes (network order) + canonical string
+			NET_iface_name_for_addr_m13(np->interface_name, addr_str);
+		}
+#endif  // MACOS_m13 || LINUX_m13
+#ifdef WINDOWS_m13
+		DWORD				dwRetVal, if_idx;
+		ULONG				outBufLen;
+		si4				i;
+		struct sockaddr_in		dst4;
+		struct sockaddr_in6		dst6;
+		PIP_ADAPTER_ADDRESSES		pAddresses, pCurrAddress;
+		PIP_ADAPTER_UNICAST_ADDRESS	pUnicast;
+
+		// MED dual-stack: mirrored from the Unix path, UNVERIFIED on this OS
+		*addr_str = 0;
+		if_idx = 0;
+		memset((void *) &dst4, 0, sizeof(dst4));
+		dst4.sin_family = AF_INET;
+		dst4.sin_port = htons(53);
+		inet_pton(AF_INET, "8.8.8.8", (void *) &dst4.sin_addr);
+		if (GetBestInterfaceEx((struct sockaddr *) &dst4, &if_idx) != NO_ERROR) {  // no v4 route - try v6
+			memset((void *) &dst6, 0, sizeof(dst6));
+			dst6.sin6_family = AF_INET6;
+			dst6.sin6_port = htons(53);
+			inet_pton(AF_INET6, "2001:4860:4860::8888", (void *) &dst6.sin6_addr);
+			if (GetBestInterfaceEx((struct sockaddr *) &dst6, &if_idx) != NO_ERROR)
+				if_idx = 0;
+		}
+		if (if_idx) {
+			outBufLen = 15000;  // MS-recommended starting size
+			pAddresses = NULL;
+			for (i = 0; i < 3; ++i) {
+				pAddresses = (PIP_ADAPTER_ADDRESSES) malloc((size_t) outBufLen);
+				dwRetVal = GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_INCLUDE_PREFIX, NULL, pAddresses, &outBufLen);
+				if (dwRetVal != ERROR_BUFFER_OVERFLOW)
+					break;
+				free(pAddresses);
+				pAddresses = NULL;
+			}
+			if (dwRetVal == NO_ERROR) {
+				for (pCurrAddress = pAddresses; pCurrAddress; pCurrAddress = pCurrAddress->Next) {
+					if (pCurrAddress->IfIndex != if_idx && pCurrAddress->Ipv6IfIndex != if_idx)
+						continue;
+					wcstombs(np->interface_name, pCurrAddress->FriendlyName, sizeof(np->interface_name) - 1);
+					np->interface_name[sizeof(np->interface_name) - 1] = 0;
+					for (pUnicast = pCurrAddress->FirstUnicastAddress; pUnicast; pUnicast = pUnicast->Next) {  // prefer the v4 unicast address
+						if (pUnicast->Address.lpSockaddr->sa_family == AF_INET) {
+							inet_ntop(AF_INET, (void *) &((struct sockaddr_in *) pUnicast->Address.lpSockaddr)->sin_addr, addr_str, (socklen_t) sizeof(addr_str));
+							break;
+						}
+					}
+					if (*addr_str == 0 && pCurrAddress->FirstUnicastAddress)  // v6-only interface
+						if (pCurrAddress->FirstUnicastAddress->Address.lpSockaddr->sa_family == AF_INET6)
+							inet_ntop(AF_INET6, (void *) &((struct sockaddr_in6 *) pCurrAddress->FirstUnicastAddress->Address.lpSockaddr)->sin6_addr, addr_str, (socklen_t) sizeof(addr_str));
+					break;
+				}
+			}
+			if (pAddresses)
+				free(pAddresses);
+		}
+		if (*addr_str)
+			NET_addr_set_m13(&np->LAN_address, addr_str);  // fills family + bytes (network order) + canonical string
+#endif  // WINDOWS_m13
 	}
 
-	#ifdef MACOS_m13
-	// parse route() output to get internet interface name
-	if ((c = STR_match_end_m13("interface: ", buffer)))
-		sscanf(c, "%63s", np->interface_name);
-	#endif  // MACOS_m13
-	
-	#ifdef LINUX_m13
-	// parse route() output to get internet interface name
-	if ((c = STR_match_end_m13("dev ", buffer)))
-		sscanf(c, "%63s", np->interface_name);
-	// parse route() output to get internet ip address ("src" is v4 or v6 depending on the resolved route)
-	if ((c = STR_match_end_m13("src ", buffer))) {
-		sscanf(c, "%45s", np->LAN_address.string);
-		NET_addr_set_m13(&np->LAN_address, np->LAN_address.string);  // fills family + bytes (network order) + canonical string
-	}
-	#endif  // LINUX_m13
-
-	#ifdef WINDOWS_m13
-	si1	tmp_str[128];
-
-	// MED dual-stack: mirrored from Linux path, UNVERIFIED on this OS
-	// parse route() output to get default ip address
-	if ((c = STR_match_end_m13("0.0.0.0", buffer))) {
-		sscanf(c, "%127s%127s%45s", tmp_str, tmp_str, np->LAN_address.string);
-		NET_addr_set_m13(&np->LAN_address, np->LAN_address.string);  // fills family + bytes (network order) + canonical string
-		NET_iface_name_for_addr_m13(np->interface_name, np->LAN_address.string);
-	}
-	#endif
-	
-	free_m13(buffer);
 	
 	if (*np->interface_name) {
 		if (global_np == FALSE_m13) {
 			strcpy(globals_m13->tables->NET_params.interface_name, np->interface_name);
-			#if defined LINUX_m13 || defined WINDOWS_m13
-			globals_m13->tables->NET_params.LAN_address = np->LAN_address;  // whole-struct copy (family + bytes + string + prefix_len)
-			#endif
+			globals_m13->tables->NET_params.LAN_address = np->LAN_address;  // whole-struct copy (family + bytes + string + prefix_len); all platforms fill it natively now
 		}
 	} else {
 		G_warning_message_m13("%s(): no default interface\n", __FUNCTION__);
@@ -43106,14 +44183,11 @@ tern	NET_get_ethtool_m13(NET_PARAMS_m13 *np, tern copy_global)
 #else
 
 	tern	global_np;
-	si1	tmp_str[256], *buffer, *c, *pattern;
 
 #ifdef FT_DEBUG_m13
 	G_push_function_m13();
 #endif
 
-	// (get all info present in same buffers regardless of which was requested)
-	//
 	// called for link speed & duplex in Linux
 
 	global_np = FALSE_m13;
@@ -43129,26 +44203,9 @@ tern	NET_get_ethtool_m13(NET_PARAMS_m13 *np, tern copy_global)
 		}
 	}
 	
-	// Note: ethtool() doesn't seem to work on WiFi networks
-	buffer = NULL;
-	sprintf_m13(tmp_str, "/usr/sbin/ethtool %s", np->interface_name);
-	if (system_pipe_m13(&buffer, 0, tmp_str, SP_BEHAVIOR_PASSED_m13, RETURN_QUIETLY_m13)) {
-		G_warning_message_m13("%s(): ethtool is not installed.\nCannot get link speed or duplex settings.\nInstall with \"sudo apt install ethtool\"\n", __FUNCTION__);
-	} else {
-		pattern = "Speed: ";
-		if ((c = STR_match_end_m13(pattern, buffer)))  // not present for wireless connections
-			sscanf(c, "%15s", np->link_speed);
-		pattern = "Duplex: ";
-		if ((c = STR_match_end_m13(pattern, buffer)))  // not present for wireless connections
-			sscanf(c, "%15s", np->duplex);
-	}
-	if (buffer)
-		free_m13(buffer);
-
-	if (*np->link_speed == 0)
-		strcpy(np->link_speed, "unknown");
-	if (*np->duplex == 0)
-		strcpy(np->duplex, "unknown");
+	// kernel asked directly (SIOCETHTOOL) - the ethtool binary is not needed & wireless
+	// drivers (which do not implement the op) read "unknown", as before
+	NET_ethtool_ioctl_m13(np->interface_name, np->link_speed, np->duplex);
 
 	if (copy_global == TRUE_m13) {
 		pthread_mutex_lock_m13(&globals_m13->tables->mutex);
@@ -43465,9 +44522,9 @@ NET_PARAMS_m13	*NET_get_plugged_in_m13(si1 *iface, NET_PARAMS_m13 *np)
 NET_PARAMS_m13 *NET_get_wan_ipv4_address_m13(NET_PARAMS_m13 *np)
 {
 	tern	global_np;
-	si1	*command, *buffer, *pattern, *c;
-	si4	r_val;
-	
+	si1	buffer[4096], *pattern, *c;
+	si8	len;
+
 #ifdef FT_DEBUG_m13
 	G_push_function_m13();
 #endif
@@ -43497,19 +44554,12 @@ NET_PARAMS_m13 *NET_get_wan_ipv4_address_m13(NET_PARAMS_m13 *np)
 	}
 
 
-	// get WAN IPV4 address (this server can take some time)
-#if defined MACOS_m13 || defined LINUX_m13
-	command = "/usr/bin/curl --connect-timeout 7.0 -s checkip.dyndns.org";
-#endif
-#ifdef WINDOWS_m13
-	command = "curl.exe --connect-timeout 7.0 -s checkip.dyndns.org";
-#endif
-	
-	buffer = NULL;
-	r_val = system_pipe_m13(&buffer, 0, command, SP_BEHAVIOR_PASSED_m13, RETURN_ON_FAIL_m13 | SUPPRESS_ERROR_OUTPUT_m13 | RETRY_ONCE_m13);
-	if (r_val || buffer == NULL) {  // curl can return successfully with no output, in which case buffer is NULL
-		if (buffer)
-			free_m13(buffer);
+	// get WAN address (this server can take some time) - native http, no curl (the service
+	// speaks plain http; same ~7 s bound the curl call used, & one retry as before)
+	len = NET_http_get_m13("checkip.dyndns.org", "/", buffer, (si8) sizeof(buffer), 7000);
+	if (len <= 0)
+		len = NET_http_get_m13("checkip.dyndns.org", "/", buffer, (si8) sizeof(buffer), 7000);
+	if (len <= 0) {
 		if (NET_get_lan_ipv4_address_m13(NULL, np) == NULL)
 			G_warning_message_m13("%s(): no internet connection\n", __FUNCTION__);
 		else
@@ -43522,16 +44572,13 @@ NET_PARAMS_m13 *NET_get_wan_ipv4_address_m13(NET_PARAMS_m13 *np)
 	// parse output
 	pattern = "Current IP Address: ";
 	if ((c = STR_match_end_m13(pattern, buffer)) == NULL) {
-		G_warning_message_m13("%s(): Could not match pattern \"%s\" in output of \"%s\"\n", __FUNCTION__, pattern, command);
+		G_warning_message_m13("%s(): Could not match pattern \"%s\" in response from checkip.dyndns.org\n", __FUNCTION__, pattern);
 		if (global_np == TRUE_m13)
 			pthread_mutex_unlock_m13(&globals_m13->tables->mutex);
-		free_m13(buffer);
 		return_m13(NULL);
 	}
 	sscanf(c, "%45[^< ]", np->WAN_address.string);
 	NET_addr_set_m13(&np->WAN_address, np->WAN_address.string);  // fills family + bytes (network order) + canonical string (v4 or v6)
-
-	free_m13(buffer);
 
 	if (global_np == TRUE_m13) {
 		pthread_mutex_unlock_m13(&globals_m13->tables->mutex);
@@ -43545,10 +44592,116 @@ NET_PARAMS_m13 *NET_get_wan_ipv4_address_m13(NET_PARAMS_m13 *np)
 }
 
 
+static si8	NET_http_get_m13(const si1 *host, const si1 *path, si1 *response, si8 response_bytes, si4 timeout_ms)
+{
+	si1			request[512];
+	si4			fd, err;
+	si8			len, n;
+	socklen_t		sl;
+	struct addrinfo		hints, *ai_list, *ai;
+	struct pollfd		pfd;
+
+	// minimal plain-HTTP GET over sockets (replaces shelling to curl for services that
+	// speak http).  getaddrinfo() honors A & AAAA records, so the transport is v4 or v6
+	// transparently.  Non-blocking connect + poll bounds every step by timeout_ms.
+	// Returns bytes read (zero-terminated in response), or -1.
+
+	memset((void *) &hints, 0, sizeof(hints));
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_socktype = SOCK_STREAM;
+	if (getaddrinfo(host, "80", &hints, &ai_list))
+		return((si8) -1);
+	fd = -1;
+	for (ai = ai_list; ai; ai = ai->ai_next) {
+		fd = (si4) socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+		if (fd < 0)
+			continue;
+		#ifdef WINDOWS_m13
+		{
+			u_long	enable = 1;
+
+			ioctlsocket(fd, FIONBIO, &enable);
+		}
+		#else
+		fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+		#endif
+		if (connect(fd, ai->ai_addr, (socklen_t) ai->ai_addrlen)) {
+			pfd.fd = fd;
+			pfd.events = POLLOUT;
+			pfd.revents = 0;
+			#ifdef WINDOWS_m13
+			err = WSAPoll(&pfd, 1, timeout_ms);
+			#else
+			err = poll(&pfd, 1, timeout_ms);
+			#endif
+			if (err > 0 && (pfd.revents & POLLOUT)) {
+				err = 0;
+				sl = (socklen_t) sizeof(err);
+				getsockopt(fd, SOL_SOCKET, SO_ERROR, (void *) &err, &sl);
+			} else {
+				err = -1;
+			}
+			if (err) {  // connect failed or timed out - try the next address
+				#ifdef WINDOWS_m13
+				closesocket(fd);
+				#else
+				close(fd);
+				#endif
+				fd = -1;
+				continue;
+			}
+		}
+		break;
+	}
+	freeaddrinfo(ai_list);
+	if (fd < 0)
+		return((si8) -1);
+
+	len = (si8) sprintf_m13(request, "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: medlib_m13\r\nConnection: close\r\n\r\n", path, host);
+	n = (si8) send(fd, request, (size_t) len, 0);  // a fresh connection's send buffer swallows one small request - no partial-send loop needed
+	if (n != len) {
+		#ifdef WINDOWS_m13
+		closesocket(fd);
+		#else
+		close(fd);
+		#endif
+		return((si8) -1);
+	}
+
+	len = 0;
+	while (len < response_bytes - 1) {
+		pfd.fd = fd;
+		pfd.events = POLLIN;
+		pfd.revents = 0;
+		#ifdef WINDOWS_m13
+		err = WSAPoll(&pfd, 1, timeout_ms);
+		#else
+		err = poll(&pfd, 1, timeout_ms);
+		#endif
+		if (err <= 0)
+			break;  // timeout or error
+		n = (si8) recv(fd, response + len, (size_t) (response_bytes - 1 - len), 0);
+		if (n <= 0)
+			break;  // orderly close (or error)
+		len += n;
+	}
+	#ifdef WINDOWS_m13
+	closesocket(fd);
+	#else
+	close(fd);
+	#endif
+	response[len] = 0;
+
+	return(len ? len : (si8) -1);
+}
+
+
 #if defined MACOS_m13 || defined LINUX_m13
 si1	*NET_iface_name_for_addr_m13(si1 *iface_name, const si1 *iface_addr)
 {
-	si1 		tmp_addr[INET6_ADDRSTRLEN];
+	si1 		tmp_addr[NI_MAXHOST];  // was INET6_ADDRSTRLEN (46): getnameinfo() is TOLD the buffer is NI_MAXHOST
+					       // (1025) below & zeroes all of it - a latent stack smash, unhit until the
+					       // native NET_get_default_interface_m13() began calling this function (2026-08-18)
 	si4 		fam;
 	struct ifaddrs	*if_addr_list, *ifa;
 	socklen_t	si_len;
@@ -43605,45 +44758,206 @@ si1	*NET_iface_name_for_addr_m13(si1 *iface_name, const si1 *iface_addr)
 #ifdef WINDOWS_m13
 si1	*NET_iface_name_for_addr_m13(si1 *iface_name, const si1 *iface_addr)
 {
-	si1	local_iface_name[64], *buffer, *c, *c2;
-	si4	r_val;
-	si8	sz;
-	FILE	*fp;
-	
+	static si1			local_iface_name[64];  // fallback return target (static: the old auto array returned dangling stack memory; still not thread safe)
+	si1				tmp_str[NET_ADDR_STR_BYTES_m13];
+	si4				i;
+	DWORD				dwRetVal;
+	ULONG				outBufLen;
+	PIP_ADAPTER_ADDRESSES		pAddresses, pCurrAddress;
+	PIP_ADAPTER_UNICAST_ADDRESS	pUnicast;
+
 #ifdef FT_DEBUG_m13
 	G_push_function_m13();
 #endif
 
-	if (iface_name == NULL)
-		iface_name = local_iface_name;  // not thread safe
+	// adapter FriendlyName (the "connection name") for the adapter holding iface_addr -
+	// native GetAdaptersAddresses() walk, replacing the "ipconfig" output parse; handles
+	// v4 & v6 literals alike.  MED dual-stack: UNVERIFIED on this OS
 
-	// get interface name (aka connection name in Windows)
+	if (iface_name == NULL)
+		iface_name = local_iface_name;
 	*iface_name = 0;
-	buffer = NULL;
-	if (system_pipe_m13(&buffer, 0, "ipconfig", SP_BEHAVIOR_PASSED_m13, RETURN_ON_FAIL_m13) == 0) {  // parse ipconfig() output to find internet ip address
-		if ((c = STR_match_start_m13(iface_addr, buffer))) {
-			// find "LAN adapter" backwards from here
-			while (c >= buffer) {
-				if (*c == 'L')
-					if (strncmp_m13(c, "LAN adapter ", 12) == 0)
-						break;
-				--c;
-			}
-			if (c >= buffer) {
-				c += 12;
-				c2 = iface_name;
-				while (*c != ':')
-					*c2++ = *c++;
-				*c2 = 0;
-			}
+
+	outBufLen = 15000;  // MS-recommended starting size
+	pAddresses = NULL;
+	dwRetVal = ERROR_BUFFER_OVERFLOW;
+	for (i = 0; i < 3 && dwRetVal == ERROR_BUFFER_OVERFLOW; ++i) {
+		pAddresses = (PIP_ADAPTER_ADDRESSES) malloc((size_t) outBufLen);
+		dwRetVal = GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_INCLUDE_PREFIX, NULL, pAddresses, &outBufLen);
+		if (dwRetVal == ERROR_BUFFER_OVERFLOW) {
+			free(pAddresses);
+			pAddresses = NULL;
 		}
 	}
-	if (buffer)
-		free_m13(buffer);
+	if (dwRetVal != NO_ERROR) {
+		if (pAddresses)
+			free(pAddresses);
+		return_m13(iface_name);
+	}
+
+	for (pCurrAddress = pAddresses; pCurrAddress; pCurrAddress = pCurrAddress->Next) {
+		for (pUnicast = pCurrAddress->FirstUnicastAddress; pUnicast; pUnicast = pUnicast->Next) {
+			*tmp_str = 0;
+			if (pUnicast->Address.lpSockaddr->sa_family == AF_INET)
+				inet_ntop(AF_INET, (void *) &((struct sockaddr_in *) pUnicast->Address.lpSockaddr)->sin_addr, tmp_str, (socklen_t) sizeof(tmp_str));
+			else if (pUnicast->Address.lpSockaddr->sa_family == AF_INET6)
+				inet_ntop(AF_INET6, (void *) &((struct sockaddr_in6 *) pUnicast->Address.lpSockaddr)->sin6_addr, tmp_str, (socklen_t) sizeof(tmp_str));
+			if (*tmp_str && strcmp_m13(tmp_str, iface_addr) == 0) {
+				wcstombs(iface_name, pCurrAddress->FriendlyName, 63);
+				iface_name[63] = 0;
+				break;
+			}
+		}
+		if (*iface_name)
+			break;
+	}
+	if (pAddresses)
+		free(pAddresses);
 
 	return_m13(iface_name);
 }
 #endif
+
+
+#if defined MACOS_m13 || defined LINUX_m13
+static tern	NET_ifaddrs_fill_m13(NET_PARAMS_m13 *np)
+{
+	tern			had_lan;
+	si1			tmp_str[NET_ADDR_STR_BYTES_m13];
+	ui1			prefix, *mb;
+	si4			i, mask_bytes;
+	ui4			flags;
+	struct ifaddrs		*ifl, *ifa;
+	struct sockaddr_in	*s4;
+	struct sockaddr_in6	*s6;
+	NET_ADDR_m13		v6_addr;
+
+	// interface facts straight from the kernel (getifaddrs): MAC address, LAN address +
+	// prefix length, & link flags - ifconfig, which used to be parsed here, is only a
+	// client of this same data.  Policy matches the old parse: an already-set LAN address
+	// is honored, otherwise the first IPv4 address wins & the first global (non-link-local)
+	// IPv6 address is the fallback.  IPv6 prefix length now comes from the v6 netmask
+	// (the old parse left it NO_ENTRY).
+
+	if (getifaddrs(&ifl)) {
+		G_set_error_m13(E_NET_m13, "getifaddrs() failed");
+		return(FALSE_m13);
+	}
+
+	had_lan = (*np->LAN_address.string) ? TRUE_m13 : FALSE_m13;
+	v6_addr.family = NET_ADDR_FAM_NONE_m13;
+	v6_addr.prefix_len = NET_ADDR_PREFIX_NO_ENTRY_m13;
+	flags = 0;
+	ifa = NULL;
+	for (ifa = ifl; ifa; ifa = ifa->ifa_next) {
+		if (strcmp(ifa->ifa_name, np->interface_name))
+			continue;
+		flags = (ui4) ifa->ifa_flags;  // same value on every entry of an interface
+		if (ifa->ifa_addr == NULL)
+			continue;
+		switch (ifa->ifa_addr->sa_family) {
+			#ifdef MACOS_m13
+			case AF_LINK: {
+				struct sockaddr_dl	*sdl = (struct sockaddr_dl *) ifa->ifa_addr;
+				struct if_data		*ifd = (struct if_data *) ifa->ifa_data;
+
+				if (sdl->sdl_alen == NET_MAC_ADDRESS_BYTES_m13) {
+					memcpy((void *) np->MAC_address_bytes, (void *) LLADDR(sdl), (size_t) NET_MAC_ADDRESS_BYTES_m13);  // network byte order
+					sprintf_m13(np->MAC_address_string, "%02X:%02X:%02X:%02X:%02X:%02X", np->MAC_address_bytes[0], np->MAC_address_bytes[1], np->MAC_address_bytes[2], np->MAC_address_bytes[3], np->MAC_address_bytes[4], np->MAC_address_bytes[5]);
+				}
+				if (ifd != NULL && ifd->ifi_baudrate) {  // link speed (bits/s); covers WiFi too (current PHY rate)
+					if (ifd->ifi_baudrate >= 1000000000)
+						sprintf_m13(np->link_speed, "%g Gbps", (sf8) ifd->ifi_baudrate / (sf8) 1e9);
+					else
+						sprintf_m13(np->link_speed, "%g Mbps", (sf8) ifd->ifi_baudrate / (sf8) 1e6);
+				}
+			} break;
+			#endif  // MACOS_m13
+			#ifdef LINUX_m13
+			case AF_PACKET: {
+				struct sockaddr_ll	*sll = (struct sockaddr_ll *) ifa->ifa_addr;
+
+				if (sll->sll_halen == NET_MAC_ADDRESS_BYTES_m13) {
+					memcpy((void *) np->MAC_address_bytes, (void *) sll->sll_addr, (size_t) NET_MAC_ADDRESS_BYTES_m13);  // network byte order
+					sprintf_m13(np->MAC_address_string, "%02X:%02X:%02X:%02X:%02X:%02X", np->MAC_address_bytes[0], np->MAC_address_bytes[1], np->MAC_address_bytes[2], np->MAC_address_bytes[3], np->MAC_address_bytes[4], np->MAC_address_bytes[5]);
+				}
+			} break;
+			#endif  // LINUX_m13
+			case AF_INET:
+				if (had_lan == TRUE_m13 && np->LAN_address.family == NET_ADDR_FAM_IPV4_m13) {  // honor a preset address; just recover its prefix
+					s4 = (struct sockaddr_in *) ifa->ifa_addr;
+					inet_ntop(AF_INET, (void *) &s4->sin_addr, tmp_str, (socklen_t) sizeof(tmp_str));
+					if (strcmp_m13(tmp_str, np->LAN_address.string))
+						break;
+				} else if (np->LAN_address.family == NET_ADDR_FAM_IPV4_m13) {
+					break;  // keep the first IPv4 address found
+				} else {
+					s4 = (struct sockaddr_in *) ifa->ifa_addr;
+					inet_ntop(AF_INET, (void *) &s4->sin_addr, tmp_str, (socklen_t) sizeof(tmp_str));
+					NET_addr_set_m13(&np->LAN_address, tmp_str);  // fills family + bytes (network order) + canonical string
+				}
+				np->LAN_address.prefix_len = NET_ADDR_PREFIX_NO_ENTRY_m13;
+				if (ifa->ifa_netmask != NULL) {
+					mb = (ui1 *) &((struct sockaddr_in *) ifa->ifa_netmask)->sin_addr;
+					mask_bytes = NET_IPV4_ADDRESS_BYTES_m13;
+					for (prefix = 0, i = 0; i < mask_bytes; ++i) {
+						if (mb[i] == 0xFF) {
+							prefix += 8;
+							continue;
+						}
+						for (ui1 byte = mb[i]; byte & 0x80; byte <<= 1)
+							++prefix;
+						break;
+					}
+					np->LAN_address.prefix_len = prefix;
+				}
+				break;
+			case AF_INET6:
+				s6 = (struct sockaddr_in6 *) ifa->ifa_addr;
+				if (IN6_IS_ADDR_LINKLOCAL(&s6->sin6_addr))
+					break;
+				if (v6_addr.family != NET_ADDR_FAM_NONE_m13)
+					break;  // keep the first global IPv6 address
+				if (inet_ntop(AF_INET6, (void *) &s6->sin6_addr, tmp_str, (socklen_t) sizeof(tmp_str)) == NULL)
+					break;
+				if (NET_addr_set_m13(&v6_addr, tmp_str) == FALSE_m13)
+					break;
+				if (ifa->ifa_netmask != NULL) {
+					mb = (ui1 *) &((struct sockaddr_in6 *) ifa->ifa_netmask)->sin6_addr;
+					mask_bytes = NET_ADDR_BYTES_m13;
+					for (prefix = 0, i = 0; i < mask_bytes; ++i) {
+						if (mb[i] == 0xFF) {
+							prefix += 8;
+							continue;
+						}
+						for (ui1 byte = mb[i]; byte & 0x80; byte <<= 1)
+							++prefix;
+						break;
+					}
+					v6_addr.prefix_len = prefix;
+				}
+				break;
+		}
+	}
+	freeifaddrs(ifl);
+
+	if (flags == 0 && *np->MAC_address_string == 0) {  // no entry matched the name at all
+		G_set_error_m13(E_NET_m13, "no interface named \"%s\"", np->interface_name);
+		return(FALSE_m13);
+	}
+
+	if (np->LAN_address.family == NET_ADDR_FAM_NONE_m13 && v6_addr.family == NET_ADDR_FAM_IPV6_m13)
+		np->LAN_address = v6_addr;  // no IPv4 on this interface - use the first global IPv6 address
+
+	if (*np->MAC_address_string == 0)
+		strcpy(np->MAC_address_string, "unknown");
+	np->active = (flags & IFF_UP) ? TRUE_m13 : FALSE_m13;  // administratively up
+	np->plugged_in = (flags & IFF_RUNNING) ? TRUE_m13 : FALSE_m13;  // carrier present
+	np->MTU = NET_mtu_ioctl_m13(np->interface_name);
+
+	return(TRUE_m13);
+}
+#endif  // MACOS_m13 || LINUX_m13
 
 
 tern	NET_init_tables_m13(void)
@@ -43682,6 +44996,59 @@ tern	NET_init_tables_m13(void)
 
 	return(TRUE_m13);
 }
+
+
+#ifdef MACOS_m13
+static tern	NET_media_duplex_m13(const si1 *iface, si1 *duplex_str)
+{
+	si4			fd;
+	struct ifmediareq	ifmr;
+
+	// duplex from the active media word (the source of ifconfig's "media:" line); WiFi &
+	// other non-ethernet media carry no duplex bits - duplex_str is left as the caller
+	// set it ("unknown")
+	fd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (fd < 0)
+		return(FALSE_m13);
+	memset((void *) &ifmr, 0, sizeof(ifmr));
+	strncpy(ifmr.ifm_name, iface, sizeof(ifmr.ifm_name) - 1);
+	if (ioctl(fd, SIOCGIFMEDIA, &ifmr) < 0) {
+		close(fd);
+		return(FALSE_m13);
+	}
+	close(fd);
+	if (ifmr.ifm_active & IFM_FDX)
+		strcpy(duplex_str, "full");
+	else if (ifmr.ifm_active & IFM_HDX)
+		strcpy(duplex_str, "half");
+
+	return(TRUE_m13);
+}
+#endif  // MACOS_m13
+
+
+#if defined MACOS_m13 || defined LINUX_m13
+static si4	NET_mtu_ioctl_m13(const si1 *iface)
+{
+	si4		fd, mtu;
+	struct ifreq	ifr;
+
+	// SIOCGIFMTU; 0 on failure (the old parse also stored 0 when no mtu could be read)
+	fd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (fd < 0)
+		fd = socket(AF_INET6, SOCK_DGRAM, 0);  // v6-only host
+	if (fd < 0)
+		return(0);
+	memset((void *) &ifr, 0, sizeof(ifr));
+	strncpy(ifr.ifr_name, iface, IFNAMSIZ - 1);
+	mtu = 0;
+	if (ioctl(fd, SIOCGIFMTU, &ifr) == 0)
+		mtu = (si4) ifr.ifr_mtu;
+	close(fd);
+
+	return(mtu);
+}
+#endif  // MACOS_m13 || LINUX_m13
 
 
 tern	NET_reset_parameters_m13(NET_PARAMS_m13 *np)
@@ -43778,18 +45145,20 @@ tern	NET_resolve_arguments_m13(si1 *iface, NET_PARAMS_m13 **params_ptr, tern *fr
 			strcpy(params->interface_name, iface);
 		}
 	} else { // iface == NULL
-		interface_is_global = TRUE_m13;  // true for both cases because if params->interface_name exists, iface
+		interface_is_global = TRUE_m13;  // true for both cases: a params->interface_name, had there been one, became iface above
 		iface = globals_m13->tables->NET_params.interface_name;
+		// (copy direction matters: the global name goes INTO params - the reverse wipes the
+		//  just-resolved global interface_name with the empty params name)
 		 // case: -iface, +params
 		if (params) {
 			if (params_are_global == FALSE_m13)
-				strcpy(iface, params->interface_name);
+				strcpy(params->interface_name, iface);
 		}
 		// case: -iface, -params
 		else {
 			params = (NET_PARAMS_m13 *) calloc_m13((size_t) 1, sizeof(NET_PARAMS_m13));
 			*free_params = TRUE_m13;
-			strcpy(iface, params->interface_name);
+			strcpy(params->interface_name, iface);
 		}
 	}
 
@@ -44188,7 +45557,7 @@ tern	PAR_distribute_m13(PAR_INFO_m13 **par_infos, si4 n_infos, si4 reserved_core
 		concurrent_jobs = total_jobs;
 
 	// open utilization measurement window (see adaptation below)
-	++distribute_calls_m13;
+	++globals_m13->miscellaneous.distribute_calls;
 	start_uutc = G_current_uutc_m13();
 	start_cpu = PROC_cpu_time_m13();
 
@@ -44253,7 +45622,7 @@ tern	PAR_distribute_m13(PAR_INFO_m13 **par_infos, si4 n_infos, si4 reserved_core
 	}
 
 	// adapt session jobs_per_core (as in PROC_jobs_distribute_m13() - see the full derivation there)
-	if (adaptive == TRUE_m13 && distribute_calls_m13 == 1) {
+	if (adaptive == TRUE_m13 && globals_m13->miscellaneous.distribute_calls == 1) {
 		wall_secs = (sf8) (G_current_uutc_m13() - start_uutc) / (sf8) 1e6;
 		if (total_jobs >= (concurrent_jobs << 1) && wall_secs >= (sf8) 0.1) {
 			cpu_rate = (PROC_cpu_time_m13() - start_cpu) / wall_secs;
@@ -44270,7 +45639,7 @@ tern	PAR_distribute_m13(PAR_INFO_m13 **par_infos, si4 n_infos, si4 reserved_core
 			}
 		}
 	}
-	--distribute_calls_m13;
+	--globals_m13->miscellaneous.distribute_calls;
 
 	if (wait_jobs == TRUE_m13)
 		return_m13(PAR_wait_all_m13(par_infos, n_infos, NULL));
@@ -44987,6 +46356,198 @@ tern	PROC_default_threading_m13(void *level_header)
 }
 
 
+tern	PROC_encode_cpu_set_m13(const si1 *reserved_str, si1 *encode_str, si4 *n_workers)
+{
+	si4	n_cpus, max_reserved, i, n_set, range_start, prev;
+	si1	*sp;
+
+#ifdef FT_DEBUG_m13
+	G_push_function_m13();
+#endif
+
+	// Derive the encode-worker CPU set from the machine's ACTUAL topology: every logical CPU whose
+	// PHYSICAL core hosts none of the caller's reserved logicals (GUI / catcher / reader by the m12
+	// convention, "0-3"). Topology-independent where the old arithmetic was not: on plain-SMT parts
+	// (siblings enumerated (i, i + n_phys) - dhn-home) it reserves the whole physical cores under the
+	// reserved logicals (the 2026-08-12 affinity fix, derived instead of hand-coded); on hybrid parts
+	// (adjacent-pair P-core siblings, sibling-less E-cores - the i9-13900K shipping model) it excludes
+	// the right ADJACENT pairs & sweeps every E-core into the pool. Reads sysfs on Linux; any other
+	// platform (or a sysfs read failure) falls back to "max reserved logical + 1 .. last logical".
+	// encode_str must hold PROC_ENCODE_SET_BYTES_m13; *n_workers gets the encode set's logical count.
+
+	if (reserved_str == NULL || encode_str == NULL || n_workers == NULL) {
+		G_set_error_m13(E_GEN_m13, "NULL argument");
+		return_m13(FALSE_m13);
+	}
+	*encode_str = 0;
+	*n_workers = 0;
+	n_cpus = globals_m13->tables->HW_params.logical_cores;
+	if (n_cpus < 2) {
+		G_set_error_m13(E_GEN_m13, "not enough logical cpus to partition");
+		return_m13(FALSE_m13);
+	}
+
+	{	// mark the reserved logicals (reuse the affinity-string parser so syntax stays uniform)
+		ui1	*logical_reserved, *core_reserved, *in_encode;
+		si8	*core_key;
+		si4	n_keys, key_idx;
+		tern	sysfs_ok;
+
+		logical_reserved = (ui1 *) calloc((size_t) n_cpus * 3, sizeof(ui1));  // + core_reserved + in_encode
+		core_key = (si8 *) calloc((size_t) n_cpus, sizeof(si8));
+		if (logical_reserved == NULL || core_key == NULL) {
+			free(logical_reserved); free(core_key);
+			G_set_error_m13(E_ALLOC_m13, NULL);
+			return_m13(FALSE_m13);
+		}
+		core_reserved = logical_reserved + n_cpus;
+		in_encode = core_reserved + n_cpus;
+
+		max_reserved = -1;
+		{
+	#ifdef MACOS_m13
+			// no affinity support on MacOS - fall back below (parse reserved max by hand: digits only)
+			for (sp = (si1 *) reserved_str; *sp; ++sp)
+				if (*sp >= '0' && *sp <= '9') {
+					i = (si4) strtol(sp, &sp, 10);
+					if (i > max_reserved)
+						max_reserved = i;
+					if (*sp == 0)
+						break;
+				}
+	#else
+			si4		in_res_set;
+			cpu_set_t_m13	res_set;
+
+			if (PROC_generate_cpu_set_m13(reserved_str, &res_set) == NULL) {
+				free(logical_reserved); free(core_key);
+				return_m13(FALSE_m13);
+			}
+			for (i = 0; i < n_cpus; ++i) {
+				// membership test hoisted to a value: braces must open & close within a
+				// preprocessor block (Xcode's parser cannot follow a split brace)
+		#ifdef LINUX_m13
+				in_res_set = CPU_ISSET(i, &res_set) ? 1 : 0;
+		#endif
+		#ifdef WINDOWS_m13
+				in_res_set = (si4) ((res_set >> i) & 1);
+		#endif
+				if (in_res_set) {
+					logical_reserved[i] = 1;
+					if (i > max_reserved)
+						max_reserved = i;
+				}
+			}
+	#endif
+		}
+		if (max_reserved < 0)
+			max_reserved = 3;  // m12 convention
+
+		// physical-core keys from the HW topology maps (filled at init - sysfs on Linux; unknown
+		// elsewhere or on read failure => fallback partition below)
+		sysfs_ok = FALSE_m13;
+		if (n_cpus <= HW_MAX_LOGICAL_CORES_m13 && globals_m13->tables->HW_params.physical_core_ids[0] >= 0) {
+			sysfs_ok = TRUE_m13;
+			for (i = 0; i < n_cpus; ++i) {
+				if (globals_m13->tables->HW_params.physical_core_ids[i] < 0) {
+					sysfs_ok = FALSE_m13;
+					break;
+				}
+				core_key[i] = (si8) globals_m13->tables->HW_params.physical_core_ids[i];
+			}
+		}
+
+		if (sysfs_ok == TRUE_m13) {
+			si8	*uniq_keys = (si8 *) calloc((size_t) n_cpus, sizeof(si8));
+			ui1	*uniq_res = (ui1 *) calloc((size_t) n_cpus, sizeof(ui1));
+
+			if (uniq_keys == NULL || uniq_res == NULL) {
+				free(uniq_keys); free(uniq_res); free(logical_reserved); free(core_key);
+				G_set_error_m13(E_ALLOC_m13, NULL);
+				return_m13(FALSE_m13);
+			}
+			// pass 1: mark each physical core that hosts a reserved logical
+			n_keys = 0;
+			for (i = 0; i < n_cpus; ++i) {
+				for (key_idx = 0; key_idx < n_keys; ++key_idx)
+					if (uniq_keys[key_idx] == core_key[i])
+						break;
+				if (key_idx == n_keys)
+					uniq_keys[n_keys++] = core_key[i];
+				if (logical_reserved[i])
+					uniq_res[key_idx] = 1;
+			}
+			// pass 2: encode set = logicals of unreserved physical cores
+			for (i = 0; i < n_cpus; ++i) {
+				for (key_idx = 0; uniq_keys[key_idx] != core_key[i]; ++key_idx);
+				if (uniq_res[key_idx] == 0)
+					in_encode[i] = 1;
+			}
+			free(uniq_keys); free(uniq_res);
+		} else {  // fallback: everything above the highest reserved logical
+			for (i = max_reserved + 1; i < n_cpus; ++i)
+				in_encode[i] = 1;
+		}
+
+		// emit compact ranges & count workers
+		sp = encode_str;
+		n_set = 0;
+		range_start = prev = -2;
+		for (i = 0; i <= n_cpus; ++i) {
+			if (i < n_cpus && in_encode[i]) {
+				if (prev != i - 1)
+					range_start = i;
+				prev = i;
+				++n_set;
+			} else if (prev >= 0 && (i == n_cpus || range_start >= 0)) {
+				if (range_start >= 0) {
+					if (sp != encode_str)
+						*sp++ = ',';
+					if (range_start == prev)
+						sp += sprintf(sp, "%d", prev);
+					else
+						sp += sprintf(sp, "%d-%d", range_start, prev);
+					range_start = -1;
+				}
+			}
+		}
+		// D33 (2026-08-17): one worker per PHYSICAL core when the topology map is known. With the WRT
+		// pool's per-physical staggering, a worker per LOGICAL doubles up SMT siblings & reintroduces
+		// the co-residency boost spikes the stagger removes (measured: P-core die-spot peaks of
+		// 96-100C - TjMax - at only ~5 cores of aggregate load). Unknown topology keeps the logical
+		// count, which pairs with the pool's shared-mask fallback.
+		{
+			si4	*pmap = globals_m13->tables->HW_params.physical_core_ids;
+
+			if (n_cpus <= HW_MAX_LOGICAL_CORES_m13 && pmap[0] >= 0) {
+				ui1	pseen[HW_MAX_LOGICAL_CORES_m13];
+				si4	n_phys;
+
+				memset(pseen, 0, sizeof(pseen));
+				n_phys = 0;
+				for (i = 0; i < n_cpus; ++i) {
+					if (in_encode[i] && pmap[i] >= 0 && pseen[pmap[i]] == 0) {
+						pseen[pmap[i]] = 1;
+						++n_phys;
+					}
+				}
+				if (n_phys)
+					n_set = n_phys;
+			}
+		}
+		free(logical_reserved);
+		free(core_key);
+		*n_workers = n_set;
+		if (n_set == 0) {
+			G_set_error_m13(E_GEN_m13, "no cpus left for the encode set (reserved \"%s\" covers every physical core)", reserved_str);
+			return_m13(FALSE_m13);
+		}
+	}
+
+	return_m13(TRUE_m13);
+}
+
+
 cpu_set_t_m13	*PROC_generate_cpu_set_m13(const si1 *affinity_str, cpu_set_t_m13 *passed_cpu_set_p)
 {
 	
@@ -45047,6 +46608,65 @@ cpu_set_t_m13	*PROC_generate_cpu_set_m13(const si1 *affinity_str, cpu_set_t_m13 
 		return_m13(cpu_set_p);
 	}
 	
+	// comma-separated segments: parse each & UNION them (a leading '~' negates the whole union).
+	// Needed for SMT-aware placement: "physical cores 4-7" is logical "4-7,12-15" when siblings are
+	// enumerated as (0,8) (1,9) ... - a single range cannot express it (2026-08-12)
+	if (strchr(affinity_str, ',') != NULL) {
+		si1		seg[64], *dst;
+		const si1	*src;
+		tern		global_not;
+		cpu_set_t_m13	tmp;
+
+		src = affinity_str;
+		while (*src == ' ')
+			++src;
+		global_not = FALSE_m13;
+		if (*src == '~') {
+			global_not = TRUE_m13;
+			++src;
+		}
+		#ifdef LINUX_m13
+		CPU_ZERO(cpu_set_p);
+		#endif
+		#ifdef WINDOWS_m13
+		*cpu_set_p = 0;
+		#endif
+		while (*src) {
+			dst = seg;
+			while (*src && *src != ',' && dst < (seg + sizeof(seg) - 1))
+				*dst++ = *src++;
+			*dst = 0;
+			if (*src == ',')
+				++src;
+			if (STR_is_empty_m13(seg) == TRUE_m13)
+				continue;
+			if (PROC_generate_cpu_set_m13(seg, &tmp) == NULL)
+				return_m13(NULL);
+			#ifdef LINUX_m13
+			for (i = 0; i < n_cpus; ++i)
+				if (CPU_ISSET(i, &tmp))
+					CPU_SET(i, cpu_set_p);
+			#endif
+			#ifdef WINDOWS_m13
+			*cpu_set_p |= tmp;
+			#endif
+		}
+		if (global_not == TRUE_m13) {
+			#ifdef LINUX_m13
+			for (i = 0; i < n_cpus; ++i) {
+				if (CPU_ISSET(i, cpu_set_p))
+					CPU_CLR(i, cpu_set_p);
+				else
+					CPU_SET(i, cpu_set_p);
+			}
+			#endif
+			#ifdef WINDOWS_m13
+			*cpu_set_p = ~*cpu_set_p & ((n_cpus >= 64) ? (ui8) 0xFFFFFFFFFFFFFFFF : (((ui8) 1 << n_cpus) - (ui8) 1));
+			#endif
+		}
+		return_m13(cpu_set_p);
+	}
+
 	// parse affinity string
 	aff_str = affinity_str - 1;
 	while (*++aff_str == ' ');  // skip any leading spaces
@@ -45282,17 +46902,23 @@ tern	PROC_increase_process_priority_m13(tern verbose_flag, si4 sudo_prompt_flag,
 
 pthread_rval_m13	PROC_job_init_m13(void *arg)
 {
+	tern			threaded;
 	pthread_t_m13		thread;
 	pthread_rval_m13	r_val;
 	PROC_JOB_m13		*job;
-	
-	
+
+
 	// this thread is passed through on way to job->function by PROC_job_launch_m13()
 	// so it can enter itself into the thread list, & set name
 	// (also called directly - not as a thread - by the unthreaded paths of PROC_jobs_distribute_m13()
 	// & PAR_start_m13(), so the status contract below holds however a job runs)
 
 	job = (PROC_JOB_m13 *) arg;
+
+	// snapshot every field still needed after job->function() returns: once a finish status is published
+	// (by the backstop below, or by the job function itself) PROC_jobs_wait_m13() may return & the owner
+	// may free the job array - so post-function reads of job race the free
+	threaded = job->threaded;
 
 	// status contract centralized here: RUNNING set before the job function runs & a finish status
 	// guaranteed after it returns - a job function that sets neither can no longer hang the launch
@@ -45301,7 +46927,7 @@ pthread_rval_m13	PROC_job_init_m13(void *arg)
 	job->status = PROC_THREAD_RUNNING_m13;
 
 	// enter into thread list
-	if (job->threaded == TRUE_m13) {
+	if (threaded == TRUE_m13) {
 		G_push_behavior_m13(job->parent_behavior);  // inherit spawner's behavior (snapshot at launch) as this thread's base entry
 		job->_id = gettid_m13();
 		thread = pthread_self_m13();
@@ -45355,10 +46981,15 @@ pthread_rval_m13	PROC_job_init_m13(void *arg)
 
 	// backstop: job function returned without setting a finish status - infer from its return value
 	// (job functions return (pthread_rval_m13) 0 on success by convention)
+	// NOTE: for a job function that publishes its OWN finish status, this read is the one remaining
+	// post-publication access to job. JOINABLE jobs are covered - PROC_jobs_wait_m13() joins before
+	// returning, so the owner cannot free until this thread is gone. DETACHED jobs (all of
+	// PROC_jobs_distribute_m13()'s & PAR's) are not: closing that would mean making publication the
+	// trampoline's exclusive job & removing the ~8 in-function stores.
 	if ((job->status & PROC_THREAD_FINISHED_m13) == 0)
 		job->status = (r_val == (pthread_rval_m13) 0) ? PROC_THREAD_SUCCEEDED_m13 : PROC_THREAD_FAILED_m13;
 
-	if (job->threaded == TRUE_m13)
+	if (threaded == TRUE_m13)
 		G_thread_exit_m13();
 
 	return(r_val);
@@ -45424,6 +47055,11 @@ tern	PROC_job_launch_m13(PROC_JOB_m13 *job)
 
 	// parent id & status
 	job->_pid = gettid_m13();
+	job->_id = (pid_t_m13) 0;  // set by the new thread: a stale id left by a previous run of this job slot must
+				   // never be visible to PROC_jobs_wait_m13()'s thread lookup (pool slots are relaunched)
+	job->skip = FALSE_m13;  // a launched job is by definition not skipped. tern, NOT boolean: a calloc'd/memset
+				// job reads UNKNOWN_m13 (0), & PROC_jobs_wait_m13() counts only skip == FALSE_m13 - so
+				// without this a direct launcher's jobs count zero & the wait returns immediately
 	job->parent_behavior = G_current_behavior_m13();  // snapshot: inherited as the new thread's base behavior
 	job->status = PROC_THREAD_WAITING_m13;
 
@@ -45476,6 +47112,11 @@ tern	PROC_job_launch_m13(PROC_JOB_m13 *job)
 
 	// parent id & status
 	job->_pid = gettid_m13();
+	job->_id = (pid_t_m13) 0;  // set by the new thread: a stale id left by a previous run of this job slot must
+				   // never be visible to PROC_jobs_wait_m13()'s thread lookup (pool slots are relaunched)
+	job->skip = FALSE_m13;  // a launched job is by definition not skipped. tern, NOT boolean: a calloc'd/memset
+				// job reads UNKNOWN_m13 (0), & PROC_jobs_wait_m13() counts only skip == FALSE_m13 - so
+				// without this a direct launcher's jobs count zero & the wait returns immediately
 	job->parent_behavior = G_current_behavior_m13();  // snapshot: inherited as the new thread's base behavior
 	job->status = PROC_THREAD_WAITING_m13;
 
@@ -45519,6 +47160,11 @@ tern	PROC_job_launch_m13(PROC_JOB_m13 *job)
 	
 	// parent id & status
 	job->_pid = gettid_m13();
+	job->_id = (pid_t_m13) 0;  // set by the new thread: a stale id left by a previous run of this job slot must
+				   // never be visible to PROC_jobs_wait_m13()'s thread lookup (pool slots are relaunched)
+	job->skip = FALSE_m13;  // a launched job is by definition not skipped. tern, NOT boolean: a calloc'd/memset
+				// job reads UNKNOWN_m13 (0), & PROC_jobs_wait_m13() counts only skip == FALSE_m13 - so
+				// without this a direct launcher's jobs count zero & the wait returns immediately
 	job->parent_behavior = G_current_behavior_m13();  // snapshot: inherited as the new thread's base behavior
 	job->status = PROC_THREAD_WAITING_m13;
 	
@@ -45697,7 +47343,7 @@ tern	PROC_jobs_distribute_m13(PROC_JOB_m13 *jobs, si4 n_jobs, si4 reserved_cores
 		concurrent_jobs = total_jobs;
 
 	// open utilization measurement window (see adaptation below)
-	++distribute_calls_m13;
+	++globals_m13->miscellaneous.distribute_calls;
 	start_uutc = G_current_uutc_m13();
 	start_cpu = PROC_cpu_time_m13();
 
@@ -45755,7 +47401,7 @@ tern	PROC_jobs_distribute_m13(PROC_JOB_m13 *jobs, si4 n_jobs, si4 reserved_cores
 	// => ideal jobs_per_core (busy fraction * ideal == 1) == (jobs_per_core * concurrent_cores) / cpu_rate
 	// measurement trusted only when: no other distribution ran concurrently, >= 2 waves of jobs, & window >= 100 ms
 	// (other busy threads in the process inflate cpu_rate => adaptation errs conservative)
-	if (adaptive == TRUE_m13 && distribute_calls_m13 == 1) {
+	if (adaptive == TRUE_m13 && globals_m13->miscellaneous.distribute_calls == 1) {
 		wall_secs = (sf8) (G_current_uutc_m13() - start_uutc) / (sf8) 1e6;
 		if (total_jobs >= (concurrent_jobs << 1) && wall_secs >= (sf8) 0.1) {
 			cpu_rate = (PROC_cpu_time_m13() - start_cpu) / wall_secs;
@@ -45772,7 +47418,7 @@ tern	PROC_jobs_distribute_m13(PROC_JOB_m13 *jobs, si4 n_jobs, si4 reserved_cores
 			}
 		}
 	}
-	--distribute_calls_m13;
+	--globals_m13->miscellaneous.distribute_calls;
 
 	if (wait_jobs == TRUE_m13)
 		return_m13(PROC_jobs_wait_m13(jobs, n_jobs));
@@ -45790,24 +47436,52 @@ tern	PROC_jobs_distribute_m13(PROC_JOB_m13 *jobs, si4 n_jobs, si4 reserved_cores
 tern	PROC_jobs_wait_m13(PROC_JOB_m13 *jobs, si4 n_jobs)
 {
 	tern		r_val;
-	si4		i, total_jobs, finished_jobs;
+	si4		i, total_jobs, finished_jobs, joinable_jobs;
+	pthread_t_m13	*join_threads, *thread_p;
 	PROC_JOB_m13	*job;
-	
+
 #ifdef FT_DEBUG_m13
 	G_push_function_m13();
 #endif
-	
+
 	// returns FALSE_m13 if any of the jobs failed
 
-	// count total jobs
-	for (job = jobs, total_jobs = 0, i = n_jobs; i--; ++job)
+	// count total jobs, & jobs this function must reap
+	// (tern, NOT boolean: an unset "detached" reads UNKNOWN_m13 & only FALSE_m13 means joinable - leaving
+	// an UNKNOWN job unjoined costs a stack mapping, joining a detached thread is undefined behavior)
+	total_jobs = joinable_jobs = 0;
+	for (job = jobs, i = n_jobs; i--; ++job) {
 		if (job->skip == FALSE_m13)
 			++total_jobs;
-		
+		if (job->threaded == TRUE_m13 && job->detached == FALSE_m13)
+			++joinable_jobs;
+	}
+
+	// thread handles are captured DURING the poll below, never when a job is first seen finished: an
+	// exiting thread removes its OWN list entry (G_thread_exit_m13()), so a deferred lookup can find the
+	// entry gone - or worse, find a new thread that has reused the thread id. Zero == not yet captured.
+	join_threads = NULL;
+	if (joinable_jobs)  // allocation failure is not fatal here: falls back to polling alone, as before
+		join_threads = (pthread_t_m13 *) calloc((size_t) n_jobs, sizeof(pthread_t_m13));
+
 	r_val = TRUE_m13;
 	while (1) {
-		
-		for (job = jobs, finished_jobs = 0, i = n_jobs; i--; ++job) {
+
+		for (job = jobs, finished_jobs = 0, i = 0; i < n_jobs; ++i, ++job) {
+			if (join_threads != NULL && join_threads[i] == (pthread_t_m13) 0 && job->_id &&
+			    job->threaded == TRUE_m13 && job->detached == FALSE_m13) {
+				thread_p = PROC_thread_for_id_m13(job->_id);
+				if (thread_p != NULL) {
+					#ifdef WINDOWS_m13
+					// the list entry OWNS its handle (closed by PROC_thread_list_remove_m13()) &
+					// pthread_join_m13() closes the handle it is passed - so join a duplicate
+					if (DuplicateHandle(GetCurrentProcess(), *thread_p, GetCurrentProcess(), join_threads + i, 0, FALSE, DUPLICATE_SAME_ACCESS) == 0)
+						join_threads[i] = (pthread_t_m13) 0;
+					#else
+					join_threads[i] = *thread_p;
+					#endif
+				}
+			}
 			if (job->skip == FALSE_m13 && (job->status & PROC_THREAD_FINISHED_m13)) {
 				// skip guard: SKIPPED status is in the FINISHED mask, but skipped jobs are not in
 				// total_jobs - counting them here returns early while unskipped jobs still run
@@ -45819,11 +47493,25 @@ tern	PROC_jobs_wait_m13(PROC_JOB_m13 *jobs, si4 n_jobs)
 
 		if (finished_jobs == total_jobs)
 			break;
-		
+
 		// don't peg this cpu
 		nap_m13("100 us");
 	}
-	
+
+	// reap joinable jobs: PROC_job_init_m13() still touches job AFTER the finish status is published, so
+	// a caller that frees the job array (or destroys a mutex the workers hold) on this function's return
+	// races the worker epilogue. Joining also releases the thread's stack mapping - a non-detached thread
+	// that is never joined leaks it for the life of the process.
+	// A handle never captured means the thread already removed its list entry, which is the LAST thing it
+	// does before its final access to job (PROC_thread_list_remove_m13() ends G_thread_exit_m13()) - so
+	// there is nothing left to wait for.
+	if (join_threads != NULL) {
+		for (i = 0; i < n_jobs; ++i)
+			if (join_threads[i] != (pthread_t_m13) 0)
+				pthread_join_m13(join_threads[i], NULL);
+		free((void *) join_threads);
+	}
+
 	return_m13(r_val);
 }
 
@@ -46243,92 +47931,665 @@ si4	pthread_create_m13(pthread_t_m13 *thread, pthread_attr_t_m13 *attributes, pt
 
 
 //*******************************//
-// MARK: PARITY FUNCTIONS  (PRTY)
-//*******************************//
+// MARK: PARITY CRC FUNCTIONS  (PCRC)
 
-
-// Single-member parity: the parity file is a copy of its one member, so verification is a byte compare
-// of the two DATA regions (each file may carry its own pcrc tail, which is not parity data).
-static tern	PRTY_compare_files_m13(const si1 *member_path, const si1 *parity_path, PRTY_m13 *parity_ps)
+si8	PCRC_block_bytes_m13(FILE_m13 *fp, const si1 *file_path)
 {
-	ui1			*a, *b;
-	si4			i;
-	si8			a_len, b_len, n, block_bytes, off;
-	FILE_m13		*a_fp, *b_fp;
-	PRTY_IDENT_m13	*tmp_ext;
+	tern			close_file;
+	si8			block_len, pcrc_offset;
+	PCRC_DATA_m13	pcrc;
+	
+#ifdef FT_DEBUG_m13
+	G_push_function_m13();
+#endif
+	
+	// returns block length of pcrc crcs or default length if no pcrc data exists
+	// returns FALSE_m13 on failure
+	// if fp passed: assumes file is open with read priveleges, returns fp to where it was when called
+	// if path passed: file is opened & closed
+	
+	// PCRC_BLOCK_BYTES_DEFAULT_m13
+	
+	if (fp == NULL) {
+		fp = fopen_m13(file_path, "r");
+		if (fp == NULL)
+			return_m13(0);
+		close_file = TRUE_m13;
+	} else {
+		close_file = FALSE_m13;
+	}
+
+	// pcrc structure sits at the end of all pcrc-bearing files (video data included): PCRC_offset_m13() locates it & restores the file position
+	pcrc_offset = PCRC_offset_m13(fp, NULL, &pcrc);
+	if (close_file == TRUE_m13)
+		fclose_m13(fp);
+	if (pcrc_offset == FALSE_m13)
+		return_m13(FALSE_m13);
+
+	if (pcrc.n_blocks)
+		block_len = pcrc.block_bytes;
+	else
+		block_len = PCRC_BLOCK_BYTES_DEFAULT_m13;
+
+	return_m13(block_len);
+}
+
+
+tern	PCRC_find_damage_m13(const si1 *file_path, PRTY_BLOCK_m13 **bad_blocks, si4 *n_bad_blocks, ui4 *n_blocks)
+{
+	tern			return_bb;
+	ui1			*block;
+	ui4			n_b, *crcs, block_bytes;
+	si4			i, n_bb, bb_size, BAD_BLOCK_INCREMENT;
+	si8			len, offset, crc_bytes, pcrc_offset, data_start;
+	PCRC_DATA_m13	pcrc;
+	PRTY_BLOCK_m13		*bb;
+	FILE_m13		*fp;
 
 #ifdef FT_DEBUG_m13
 	G_push_function_m13();
 #endif
 
-	a_fp = fopen_m13(member_path, "r");
-	if (a_fp == NULL)
-		return_m13(FALSE_m13);
-	b_fp = fopen_m13(parity_path, "r");
-	if (b_fp == NULL) {
-		fclose_m13(a_fp);
-		return_m13(FALSE_m13);
+	// validates a file's APPENDED block crcs (pcrc) & reports WHICH blocks fail
+	// bad_blocks & n_bad_blocks are returned only if BOTH are passed; n_blocks may be passed alone
+	// any of the three may be NULL - all three NULL is just a verdict, which is what PCRC_validate_m13() is,
+	// & in that form the walk stops at the first bad block instead of collecting them all
+	// returns TRUE_m13 if valid, FALSE_m13 if invalid, UNKNOWN_m13 for errors
+
+	return_bb = FALSE_m13;
+	BAD_BLOCK_INCREMENT = 5;
+	if (bad_blocks && n_bad_blocks) {
+		return_bb = TRUE_m13;
+		*bad_blocks = NULL;
+		*n_bad_blocks = 0;
 	}
-	// Parity DATA ends where the pcrc EXTENSION begins.  The extension (member UIDs + PRTY_MANIFEST_m13)
-	// sits between the data & the pcrc crcs & is deliberately invisible to PCRC_offset_m13(), which
-	// reports where the crcs start - counting it as data makes every extension-bearing parity file
-	// mismatch by exactly (8 * n_members + 24) bytes.  PRTY_manifest_m13() reports the data end for both
-	// cases: the extension start, or the crc start where there is no extension (legacy files).
-	tmp_ext = PRTY_manifest_m13(a_fp, NULL, &a_len);
-	if (tmp_ext != NULL)
-		free(tmp_ext);
-	tmp_ext = PRTY_manifest_m13(b_fp, NULL, &b_len);
-	if (tmp_ext != NULL)
-		free(tmp_ext);
-	if (a_len == FALSE_m13 || b_len == FALSE_m13) {	 // could not read one of the files
-		fclose_m13(a_fp); fclose_m13(b_fp);
-		return_m13(FALSE_m13);
+	if (n_blocks)
+		*n_blocks = 0;
+	bb = NULL;
+	n_b = bb_size = 0;
+
+	if (G_exists_m13(file_path) != FILE_EXISTS_m13) {
+		G_warning_message_m13("%s(): file \"%s\" does not exist => returning\n", __FUNCTION__, file_path);
+		return_m13(UNKNOWN_m13);
 	}
-	if (a_len != b_len) {
-		parity_ps->mismatch_bytes += (a_len > b_len) ? (a_len - b_len) : (b_len - a_len);
-		if (parity_ps->first_mismatch_offset < 0)
-			parity_ps->first_mismatch_offset = (a_len < b_len) ? a_len : b_len;
-		fclose_m13(a_fp); fclose_m13(b_fp);
-		return_m13(FALSE_m13);
+		
+	// locate pcrc data
+	fp = fopen_m13(file_path, "r");
+	pcrc_offset = PCRC_offset_m13(fp, NULL, &pcrc);
+	if (pcrc_offset == FALSE_m13) {
+		fclose_m13(fp);
+		return_m13(UNKNOWN_m13);
+	}
+	if (pcrc.n_blocks == 0) {
+		G_warning_message_m13("%s(): file \"%s\" does not contain parity crc data\n", __FUNCTION__, file_path);
+		fclose_m13(fp);
+		return_m13(UNKNOWN_m13);
 	}
 
-	block_bytes = parity_ps->mem_block_bytes;
-	a = parity_ps->parity;		// reuse the caller-owned buffers
-	b = parity_ps->data;
-	for (off = 0; off < a_len; off += n) {
-		n = a_len - off;
-		if (n > block_bytes)
-			n = block_bytes;
-		if (fread_m13(a, sizeof(ui1), (size_t) n, a_fp) != n || fread_m13(b, sizeof(ui1), (size_t) n, b_fp) != n) {
-			fclose_m13(a_fp); fclose_m13(b_fp);
-			return_m13(FALSE_m13);
-		}
-		for (i = 0; i < (si4) n; ++i) {
-			if (a[i] != b[i]) {
-				if (parity_ps->first_mismatch_offset < 0)
-					parity_ps->first_mismatch_offset = off + i;
-				++parity_ps->mismatch_bytes;
+	// covered region = [0, pcrc_offset): every file byte, universal headers included (header at file start, or video data footer at pcrc_offset - UH_BYTES)
+	// only the pcrc trailer itself is excluded - must mirror PCRC_write_m13(), which computes block crcs from offset zero
+	data_start = 0;
+	len = pcrc_offset;
+
+	// read in crcs
+	n_b = pcrc.n_blocks;
+	if (n_blocks)
+		*n_blocks = n_b;
+	block_bytes = pcrc.block_bytes;
+	crc_bytes = (si8) n_b * sizeof(ui4);
+	crcs = (ui4 *) malloc((size_t) crc_bytes);
+	if (crcs == NULL) {
+		G_set_error_m13(E_ALLOC_m13, NULL);
+		fclose_m13(fp);
+		return_m13(UNKNOWN_m13);
+	}
+	fseek_m13(fp, pcrc_offset, SEEK_SET);
+	fread_m13(crcs, sizeof(ui4), (size_t) n_b, fp);
+
+	// check crcs
+	block = (ui1 *) malloc((size_t) block_bytes);
+	if (block == NULL) {
+		G_set_error_m13(E_ALLOC_m13, NULL);
+		free(crcs);
+		fclose_m13(fp);
+		return_m13(UNKNOWN_m13);
+	}
+	fseek_m13(fp, data_start, SEEK_SET);
+	offset = data_start;  // bad block offsets are file absolute
+	n_bb = 0;
+	for (i = 0; i < n_b; ++i) {
+		if (len < block_bytes)
+			block_bytes = len;
+		fread_m13(block, sizeof(ui1), (size_t) block_bytes, fp);
+		if (crcs[i] != CRC_calculate_m13(block, block_bytes)) {
+			if (return_bb == TRUE_m13) {
+				if (n_bb == bb_size) {
+					bb_size += BAD_BLOCK_INCREMENT;
+					bb = (PRTY_BLOCK_m13 *) realloc_m13(bb, (size_t) bb_size * sizeof(PRTY_BLOCK_m13));
+				}
+				bb[n_bb].length = (si8) block_bytes;
+				bb[n_bb].offset = offset;
+				++n_bb;
+			} else {
+				fclose_m13(fp);
+				free(block);
+				free(crcs);
+				return_m13(FALSE_m13);
 			}
 		}
+		offset += block_bytes;  // advance for every block (bad block offsets were wrong when good blocks preceded bad ones)
+		len -= block_bytes;
 	}
-	fclose_m13(a_fp);
-	fclose_m13(b_fp);
 
-	return_m13(parity_ps->mismatch_bytes ? FALSE_m13 : TRUE_m13);
+	// clean up
+	fclose_m13(fp);
+	free(block);
+	free(crcs);
+
+	if (n_blocks)
+		*n_blocks = n_b;
+	if (n_bb) {  // only reachable with return_bb set: the verdict form returns at the first bad block
+		*bad_blocks = bb;
+		*n_bad_blocks = n_bb;
+		return_m13(FALSE_m13);
+	}
+
+	return_m13(TRUE_m13);
 }
 
 
-// verify mode: name the group whose parity differs.  The counters in PRTY_m13 accumulate across the
-// whole session & keep only the first offset, so without this a failed verify cannot say WHICH parity
-// file drifted - the first thing anyone needs in order to act on it.
-static void	PRTY_report_mismatch_m13(PRTY_m13 *parity_ps, si8 entry_mismatch_bytes)
+si8	PCRC_offset_m13(FILE_m13 *fp, const si1 *file_path, PCRC_DATA_m13 *pcrc)
 {
-	si8	n;
+	tern			got_pcrc, close_fp;
+	si8			nr, flen, in_offset, pcrc_offset, pcrc_bytes;
+	PCRC_DATA_m13	local_pcrc;
+	
+#ifdef FT_DEBUG_m13
+	G_push_function_m13();
+#endif
+	
+	// returns offset of pcrc CRCs (+ pcrc data if pointer passed)
+	// if no pcrc data exists, returns offset to where pcrc crcs would begin (& sets zeros pcrc if ponter passed)
+	// returns FALSE_m13 (-1) on failure
+	// if fp passed: assumes file is open with read privileges, returns fp to where it was when called
+	// if path passed: file is opened & closed
+	// pass NULL for pcrc if not needed
+	
+	// set error conditions
+	pcrc_offset = got_pcrc = close_fp = FALSE_m13;
+	if (pcrc == NULL)
+		pcrc = &local_pcrc;
+	
+	if (fp == NULL) {
+		fp = fopen_m13(file_path, "r");
+		if (fp == NULL)
+			return_m13(FALSE_m13);
+		close_fp = TRUE_m13;
+	} else {
+		in_offset = ftell_m13(fp);
+	}
+	
+	flen = flen_m13(fp);
+	
+	// no pcrc data possible (don't read)
+	if (flen <= (sizeof(ui4) + sizeof(PCRC_DATA_m13))) {  // must be at least one crc + pcrc struct
+		pcrc_offset = flen;  // not error
+		goto PCRC_OFFSET_FAIL;
+	}
+	
+	if (fseek_m13(fp, (size_t) flen - sizeof(PCRC_DATA_m13), SEEK_SET))
+		goto PCRC_OFFSET_FAIL;
+	nr = fread_m13(pcrc, sizeof(PCRC_DATA_m13), (size_t) 1, fp);
+	if (nr != 1)
+		goto PCRC_OFFSET_FAIL;
+\
+	// no pcrc data
+	if (pcrc->tag != PCRC_TAG_m13) {
+		pcrc_offset = flen;  // not error
+		goto PCRC_OFFSET_FAIL;
+	}
+	
+	// pcrc data exists
+	got_pcrc = TRUE_m13;
+	pcrc_bytes = (pcrc->n_blocks * sizeof(ui4)) + sizeof(PCRC_DATA_m13);
+	pcrc_offset = flen - pcrc_bytes;
 
-	n = parity_ps->mismatch_bytes - entry_mismatch_bytes;
-	if (n > 0)
-		G_message_m13("Parity MISMATCH: \"%s\" (%ld byte%s)\n", parity_ps->path, n, n == 1 ? " differs" : "s differ");
+PCRC_OFFSET_FAIL:
+
+	if (close_fp == TRUE_m13)
+		fclose_m13(fp);
+	else if (fseek_m13(fp, in_offset, SEEK_SET))  // reset error contitions in case got here successfully
+		got_pcrc = pcrc_offset = FALSE_m13;
+
+	if (got_pcrc == FALSE_m13)
+		if (pcrc != &local_pcrc)
+			memset(pcrc, 0, sizeof(PCRC_DATA_m13));
+
+	return_m13(pcrc_offset);
 }
+
+
+tern	PCRC_show_m13(const si1 *file_path)
+{
+	si4			i;
+	si8			pcrc_offset;
+	FILE_m13		*fp;
+	PCRC_DATA_m13	pcrc;
+	PRTY_IDENT_m13	*ext;
+	
+#ifdef FT_DEBUG_m13
+	G_push_function_m13();
+#endif
+		
+	if (G_exists_m13(file_path) == DOES_NOT_EXIST_m13) {
+		G_warning_message_m13("%s(): file \"%s\" does not exist\n", __FUNCTION__, file_path);
+		return_m13(FALSE_m13);
+	}
+	
+	fp = fopen_m13(file_path, "r");
+	pcrc_offset = PCRC_offset_m13(fp, NULL, &pcrc);  // pcrc structure sits at the end of all pcrc-bearing files (video data included)
+	if (pcrc_offset == FALSE_m13 || pcrc.n_blocks == 0) {
+		fclose_m13(fp);
+		G_warning_message_m13("%s(): file \"%s\" does not contain parity crc data\n", __FUNCTION__, file_path);
+		return_m13(FALSE_m13);
+	}
+
+	printf_m13("parity_tag: 0x%016lx\n", pcrc.tag);
+	printf_m13("session_UID: 0x%016lx\n", pcrc.session_UID);
+	printf_m13("segment_UID: 0x%016lx\n", pcrc.segment_UID);
+	printf_m13("n_blocks: %u\n", pcrc.n_blocks);
+	printf_m13("block_bytes: %u\n", pcrc.block_bytes);
+
+	// extension
+	ext = PRTY_manifest_m13(fp, NULL, NULL);
+	fclose_m13(fp);
+	if (ext != NULL) {
+		printf_m13("extension version: %hhu.%hhu\n", ext->version_major, ext->version_minor);
+		printf_m13("extension session_UID: 0x%016lx\n", ext->session_UID);
+		printf_m13("extension channel_UID: 0x%016lx\n", ext->channel_UID);
+		printf_m13("extension segment_UID: 0x%016lx\n", ext->segment_UID);
+		printf_m13("extension n_members: %u\n", ext->n_members);
+		for (i = 0; i < (si4) ext->n_members; ++i)
+			printf_m13("manifest member[%d]: UID 0x%016lx  lib_mod_time %ld  header_CRC 0x%08x  body_CRC 0x%08x\n", i, ext->members[i].file_UID, ext->members[i].lib_mod_time, ext->members[i].header_CRC, ext->members[i].body_CRC);
+		free(ext);
+	} else if (PRTY_is_parity_m13(file_path, TRUE_m13) == TRUE_m13) {
+		printf_m13("no pcrc extension (legacy parity file): UID fields above were never set & are unreliable\n");
+	}
+
+	return_m13(TRUE_m13);
+}
+
+
+tern	PCRC_update_m13(void *ptr, si8 n_bytes, si8 offset, void *fp, ...)  // vararg(fp == FILE *): const si1 *path)
+{
+	tern			r_val, is_std, was_open, unset_parity_flag;
+	ui1			*new_data, *tmp_data, *td;
+	const si1		*path;
+	ui4			*crcs;
+	si8			i, j, pcrc_offset, bytes_remaining, crc_bytes, data_start, data_end;
+	si8			nrw, start_block, start_byte, end_block, end_byte, bytes_to_read;
+	FILE_m13		*m13_fp;
+	PCRC_DATA_m13	pcrc;
+	va_list			v_arg;
+
+#ifdef FT_DEBUG_m13
+	G_push_function_m13();
+#endif
+
+	// update pcrc data in file if present
+	// offset presumed to be absolute
+	// returns TRUE_m13 on success or no pcrc data exists
+	// returns FALSE_m13 on failure
+	
+	// check fp
+	if (fp == NULL) {
+		G_set_error_m13(E_GEN_m13, "fp is null");
+		return_m13(FALSE_m13);
+	}
+
+	// get vararg
+	is_std = FILE_is_std_m13(fp);
+	if (is_std == TRUE_m13) {
+		va_start(v_arg, fp);
+		path = va_arg(v_arg, const si1 *);
+		va_end(v_arg);
+	} else {
+		m13_fp = (FILE_m13 *) fp;
+		path = m13_fp->path;
+	}
+	
+	// check path
+	if (STR_is_empty_m13(path) == TRUE_m13) {
+		G_set_error_m13(E_GEN_m13, "path is empty");
+		return_m13(FALSE_m13);
+	}
+	
+	// no pcrc data
+	pcrc_offset = PCRC_offset_m13(fp, NULL, &pcrc);
+	if (pcrc.n_blocks == 0)  // no pcrc data
+		return_m13(TRUE_m13);
+	if (pcrc_offset == FALSE_m13)  // error
+		return_m13(FALSE_m13);
+
+	// determine covered data region (see PCRC_write_m13): pcrcs cover data only - universal headers are excluded
+	if (G_is_video_data_m13(path) == TRUE_m13) {
+		data_start = 0;
+		data_end = pcrc_offset - (si8) UH_BYTES_m13;
+	} else if (PRTY_is_parity_m13(path, UNKNOWN_m13) == TRUE_m13) {
+		data_start = 0;
+		data_end = pcrc_offset;
+	} else {
+		data_start = (si8) UH_BYTES_m13;
+		data_end = pcrc_offset;
+	}
+
+	// clamp the update range to the covered data (universal header rewrites do not affect pcrcs)
+	if (offset >= data_end || (offset + n_bytes) <= data_start)
+		return_m13(TRUE_m13);  // update entirely outside covered data
+	if (offset < data_start) {
+		ptr = (void *) ((ui1 *) ptr + (data_start - offset));
+		n_bytes -= (data_start - offset);
+		offset = data_start;
+	}
+
+	// file extension not handled => warn, but do not set error (PRTY_update_m13() handles this)
+	if ((offset + n_bytes) > data_end) {
+		G_warning_message_m13("%s(), file extension not currently handled, rebuild pcrc data after files written\n", __FUNCTION__);
+		return_m13(TRUE_m13);
+	}
+
+	// open data file
+	was_open = fisopen_m13(fp);
+	if (was_open == FALSE_m13) {
+		fp = (void *) fopen_m13(path, "r+");
+		if (fp == NULL)
+			return_m13(FALSE_m13);
+	}
+	
+	// set up
+	r_val = FALSE_m13;
+	crcs = NULL;
+	tmp_data = NULL;
+	unset_parity_flag = FALSE_m13;
+
+	// read in pcrc crcs
+	crc_bytes = pcrc.n_blocks * sizeof(ui4);
+	crcs = (ui4 *) malloc((size_t) crc_bytes);
+	if (crcs == NULL)
+		goto PCRC_UPDATE_FAIL_m13;
+	if (fseek_m13(fp, pcrc_offset, SEEK_SET))
+		goto PCRC_UPDATE_FAIL_m13;
+	nrw = fread_m13(crcs, sizeof(ui1), (size_t) crc_bytes, fp);
+	if (nrw != crc_bytes)
+		goto PCRC_UPDATE_FAIL_m13;
+
+	// find where offset falls in pcrc blocks (block origin at data_start)
+	start_block = (offset - data_start) / pcrc.block_bytes;
+	end_block = ((offset - data_start) + n_bytes - 1) / pcrc.block_bytes;  // last block containing updated bytes
+
+	// read in affected blocks
+	start_byte = data_start + (start_block * pcrc.block_bytes);
+	end_byte = data_start + ((end_block + 1) * pcrc.block_bytes);
+	bytes_to_read = end_byte - start_byte;
+	bytes_remaining = data_end - start_byte;
+	if (bytes_to_read > bytes_remaining)
+		bytes_to_read = bytes_remaining;
+	tmp_data = (ui1 *) malloc((size_t) bytes_to_read);
+	if (tmp_data == NULL)
+		goto PCRC_UPDATE_FAIL_m13;
+	if (fseek_m13(fp, start_byte, SEEK_SET))
+		goto PCRC_UPDATE_FAIL_m13;
+	nrw = fread_m13(tmp_data, sizeof(ui1), (size_t) bytes_to_read, fp);
+	if (nrw != bytes_to_read)
+		goto PCRC_UPDATE_FAIL_m13;
+
+	// overlay the new data onto the affected blocks in memory: new_data[0..n_bytes) is written at file offset `offset`,
+	// which lands at tmp_data index (offset - start_byte). start_byte is the file offset of the first affected block &
+	// is <= offset, so the index is >= 0. Copy exactly n_bytes (the new-data size), NOT the whole block span.
+	new_data = (ui1 *) ptr;
+	for (i = offset - start_byte, j = 0; j < n_bytes; ++i, ++j)
+		tmp_data[i] = new_data[j];
+
+	// update those values in pcrc crc array
+	for (i = start_block, td = tmp_data; i <= end_block; ++i, td += pcrc.block_bytes) {
+		if (bytes_remaining > pcrc.block_bytes)
+			bytes_to_read = pcrc.block_bytes;
+		else
+			bytes_to_read = bytes_remaining;
+		crcs[i] = CRC_calculate_m13(td, bytes_to_read);
+		bytes_remaining -= pcrc.block_bytes;
+	}
+
+	// write out updated values
+	if (fseek_m13(fp, pcrc_offset, SEEK_SET))
+		goto PCRC_UPDATE_FAIL_m13;
+	if (is_std == FALSE_m13) {
+		if ((m13_fp->flags & FILE_FLAGS_PARITY_m13) == 0) {
+			unset_parity_flag = TRUE_m13;
+			m13_fp->flags |= FILE_FLAGS_PARITY_m13;  // this function can be run with parity & non-parity files, don't want fwrite to call PRTY_update_m13() on this write
+		}  // if std file & not call fwrite_m13 with path, PRTY_update_m13() won't be called
+	}
+	nrw = fwrite_m13(crcs, sizeof(ui1), (size_t) crc_bytes, fp);
+	if (nrw != crc_bytes)
+		goto PCRC_UPDATE_FAIL_m13;
+	
+	r_val = TRUE_m13;
+	
+PCRC_UPDATE_FAIL_m13:
+	
+	// clean up
+	if (crcs)
+		free(crcs);
+	if (tmp_data)
+		free(tmp_data);
+	if (is_std == FALSE_m13 && unset_parity_flag == TRUE_m13)
+		m13_fp->flags &= ~FILE_FLAGS_PARITY_m13;
+	if (was_open == FALSE_m13)
+		fclose_m13(fp);
+	else if (fseek_m13(fp, offset, SEEK_SET))  // reset to incoming file position
+		r_val = FALSE_m13;  // reset error
+
+	return_m13(r_val);
+}
+
+
+// verdict only: are this file's appended block crcs intact?  PCRC_find_damage_m13() answers which blocks
+// are not, & is what a repair needs; this form stops at the first failure.
+tern	PCRC_validate_m13(const si1 *file_path)
+{
+#ifdef FT_DEBUG_m13
+	G_push_function_m13();
+#endif
+
+	return_m13(PCRC_find_damage_m13(file_path, NULL, NULL, NULL));
+}
+
+
+tern	PCRC_write_m13(const si1 *file_path, ui4 block_bytes)
+{
+	tern				r_val, vid_data, is_parity;
+	ui1				*bytes;
+	ui4				*crcs, n_blocks, max_block_bytes;
+	si4				i;
+	si8				len, old_flen, header_offset, ext_offset, member_bytes, crc_offset, nrw;
+	PCRC_DATA_m13		pcrc;
+	PRTY_IDENT_m13		*ext, *tmp_ext;
+	PRTY_MANIFEST_m13	ext_st;
+	FILE_m13			*fp;
+	UH_m13				uh;
+
+#ifdef FT_DEBUG_m13
+	G_push_function_m13();
+#endif
+
+	// function expects file to be closed
+	// pass zero for blocks_bytes to use default
+	// file_path can be any file, typically used for files that have no CRCs such as parity data and video data
+	// can be used to enhance localization in any file that has only one crc for the entire body, such as record or time series index files
+
+
+	if (G_exists_m13(file_path) != TRUE_m13) {  // might be directory
+		G_warning_message_m13("%s(): file \"%s\" does not exist\n", __FUNCTION__, file_path);
+		return_m13(FALSE_m13);
+	}
+
+	r_val = FALSE_m13;
+	bytes = NULL;
+	crcs = NULL;
+	ext = NULL;
+
+	// open file
+	fp = fopen_m13(file_path, "r+");
+	if (fp == NULL)
+		return_m13(FALSE_m13);
+	fp->flags |= FILE_FLAGS_PARITY_m13;  // pcrc bytes lie outside parity coverage by design (PRTY_build_m13() uses pcrc offset lengths): don't let fwrite_m13() invoke a parity update for them
+	old_flen = flen_m13(fp);
+	len = PCRC_offset_m13(fp, NULL, &pcrc);  // start of pcrc crcs, if they exist, otherwise where they should go
+
+	if (len == FALSE_m13) {  // error
+		fclose_m13(fp);
+		return_m13(FALSE_m13);
+	}
+
+	vid_data = G_is_video_data_m13(fp->path);
+	is_parity = PRTY_is_parity_m13(fp->path, TRUE_m13);
+	if (is_parity == TRUE_m13) {
+		// parity files have no universal header (body is xor of member files): identity comes from member file universal headers
+		vid_data = FALSE_m13;  // video data parity files have no universal header footer either
+		tmp_ext = PRTY_manifest_m13(fp, NULL, &ext_offset);  // existing extension will be regenerated: exclude it from data length
+		if (tmp_ext != NULL) {
+			len = ext_offset;
+			free(tmp_ext);
+		}
+		ext = PRTY_set_manifest_m13(&pcrc, fp->path);
+		if (ext == NULL)
+			goto PCRC_WRITE_FAIL;
+
+		// write extension after parity data (covered by the pcrc block crcs: transparent to pre-extension readers)
+		// on-disk layout: [ member file UIDs (ascending) ][ PRTY_MANIFEST_m13 ]  (session & segment UID travel in the pcrc trailer)
+		member_bytes = (si8) ext->n_members * (si8) sizeof(PRTY_MEMBER_m13);
+		memset(&ext_st, 0, sizeof(PRTY_MANIFEST_m13));
+		ext_st.version_major = PRTY_MANIFEST_VER_MAJOR_m13;
+		ext_st.version_minor = PRTY_MANIFEST_VER_MINOR_m13;
+		ext_st.n_members = ext->n_members;
+		ext_st.channel_UID = ext->channel_UID;
+		ext_st.tag = PRTY_MANIFEST_TAG_m13;
+		if (fseek_m13(fp, len, SEEK_SET))
+			goto PCRC_WRITE_FAIL;
+		if (member_bytes) {
+			nrw = fwrite_m13(ext->members, sizeof(ui1), (size_t) member_bytes, fp);
+			if (nrw != member_bytes)
+				goto PCRC_WRITE_FAIL;
+		}
+		nrw = fwrite_m13(&ext_st, sizeof(PRTY_MANIFEST_m13), (size_t) 1, fp);
+		if (nrw != 1)
+			goto PCRC_WRITE_FAIL;
+		len += member_bytes + (si8) sizeof(PRTY_MANIFEST_m13);
+	} else {
+		// read universal header
+		if (vid_data == TRUE_m13)
+			header_offset = len - UH_BYTES_m13;  // between end of video data & start of pcrc crcs
+		else
+			header_offset = 0;
+		if (fseek_m13(fp, header_offset, SEEK_SET))
+			goto PCRC_WRITE_FAIL;
+
+		nrw = fread_m13(&uh, sizeof(ui1), UH_BYTES_m13, fp);
+		if (nrw != UH_BYTES_m13)
+			goto PCRC_WRITE_FAIL;
+		pcrc.session_UID = uh.session_UID;
+		pcrc.segment_UID = uh.segment_UID;
+	}
+
+	// rewind
+	if (fseek_m13(fp, 0, SEEK_SET))
+		goto PCRC_WRITE_FAIL;
+
+	// allocate
+	if (block_bytes == 0)
+		block_bytes = PCRC_BLOCK_BYTES_DEFAULT_m13;
+	bytes = (ui1 *) malloc((size_t) block_bytes);
+	if (bytes == NULL) {
+		G_set_error_m13(E_ALLOC_m13, NULL);
+		goto PCRC_WRITE_FAIL;
+	}
+	n_blocks = pcrc.n_blocks = (ui4) ceil((sf8) len / (sf8) block_bytes);
+	crcs = (ui4 *) malloc((size_t) n_blocks * sizeof(ui4));
+	if (crcs == NULL) {
+		G_set_error_m13(E_ALLOC_m13, NULL);
+		goto PCRC_WRITE_FAIL;
+	}
+
+	// calculate crcs
+	crc_offset = len;  // crcs start where covered bytes end
+	max_block_bytes = 0;
+	for (i = 0; i < n_blocks; ++i) {
+		if (len < block_bytes)
+			block_bytes = len;
+		if (max_block_bytes < block_bytes)
+			max_block_bytes = block_bytes;  // capture largest block bytes (often less than block_bytes because only one block)
+
+		nrw = fread_m13(bytes, sizeof(ui1), block_bytes, fp);
+		if (nrw != block_bytes)
+			goto PCRC_WRITE_FAIL;
+		crcs[i] = CRC_calculate_m13(bytes, block_bytes);
+		len -= block_bytes;
+	}
+
+	// write crcs
+	if (fseek_m13(fp, crc_offset, SEEK_SET))  // explicit reposition: ANSI C requires a seek between read & write on update streams (unless at EOF, which is not guaranteed on rewrites)
+		goto PCRC_WRITE_FAIL;
+	nrw = fwrite_m13(crcs, sizeof(ui4), (size_t) n_blocks, fp);
+	if (nrw != n_blocks)
+		goto PCRC_WRITE_FAIL;
+
+	// write pcrc structure
+	pcrc.tag = PCRC_TAG_m13;
+	pcrc.n_blocks = n_blocks;
+	pcrc.block_bytes = max_block_bytes;
+	nrw = fwrite_m13(&pcrc, sizeof(PCRC_DATA_m13), (size_t) 1, fp);
+	if (nrw != 1)
+		goto PCRC_WRITE_FAIL;
+
+	// NOTE: the video universal header is NOT re-appended after the pcrc.  Video data file layout is
+	// [native container][UH][pcrc]: the UH is the last COVERED element (read above at len - UH_BYTES for the
+	// trailer UIDs), & the pcrc is an excluded appendage - exactly as for every other file type.  This is what
+	// the CSig/DGST video holdback expects (data_end == pcrc_offset: the rolling holdback lands on the UH), &
+	// it keeps the UH inside pcrc & parity coverage.  (An earlier version re-appended the UH after the trailer,
+	// which moved the trailer off the file end => PCRC_offset_m13() could no longer find it.)
+
+	// remove stale bytes (rewrites can shrink the trailer, e.g. regenerated extension with fewer members)
+	len = ftell_m13(fp);
+	if (len < old_flen)
+		if (ftruncate_m13(fp, (off_t) len))
+			goto PCRC_WRITE_FAIL;
+
+	r_val = TRUE_m13;
+
+PCRC_WRITE_FAIL:
+
+	// clean up
+	if (fp)
+		fclose_m13(fp);
+	if (bytes)
+		free(bytes);
+	if (crcs)
+		free(crcs);
+	if (ext)
+		free(ext);
+
+	return_m13(r_val);
+}
+
+
+// MARK: PARITY FUNCTIONS  (PRTY)
+
+// static prototypes (alphabetical order can place callers before callees)
+static tern	PRTY_compare_files_m13(const si1 *member_path, const si1 *parity_path, PRTY_m13 *parity_ps);
+static si8	PRTY_group_max_other_len_m13(const si1 *member_path, const si1 *par_path);
+static tern	PRTY_parity_path_m13(const si1 *path, si1 *par_path);
+static void	PRTY_report_mismatch_m13(PRTY_m13 *parity_ps, si8 entry_mismatch_bytes);
+static tern	PRTY_write_or_verify_m13(const si1 *session_path, ui4 flags, si4 segment_number, tern verify);
 
 
 tern	PRTY_build_m13(PRTY_m13 *parity_ps)
@@ -46435,8 +48696,6 @@ tern	PRTY_build_m13(PRTY_m13 *parity_ps)
 				continue;
 			source_bytes_to_read = bytes_to_read;
 			source_bytes_remaining = source_file->len - bytes_written;
-			if (source_bytes_remaining & 7)
-				G_warning_message_m13("%s(): source_bytes_remaining not multiple of 8 in \"%s\"\n", __FUNCTION__, source_file->path);
 			if (source_bytes_to_read >= source_bytes_remaining) {
 				source_bytes_to_read = source_bytes_remaining;
 				source_file->finished = TRUE_m13;
@@ -46451,6 +48710,11 @@ tern	PRTY_build_m13(PRTY_m13 *parity_ps)
 			
 			for (j = source_bytes_to_read >> 3; j--;)
 				*target_ptr++ ^= *source_ptr++;
+			if (source_bytes_to_read & 7) {  // tail bytes: member lengths need not be 8-aligned (native video containers)
+				ui1	*target_bp = (ui1 *) target_ptr, *source_bp = (ui1 *) source_ptr;
+				for (j = source_bytes_to_read & 7; j--;)
+					*target_bp++ ^= *source_bp++;
+			}
 		}
 
 		if (verify == TRUE_m13) {
@@ -46503,6 +48767,80 @@ tern	PRTY_build_m13(PRTY_m13 *parity_ps)
 		return_m13(FALSE_m13);
 
 	return_m13(TRUE_m13);
+}
+
+
+//*******************************//
+
+
+// Single-member parity: the parity file is a copy of its one member, so verification is a byte compare
+// of the two DATA regions (each file may carry its own pcrc tail, which is not parity data).
+static tern	PRTY_compare_files_m13(const si1 *member_path, const si1 *parity_path, PRTY_m13 *parity_ps)
+{
+	ui1			*a, *b;
+	si4			i;
+	si8			a_len, b_len, n, block_bytes, off;
+	FILE_m13		*a_fp, *b_fp;
+	PRTY_IDENT_m13	*tmp_ext;
+
+#ifdef FT_DEBUG_m13
+	G_push_function_m13();
+#endif
+
+	a_fp = fopen_m13(member_path, "r");
+	if (a_fp == NULL)
+		return_m13(FALSE_m13);
+	b_fp = fopen_m13(parity_path, "r");
+	if (b_fp == NULL) {
+		fclose_m13(a_fp);
+		return_m13(FALSE_m13);
+	}
+	// Parity DATA ends where the pcrc EXTENSION begins.  The extension (member UIDs + PRTY_MANIFEST_m13)
+	// sits between the data & the pcrc crcs & is deliberately invisible to PCRC_offset_m13(), which
+	// reports where the crcs start - counting it as data makes every extension-bearing parity file
+	// mismatch by exactly (8 * n_members + 24) bytes.  PRTY_manifest_m13() reports the data end for both
+	// cases: the extension start, or the crc start where there is no extension (legacy files).
+	tmp_ext = PRTY_manifest_m13(a_fp, NULL, &a_len);
+	if (tmp_ext != NULL)
+		free(tmp_ext);
+	tmp_ext = PRTY_manifest_m13(b_fp, NULL, &b_len);
+	if (tmp_ext != NULL)
+		free(tmp_ext);
+	if (a_len == FALSE_m13 || b_len == FALSE_m13) {	 // could not read one of the files
+		fclose_m13(a_fp); fclose_m13(b_fp);
+		return_m13(FALSE_m13);
+	}
+	if (a_len != b_len) {
+		parity_ps->mismatch_bytes += (a_len > b_len) ? (a_len - b_len) : (b_len - a_len);
+		if (parity_ps->first_mismatch_offset < 0)
+			parity_ps->first_mismatch_offset = (a_len < b_len) ? a_len : b_len;
+		fclose_m13(a_fp); fclose_m13(b_fp);
+		return_m13(FALSE_m13);
+	}
+
+	block_bytes = parity_ps->mem_block_bytes;
+	a = parity_ps->parity;		// reuse the caller-owned buffers
+	b = parity_ps->data;
+	for (off = 0; off < a_len; off += n) {
+		n = a_len - off;
+		if (n > block_bytes)
+			n = block_bytes;
+		if (fread_m13(a, sizeof(ui1), (size_t) n, a_fp) != n || fread_m13(b, sizeof(ui1), (size_t) n, b_fp) != n) {
+			fclose_m13(a_fp); fclose_m13(b_fp);
+			return_m13(FALSE_m13);
+		}
+		for (i = 0; i < (si4) n; ++i) {
+			if (a[i] != b[i]) {
+				if (parity_ps->first_mismatch_offset < 0)
+					parity_ps->first_mismatch_offset = off + i;
+				++parity_ps->mismatch_bytes;
+			}
+		}
+	}
+	fclose_m13(a_fp);
+	fclose_m13(b_fp);
+
+	return_m13(parity_ps->mismatch_bytes ? FALSE_m13 : TRUE_m13);
 }
 
 
@@ -46693,6 +49031,301 @@ si1	**PRTY_file_list_m13(const si1 *MED_path, si4 *n_files)  // MED_path is MED 
 }
 
 
+tern	PRTY_find_damage_m13(const si1 *file_path, PRTY_BLOCK_m13 **bad_blocks, si4 *n_bad_blocks, ui4 *n_blocks)
+{
+	tern			r_val, valid, header_valid, body_valid, return_bb, localizing_crcs;
+	ui1			*bytes, *idx_bytes;
+	si1			idx_path[PATH_BYTES_m13];
+	ui4			n_b, type_code;
+	si4			n_bb, p_n_bb, bb_size, BAD_BLOCK_INCREMENT;
+	si8			i, len, idx_len, nr, offset, record_bytes, block_bytes;
+	si8			header_offset, read_offset, read_len;
+	FILE_m13		*fp, *idx_fp;
+	UH_m13			*uh;
+	GEN_IDX_m13		*idx;
+	REC_HDR_m13		*rh;
+	CMP_FIXED_BH_m13	*bh;
+	PRTY_BLOCK_m13		*bb, *p_bb;
+	PCRC_DATA_m13	pcrc;
+
+#ifdef FT_DEBUG_m13
+	G_push_function_m13();
+#endif
+
+	// validates a MED file's OWN CRCs & reports WHERE it is damaged
+	// bad_blocks & n_bad_blocks are returned only if BOTH are passed; n_blocks may be passed alone
+	// any of the three may be NULL - all three NULL is just a verdict, which is what PRTY_validate_m13() is
+	// returns TRUE_m13 if valid, FALSE_m13 if invalid, UNKNOWN_m13 for errors
+	//
+	// this was one varargs function serving both contracts (verdict & diagnostics).  In the verdict form the
+	// varargs branch was skipped, which left bad_blocks / n_bad_blocks / n_blocks UNINITIALISED on the stack &
+	// then wrote through them.  Real parameters make that unrepresentable.
+
+	return_bb = FALSE_m13;
+	BAD_BLOCK_INCREMENT = 5;
+	if (bad_blocks && n_bad_blocks) {
+		return_bb = TRUE_m13;
+		*bad_blocks = NULL;
+		*n_bad_blocks = 0;
+	}
+	if (n_blocks)
+		*n_blocks = 0;
+	bytes = NULL;
+	bb = NULL;
+	n_b = n_bb = bb_size = 0;
+
+	G_message_m13("Validating \"%s\" ... ", file_path);
+
+	if (G_exists_m13(file_path) == DOES_NOT_EXIST_m13) {
+		G_warning_message_m13("\n%s(): file \"%s\" does not exist\n", __FUNCTION__, file_path);
+		return_m13(UNKNOWN_m13);
+	}
+
+	// parity files have no universal header (body is xor of member file bytes): pcrc block crcs are the only validation
+	// (checked before the type code switch: parity file names carry member-type extensions)
+	if (PRTY_is_parity_m13(file_path, UNKNOWN_m13) == TRUE_m13) {
+		valid = PCRC_find_damage_m13(file_path, &bb, &n_bb, &n_b);
+		goto PRTY_VALIDATE_EXIT_m13;
+	}
+
+	type_code = G_MED_type_code_from_string_m13(file_path);
+	switch (type_code) {
+		case SESS_TYPE_CODE_m13:
+		case SSR_TYPE_CODE_m13:
+		case TS_CHAN_TYPE_CODE_m13:
+		case VID_CHAN_TYPE_CODE_m13:
+		case TS_SEG_TYPE_CODE_m13:
+		case VID_SEG_TYPE_CODE_m13:
+			G_warning_message_m13("\n%s(): \"%s\" is a MED directory, not file\n", __FUNCTION__, file_path);
+			return_m13(UNKNOWN_m13);
+		case REC_DATA_TYPE_CODE_m13:
+		case REC_INDS_TYPE_CODE_m13:
+		case TS_METADATA_TYPE_CODE_m13:
+		case TS_DATA_TYPE_CODE_m13:
+		case TS_INDS_TYPE_CODE_m13:
+		case VID_METADATA_TYPE_CODE_m13:
+		case VID_DATA_TYPE_CODE_m13:
+		case VID_INDS_TYPE_CODE_m13:
+			break;
+		case NO_TYPE_CODE_m13:
+		default:
+			G_warning_message_m13("\n%s(): file \"%s\" is not a MED type\n", __FUNCTION__, file_path);
+			return_m13(UNKNOWN_m13);
+	}
+	
+	fp = fopen_m13(file_path, "r");
+	if (fp == NULL)
+		return_m13(UNKNOWN_m13);
+	len = PCRC_offset_m13(fp, NULL, &pcrc);
+	if (len == FALSE_m13) {  // error
+		fclose_m13(fp);
+		return_m13(UNKNOWN_m13);
+	}
+	header_offset = G_header_offset_m13(fp, NULL);  // video data universal header is a footer (last covered element, before the pcrc trailer)
+	if (header_offset < 0 || (header_offset + (si8) UH_BYTES_m13) > len) {  // error (FALSE_m13) or malformed file
+		fclose_m13(fp);
+		return_m13(UNKNOWN_m13);
+	}
+	if (type_code == VID_DATA_TYPE_CODE_m13) {  // native container body is validated by pcrc block crcs (read from file by PCRC_validate_m13()): footer universal header is all that is needed here
+		read_offset = header_offset;
+		read_len = (si8) UH_BYTES_m13;
+	} else {
+		read_offset = 0;
+		read_len = len;
+	}
+	bytes = (ui1 *) malloc((size_t) read_len);
+	if (bytes == NULL) {
+		G_warning_message_m13("\n%s(): allocation error\n", __FUNCTION__);
+		fclose_m13(fp);
+		return_m13(UNKNOWN_m13);
+	}
+	fseek_m13(fp, read_offset, SEEK_SET);
+	nr = fread_m13(bytes, sizeof(ui1), (size_t) read_len, fp);
+	fclose_m13(fp);
+	if (nr != read_len) {
+		free(bytes);
+		return_m13(UNKNOWN_m13);
+	}
+
+	// check universal header CRCs
+	header_valid = body_valid = valid = UNKNOWN_m13;
+	// header CRC
+	uh = (UH_m13 *) bytes;  // read starts at header_offset, so universal header is at buffer start for all types
+	header_valid = CRC_validate_m13(bytes + UH_HEADER_CRC_START_OFFSET_m13, UH_BYTES_m13 - UH_HEADER_CRC_START_OFFSET_m13, uh->header_CRC);
+	if (header_valid == FALSE_m13) {
+		if (return_bb == TRUE_m13) {
+			if (n_bb == bb_size) {
+				bb_size += BAD_BLOCK_INCREMENT;
+				bb = (PRTY_BLOCK_m13 *) realloc_m13(bb, (size_t) bb_size * sizeof(PRTY_BLOCK_m13));
+			}
+			bb[n_bb].length = (si8) UH_BYTES_m13;
+			bb[n_bb].offset = header_offset;
+			++n_bb;
+		}
+	}
+	// body CRC
+	if (type_code == VID_DATA_TYPE_CODE_m13) {
+		// native containers carry no whole-body MED CRC: the pcrc block crcs are the body validation, when present
+		// (no pcrc data == body unvalidatable == UNKNOWN_m13, not an error: pcrcs arrive with parity generation)
+		if (pcrc.n_blocks) {
+			p_bb = NULL;
+			p_n_bb = 0;
+			body_valid = PCRC_find_damage_m13(file_path, &p_bb, &p_n_bb, &n_b);
+			if (p_n_bb) {  // merge pcrc bad blocks (universal header entry may precede them)
+				if (n_bb == 0) {
+					bb = p_bb;
+					bb_size = n_bb = p_n_bb;
+				} else {
+					bb_size = n_bb + p_n_bb;
+					bb = (PRTY_BLOCK_m13 *) realloc_m13(bb, (size_t) bb_size * sizeof(PRTY_BLOCK_m13));
+					memcpy(bb + n_bb, p_bb, (size_t) p_n_bb * sizeof(PRTY_BLOCK_m13));
+					n_bb = bb_size;
+					free_m13(p_bb);
+				}
+			}
+		}
+	} else {
+		body_valid = CRC_validate_m13(bytes + UH_BODY_CRC_START_OFFSET_m13, len - UH_BODY_CRC_START_OFFSET_m13, uh->body_CRC);
+		if (body_valid == FALSE_m13) {
+			if (return_bb == TRUE_m13) {
+				if (n_bb == bb_size) {
+					bb_size += BAD_BLOCK_INCREMENT;
+					bb = (PRTY_BLOCK_m13 *) realloc_m13(bb, (size_t) bb_size * sizeof(PRTY_BLOCK_m13));
+				}
+				bb[n_bb].length = len - (si8) UH_BODY_CRC_START_OFFSET_m13;
+				bb[n_bb].offset = (si8) UH_BODY_CRC_START_OFFSET_m13;
+				++n_bb;
+			}
+		}
+	}
+	if (header_valid == TRUE_m13 && body_valid == TRUE_m13)
+		valid = TRUE_m13;
+	else if (header_valid == FALSE_m13 || body_valid == FALSE_m13)
+		valid = FALSE_m13;
+
+	localizing_crcs = FALSE_m13;
+	if (body_valid != TRUE_m13 && return_bb == TRUE_m13)
+		if (type_code == REC_DATA_TYPE_CODE_m13 || type_code == TS_DATA_TYPE_CODE_m13 || (type_code != VID_DATA_TYPE_CODE_m13 && pcrc.n_blocks))  // video data pcrcs checked above (body validation, not localization)
+			localizing_crcs = TRUE_m13;
+
+	// check body CRCs (localize within in data files)
+	if (localizing_crcs == TRUE_m13) {
+		if (body_valid == FALSE_m13) {
+			if (bb[0].offset == 0)  // keep universal header entry, if present, overwrite body entry
+				n_bb = 1;
+			else
+				n_bb = 0;  // overwrite body entry
+		}
+		if (type_code == REC_DATA_TYPE_CODE_m13) {
+			idx_len = strcpy_m13(idx_path, file_path);
+			strcpy(idx_path + (idx_len - 4), REC_INDS_TYPE_STR_m13);
+			idx_fp = fopen_m13(idx_path, "r");
+			if (idx_fp == NULL)
+				goto PRTY_VALIDATE_EXIT_m13;
+			idx_len = flen_m13(idx_fp);
+			idx_bytes = (ui1 *) malloc((size_t) idx_len);
+			if (idx_bytes == NULL) {
+				G_warning_message_m13("\n%s(): allocation error\n", __FUNCTION__);
+				fclose_m13(idx_fp);
+				goto PRTY_VALIDATE_EXIT_m13;
+			}
+			nr = fread_m13(idx_bytes, sizeof(ui1), (size_t) idx_len, idx_fp);
+			fclose_m13(idx_fp);
+			if (nr != idx_len) {
+				free(idx_bytes);
+				G_warning_message_m13("\n%s(): index file read error\n", __FUNCTION__);
+				goto PRTY_VALIDATE_EXIT_m13;
+			}
+			idx = (GEN_IDX_m13 *) (idx_bytes + UH_BYTES_m13);
+			for (i = uh->n_entries - 1; i--; ++idx) {
+				offset = idx->file_offset;
+				rh = (REC_HDR_m13 *) (bytes + offset);
+				record_bytes = (idx + 1)->file_offset - offset;  // no discontinuities in record indices
+				r_val = CRC_validate_m13((ui1 *) rh + REC_HDR_CRC_START_OFFSET_m13, record_bytes - REC_HDR_CRC_START_OFFSET_m13, rh->record_CRC);
+				if (r_val == FALSE_m13) {
+					if (return_bb == TRUE_m13) {
+						if (n_bb == bb_size) {
+							bb_size += BAD_BLOCK_INCREMENT;
+							bb = (PRTY_BLOCK_m13 *) realloc_m13(bb, (size_t) bb_size * sizeof(PRTY_BLOCK_m13));
+						}
+						bb[n_bb].length = (si8) rh->total_record_bytes;
+						bb[n_bb].offset = offset;
+						++n_bb;
+					}
+				}
+			}
+		} else if (type_code == TS_DATA_TYPE_CODE_m13) {
+			idx_len = strcpy_m13(idx_path, file_path);
+			strcpy(idx_path + (idx_len - 4), TS_INDS_TYPE_STR_m13);
+			idx_fp = fopen_m13(idx_path, "r");
+			if (idx_fp == NULL)
+				goto PRTY_VALIDATE_EXIT_m13;
+			idx_len = flen_m13(idx_fp);
+			idx_bytes = (ui1 *) malloc((size_t) idx_len);
+			if (idx_bytes == NULL) {
+				G_warning_message_m13("\n%s(): allocation error\n", __FUNCTION__);
+				fclose_m13(idx_fp);
+				goto PRTY_VALIDATE_EXIT_m13;
+			}
+			nr = fread_m13(idx_bytes, sizeof(ui1), (size_t) idx_len, idx_fp);
+			fclose_m13(idx_fp);
+			if (nr != idx_len) {
+				free(idx_bytes);
+				G_warning_message_m13("\n%s(): index file read error\n", __FUNCTION__);
+				goto PRTY_VALIDATE_EXIT_m13;
+			}
+			idx = (GEN_IDX_m13 *) (idx_bytes + UH_BYTES_m13);
+			for (i = uh->n_entries - 1; i--; ++idx) {
+				offset = REMOVE_DISCONT_m13(idx->file_offset);  // discontinuities possible in time series indices
+				bh = (CMP_FIXED_BH_m13 *) (bytes + offset);
+				block_bytes = REMOVE_DISCONT_m13((idx + 1)->file_offset) - offset;
+				r_val = CRC_validate_m13((ui1 *) bh + CMP_BLOCK_CRC_START_OFFSET_m13, block_bytes - CMP_BLOCK_CRC_START_OFFSET_m13, bh->block_CRC);
+				if (r_val == FALSE_m13) {
+					if (return_bb == TRUE_m13) {
+						if (n_bb == bb_size) {
+							bb_size += BAD_BLOCK_INCREMENT;
+							bb = (PRTY_BLOCK_m13 *) realloc_m13(bb, (size_t) bb_size * sizeof(PRTY_BLOCK_m13));
+						}
+						bb[n_bb].length = (si8) bh->total_block_bytes;
+						bb[n_bb].offset = offset;
+						++n_bb;
+					}
+				}
+			}
+		} else {  // pcrc data present (video data never reaches here: its pcrcs are checked above as body validation)
+			valid = PCRC_find_damage_m13(file_path, &bb, &n_bb, &n_b);
+		}
+	}
+	
+PRTY_VALIDATE_EXIT_m13:
+	
+	free(bytes);
+	
+	if (return_bb == TRUE_m13 && n_bb) {
+		*bad_blocks = bb;
+		*n_bad_blocks = n_bb;
+	} else if (bb) {
+		free_m13(bb);
+	}
+	if (n_blocks)  // reported whenever asked for, not only alongside bad blocks
+		*n_blocks = n_b;
+
+	switch (valid) {
+		case FALSE_m13:
+			G_message_m13("%sinvalid%s\n", TC_RED_m13, TC_RESET_m13);
+			break;
+		case UNKNOWN_m13:
+			G_message_m13("%sprocessing error%s\n", TC_BLUE_m13, TC_RESET_m13);
+			break;
+		case TRUE_m13:
+			G_message_m13("%svalid%s\n", TC_GREEN_m13, TC_RESET_m13);
+			break;
+	}
+
+	return_m13(valid);
+}
+
+
 ui4	PRTY_flag_for_path_m13(const si1 *path)
 {
 	ui4	type_code, level_code, flag;
@@ -46772,6 +49405,56 @@ ui4	PRTY_flag_for_path_m13(const si1 *path)
 }
 
 
+// Longest member of a parity group OTHER than member_path, in data bytes (pcrc tails excluded).
+// Group membership is decided by running the SAME forward mapping every member uses to find its parity
+// file (PRTY_parity_path_m13()) & keeping the files that land on this one - rather than re-deriving the
+// grouping, which could disagree with the writer for its own reasons.
+// returns FALSE_m13 on failure (0 is a legitimate answer: no other member, or all others empty)
+static si8	PRTY_group_max_other_len_m13(const si1 *member_path, const si1 *par_path)
+{
+	si1			sess_path[PATH_BYTES_m13], cand_par_path[PATH_BYTES_m13];
+	si1			**file_list;
+	si4			i, n_files;
+	si8			len, max_len;
+	FILE_m13		*fp;
+	PRTY_IDENT_m13	*tmp_ext;
+
+#ifdef FT_DEBUG_m13
+	G_push_function_m13();
+#endif
+
+	if (G_session_path_for_path_m13(member_path, sess_path) == NULL)
+		return_m13(FALSE_m13);
+	file_list = PRTY_file_list_m13(sess_path, &n_files);
+	if (file_list == NULL)
+		return_m13(FALSE_m13);
+
+	max_len = 0;
+	for (i = 0; i < n_files; ++i) {
+		if (strcmp(file_list[i], member_path) == 0)
+			continue;
+		if (PRTY_is_parity_m13(file_list[i], TRUE_m13) == TRUE_m13)
+			continue;
+		if (PRTY_parity_path_m13(file_list[i], cand_par_path) == FALSE_m13)
+			continue;
+		if (strcmp(cand_par_path, par_path) != 0)
+			continue;  // different group
+		fp = fopen_m13(file_list[i], "r");
+		if (fp == NULL)
+			continue;
+		tmp_ext = PRTY_manifest_m13(fp, file_list[i], &len);  // data end, not the pcrc crc start
+		if (tmp_ext != NULL)
+			free(tmp_ext);
+		fclose_m13(fp);
+		if (len > max_len)
+			max_len = len;
+	}
+	free_m13(file_list);
+
+	return_m13(max_len);
+}
+
+
 tern	PRTY_is_parity_m13(const si1 *path, tern MED_file)
 {
 	si1		name[MAX_NAME_BYTES_m13], ext[TYPE_BYTES_m13];
@@ -46802,48 +49485,6 @@ tern	PRTY_is_parity_m13(const si1 *path, tern MED_file)
 		return_m13(FALSE_m13);
 
 	return_m13(TRUE_m13);
-}
-
-
-si8	PCRC_block_bytes_m13(FILE_m13 *fp, const si1 *file_path)
-{
-	tern			close_file;
-	si8			block_len, pcrc_offset;
-	PCRC_DATA_m13	pcrc;
-	
-#ifdef FT_DEBUG_m13
-	G_push_function_m13();
-#endif
-	
-	// returns block length of pcrc crcs or default length if no pcrc data exists
-	// returns FALSE_m13 on failure
-	// if fp passed: assumes file is open with read priveleges, returns fp to where it was when called
-	// if path passed: file is opened & closed
-	
-	// PCRC_BLOCK_BYTES_DEFAULT_m13
-	
-	if (fp == NULL) {
-		fp = fopen_m13(file_path, "r");
-		if (fp == NULL)
-			return_m13(0);
-		close_file = TRUE_m13;
-	} else {
-		close_file = FALSE_m13;
-	}
-
-	// pcrc structure sits at the end of all pcrc-bearing files (video data included): PCRC_offset_m13() locates it & restores the file position
-	pcrc_offset = PCRC_offset_m13(fp, NULL, &pcrc);
-	if (close_file == TRUE_m13)
-		fclose_m13(fp);
-	if (pcrc_offset == FALSE_m13)
-		return_m13(FALSE_m13);
-
-	if (pcrc.n_blocks)
-		block_len = pcrc.block_bytes;
-	else
-		block_len = PCRC_BLOCK_BYTES_DEFAULT_m13;
-
-	return_m13(block_len);
 }
 
 
@@ -46953,74 +49594,33 @@ PRTY_MANIFEST_EXIT_m13:
 }
 
 
-si8	PCRC_offset_m13(FILE_m13 *fp, const si1 *file_path, PCRC_DATA_m13 *pcrc)
+// The parity file a given MED file contributes to.  Factored out of PRTY_update_m13() so that every
+// operation which alters a member - write, truncate - maps to its parity file through the SAME code: a
+// second derivation that drifted from this one would silently maintain the wrong file.
+// returns FALSE_m13 on failure; TRUE_m13 with par_path set otherwise (existence is the caller's to check)
+static tern	PRTY_parity_path_m13(const si1 *path, si1 *par_path)
 {
-	tern			got_pcrc, close_fp;
-	si8			nr, flen, in_offset, pcrc_offset, pcrc_bytes;
-	PCRC_DATA_m13	local_pcrc;
-	
+	si1	base_name[MAX_NAME_BYTES_m13], ext[TYPE_BYTES_m13];
+	ui4	level_code;
+
 #ifdef FT_DEBUG_m13
 	G_push_function_m13();
 #endif
-	
-	// returns offset of pcrc CRCs (+ pcrc data if pointer passed)
-	// if no pcrc data exists, returns offset to where pcrc crcs would begin (& sets zeros pcrc if ponter passed)
-	// returns FALSE_m13 (-1) on failure
-	// if fp passed: assumes file is open with read privileges, returns fp to where it was when called
-	// if path passed: file is opened & closed
-	// pass NULL for pcrc if not needed
-	
-	// set error conditions
-	pcrc_offset = got_pcrc = close_fp = FALSE_m13;
-	if (pcrc == NULL)
-		pcrc = &local_pcrc;
-	
-	if (fp == NULL) {
-		fp = fopen_m13(file_path, "r");
-		if (fp == NULL)
-			return_m13(FALSE_m13);
-		close_fp = TRUE_m13;
+
+	level_code = G_level_m13(path, NULL);
+	if (level_code == SESS_TYPE_CODE_m13 || level_code == SSR_TYPE_CODE_m13) {
+		G_path_parts_m13(path, par_path, NULL, ext);
+		if (level_code == SESS_TYPE_CODE_m13)
+			sprintf_m13(par_path, "%s/parity.%s", par_path, ext);
+		else  // level_code == SSR_TYPE_CODE_m13
+			sprintf_m13(par_path, "%s/parity_s0000.%s", par_path, ext);
 	} else {
-		in_offset = ftell_m13(fp);
+		if (G_base_name_m13(NULL, path, base_name) == NULL)
+			return_m13(FALSE_m13);
+		STR_replace_pattern_m13(base_name, "parity", (si1 *) path, par_path);
 	}
-	
-	flen = flen_m13(fp);
-	
-	// no pcrc data possible (don't read)
-	if (flen <= (sizeof(ui4) + sizeof(PCRC_DATA_m13))) {  // must be at least one crc + pcrc struct
-		pcrc_offset = flen;  // not error
-		goto PCRC_OFFSET_FAIL;
-	}
-	
-	if (fseek_m13(fp, (size_t) flen - sizeof(PCRC_DATA_m13), SEEK_SET))
-		goto PCRC_OFFSET_FAIL;
-	nr = fread_m13(pcrc, sizeof(PCRC_DATA_m13), (size_t) 1, fp);
-	if (nr != 1)
-		goto PCRC_OFFSET_FAIL;
-\
-	// no pcrc data
-	if (pcrc->tag != PCRC_TAG_m13) {
-		pcrc_offset = flen;  // not error
-		goto PCRC_OFFSET_FAIL;
-	}
-	
-	// pcrc data exists
-	got_pcrc = TRUE_m13;
-	pcrc_bytes = (pcrc->n_blocks * sizeof(ui4)) + sizeof(PCRC_DATA_m13);
-	pcrc_offset = flen - pcrc_bytes;
 
-PCRC_OFFSET_FAIL:
-
-	if (close_fp == TRUE_m13)
-		fclose_m13(fp);
-	else if (fseek_m13(fp, in_offset, SEEK_SET))  // reset error contitions in case got here successfully
-		got_pcrc = pcrc_offset = FALSE_m13;
-
-	if (got_pcrc == FALSE_m13)
-		if (pcrc != &local_pcrc)
-			memset(pcrc, 0, sizeof(PCRC_DATA_m13));
-
-	return_m13(pcrc_offset);
+	return_m13(TRUE_m13);
 }
 
 
@@ -47213,6 +49813,11 @@ tern	PRTY_repair_file_m13(PRTY_m13 *parity_ps)
 				source_ptr = (ui8 *) data;
 				for (k = source_bytes_to_read >> 3; k--;)
 					*target_ptr++ ^= *source_ptr++;
+				if (source_bytes_to_read & 7) {  // tail bytes: member lengths need not be 8-aligned (native video containers)
+					ui1	*target_bp = (ui1 *) target_ptr, *source_bp = (ui1 *) source_ptr;
+					for (k = source_bytes_to_read & 7; k--;)
+						*target_bp++ ^= *source_bp++;
+				}
 			}
 			
 			// show modifications
@@ -47262,6 +49867,19 @@ PRTY_REPAIR_EXIT_m13:
 	}
 	
 	return_m13(repaired);
+}
+
+
+// verify mode: name the group whose parity differs.  The counters in PRTY_m13 accumulate across the
+// whole session & keep only the first offset, so without this a failed verify cannot say WHICH parity
+// file drifted - the first thing anyone needs in order to act on it.
+static void	PRTY_report_mismatch_m13(PRTY_m13 *parity_ps, si8 entry_mismatch_bytes)
+{
+	si8	n;
+
+	n = parity_ps->mismatch_bytes - entry_mismatch_bytes;
+	if (n > 0)
+		G_message_m13("Parity MISMATCH: \"%s\" (%ld byte%s)\n", parity_ps->path, n, n == 1 ? " differs" : "s differ");
 }
 
 
@@ -47812,137 +50430,6 @@ PRTY_IDENT_m13	*PRTY_set_manifest_m13(PCRC_DATA_m13 *pcrc, const si1 *MED_path)
 }
 
 
-tern	PCRC_show_m13(const si1 *file_path)
-{
-	si4			i;
-	si8			pcrc_offset;
-	FILE_m13		*fp;
-	PCRC_DATA_m13	pcrc;
-	PRTY_IDENT_m13	*ext;
-	
-#ifdef FT_DEBUG_m13
-	G_push_function_m13();
-#endif
-		
-	if (G_exists_m13(file_path) == DOES_NOT_EXIST_m13) {
-		G_warning_message_m13("%s(): file \"%s\" does not exist\n", __FUNCTION__, file_path);
-		return_m13(FALSE_m13);
-	}
-	
-	fp = fopen_m13(file_path, "r");
-	pcrc_offset = PCRC_offset_m13(fp, NULL, &pcrc);  // pcrc structure sits at the end of all pcrc-bearing files (video data included)
-	if (pcrc_offset == FALSE_m13 || pcrc.n_blocks == 0) {
-		fclose_m13(fp);
-		G_warning_message_m13("%s(): file \"%s\" does not contain parity crc data\n", __FUNCTION__, file_path);
-		return_m13(FALSE_m13);
-	}
-
-	printf_m13("parity_tag: 0x%016lx\n", pcrc.tag);
-	printf_m13("session_UID: 0x%016lx\n", pcrc.session_UID);
-	printf_m13("segment_UID: 0x%016lx\n", pcrc.segment_UID);
-	printf_m13("n_blocks: %u\n", pcrc.n_blocks);
-	printf_m13("block_bytes: %u\n", pcrc.block_bytes);
-
-	// extension
-	ext = PRTY_manifest_m13(fp, NULL, NULL);
-	fclose_m13(fp);
-	if (ext != NULL) {
-		printf_m13("extension version: %hhu.%hhu\n", ext->version_major, ext->version_minor);
-		printf_m13("extension session_UID: 0x%016lx\n", ext->session_UID);
-		printf_m13("extension channel_UID: 0x%016lx\n", ext->channel_UID);
-		printf_m13("extension segment_UID: 0x%016lx\n", ext->segment_UID);
-		printf_m13("extension n_members: %u\n", ext->n_members);
-		for (i = 0; i < (si4) ext->n_members; ++i)
-			printf_m13("manifest member[%d]: UID 0x%016lx  lib_mod_time %ld  header_CRC 0x%08x  body_CRC 0x%08x\n", i, ext->members[i].file_UID, ext->members[i].lib_mod_time, ext->members[i].header_CRC, ext->members[i].body_CRC);
-		free(ext);
-	} else if (PRTY_is_parity_m13(file_path, TRUE_m13) == TRUE_m13) {
-		printf_m13("no pcrc extension (legacy parity file): UID fields above were never set & are unreliable\n");
-	}
-
-	return_m13(TRUE_m13);
-}
-
-
-// The parity file a given MED file contributes to.  Factored out of PRTY_update_m13() so that every
-// operation which alters a member - write, truncate - maps to its parity file through the SAME code: a
-// second derivation that drifted from this one would silently maintain the wrong file.
-// returns FALSE_m13 on failure; TRUE_m13 with par_path set otherwise (existence is the caller's to check)
-static tern	PRTY_parity_path_m13(const si1 *path, si1 *par_path)
-{
-	si1	base_name[MAX_NAME_BYTES_m13], ext[TYPE_BYTES_m13];
-	ui4	level_code;
-
-#ifdef FT_DEBUG_m13
-	G_push_function_m13();
-#endif
-
-	level_code = G_level_m13(path, NULL);
-	if (level_code == SESS_TYPE_CODE_m13 || level_code == SSR_TYPE_CODE_m13) {
-		G_path_parts_m13(path, par_path, NULL, ext);
-		if (level_code == SESS_TYPE_CODE_m13)
-			sprintf_m13(par_path, "%s/parity.%s", par_path, ext);
-		else  // level_code == SSR_TYPE_CODE_m13
-			sprintf_m13(par_path, "%s/parity_s0000.%s", par_path, ext);
-	} else {
-		if (G_base_name_m13(NULL, path, base_name) == NULL)
-			return_m13(FALSE_m13);
-		STR_replace_pattern_m13(base_name, "parity", (si1 *) path, par_path);
-	}
-
-	return_m13(TRUE_m13);
-}
-
-
-// Longest member of a parity group OTHER than member_path, in data bytes (pcrc tails excluded).
-// Group membership is decided by running the SAME forward mapping every member uses to find its parity
-// file (PRTY_parity_path_m13()) & keeping the files that land on this one - rather than re-deriving the
-// grouping, which could disagree with the writer for its own reasons.
-// returns FALSE_m13 on failure (0 is a legitimate answer: no other member, or all others empty)
-static si8	PRTY_group_max_other_len_m13(const si1 *member_path, const si1 *par_path)
-{
-	si1			sess_path[PATH_BYTES_m13], cand_par_path[PATH_BYTES_m13];
-	si1			**file_list;
-	si4			i, n_files;
-	si8			len, max_len;
-	FILE_m13		*fp;
-	PRTY_IDENT_m13	*tmp_ext;
-
-#ifdef FT_DEBUG_m13
-	G_push_function_m13();
-#endif
-
-	if (G_session_path_for_path_m13(member_path, sess_path) == NULL)
-		return_m13(FALSE_m13);
-	file_list = PRTY_file_list_m13(sess_path, &n_files);
-	if (file_list == NULL)
-		return_m13(FALSE_m13);
-
-	max_len = 0;
-	for (i = 0; i < n_files; ++i) {
-		if (strcmp(file_list[i], member_path) == 0)
-			continue;
-		if (PRTY_is_parity_m13(file_list[i], TRUE_m13) == TRUE_m13)
-			continue;
-		if (PRTY_parity_path_m13(file_list[i], cand_par_path) == FALSE_m13)
-			continue;
-		if (strcmp(cand_par_path, par_path) != 0)
-			continue;  // different group
-		fp = fopen_m13(file_list[i], "r");
-		if (fp == NULL)
-			continue;
-		tmp_ext = PRTY_manifest_m13(fp, file_list[i], &len);  // data end, not the pcrc crc start
-		if (tmp_ext != NULL)
-			free(tmp_ext);
-		fclose_m13(fp);
-		if (len > max_len)
-			max_len = len;
-	}
-	free_m13(file_list);
-
-	return_m13(max_len);
-}
-
-
 // A file that SHRINKS is not a write, so nothing on the fwrite_m13() path ever tells parity about it:
 // the dropped bytes keep contributing to the parity file, which then disagrees with the xor of its
 // members forever after.  (Found by PRTY_verify_m13() on a MED version update, which rewrites the record
@@ -48440,474 +50927,6 @@ PRTY_UPDATE_MANIFEST_EXIT_m13:
 }
 
 
-tern	PCRC_update_m13(void *ptr, si8 n_bytes, si8 offset, void *fp, ...)  // vararg(fp == FILE *): const si1 *path)
-{
-	tern			r_val, is_std, was_open, unset_parity_flag;
-	ui1			*new_data, *tmp_data, *td;
-	const si1		*path;
-	ui4			*crcs;
-	si8			i, j, pcrc_offset, bytes_remaining, crc_bytes, data_start, data_end;
-	si8			nrw, start_block, start_byte, end_block, end_byte, bytes_to_read;
-	FILE_m13		*m13_fp;
-	PCRC_DATA_m13	pcrc;
-	va_list			v_arg;
-
-#ifdef FT_DEBUG_m13
-	G_push_function_m13();
-#endif
-
-	// update pcrc data in file if present
-	// offset presumed to be absolute
-	// returns TRUE_m13 on success or no pcrc data exists
-	// returns FALSE_m13 on failure
-	
-	// check fp
-	if (fp == NULL) {
-		G_set_error_m13(E_GEN_m13, "fp is null");
-		return_m13(FALSE_m13);
-	}
-
-	// get vararg
-	is_std = FILE_is_std_m13(fp);
-	if (is_std == TRUE_m13) {
-		va_start(v_arg, fp);
-		path = va_arg(v_arg, const si1 *);
-		va_end(v_arg);
-	} else {
-		m13_fp = (FILE_m13 *) fp;
-		path = m13_fp->path;
-	}
-	
-	// check path
-	if (STR_is_empty_m13(path) == TRUE_m13) {
-		G_set_error_m13(E_GEN_m13, "path is empty");
-		return_m13(FALSE_m13);
-	}
-	
-	// no pcrc data
-	pcrc_offset = PCRC_offset_m13(fp, NULL, &pcrc);
-	if (pcrc.n_blocks == 0)  // no pcrc data
-		return_m13(TRUE_m13);
-	if (pcrc_offset == FALSE_m13)  // error
-		return_m13(FALSE_m13);
-
-	// determine covered data region (see PCRC_write_m13): pcrcs cover data only - universal headers are excluded
-	if (G_is_video_data_m13(path) == TRUE_m13) {
-		data_start = 0;
-		data_end = pcrc_offset - (si8) UH_BYTES_m13;
-	} else if (PRTY_is_parity_m13(path, UNKNOWN_m13) == TRUE_m13) {
-		data_start = 0;
-		data_end = pcrc_offset;
-	} else {
-		data_start = (si8) UH_BYTES_m13;
-		data_end = pcrc_offset;
-	}
-
-	// clamp the update range to the covered data (universal header rewrites do not affect pcrcs)
-	if (offset >= data_end || (offset + n_bytes) <= data_start)
-		return_m13(TRUE_m13);  // update entirely outside covered data
-	if (offset < data_start) {
-		ptr = (void *) ((ui1 *) ptr + (data_start - offset));
-		n_bytes -= (data_start - offset);
-		offset = data_start;
-	}
-
-	// file extension not handled => warn, but do not set error (PRTY_update_m13() handles this)
-	if ((offset + n_bytes) > data_end) {
-		G_warning_message_m13("%s(), file extension not currently handled, rebuild pcrc data after files written\n", __FUNCTION__);
-		return_m13(TRUE_m13);
-	}
-
-	// open data file
-	was_open = fisopen_m13(fp);
-	if (was_open == FALSE_m13) {
-		fp = (void *) fopen_m13(path, "r+");
-		if (fp == NULL)
-			return_m13(FALSE_m13);
-	}
-	
-	// set up
-	r_val = FALSE_m13;
-	crcs = NULL;
-	tmp_data = NULL;
-	unset_parity_flag = FALSE_m13;
-
-	// read in pcrc crcs
-	crc_bytes = pcrc.n_blocks * sizeof(ui4);
-	crcs = (ui4 *) malloc((size_t) crc_bytes);
-	if (crcs == NULL)
-		goto PCRC_UPDATE_FAIL_m13;
-	if (fseek_m13(fp, pcrc_offset, SEEK_SET))
-		goto PCRC_UPDATE_FAIL_m13;
-	nrw = fread_m13(crcs, sizeof(ui1), (size_t) crc_bytes, fp);
-	if (nrw != crc_bytes)
-		goto PCRC_UPDATE_FAIL_m13;
-
-	// find where offset falls in pcrc blocks (block origin at data_start)
-	start_block = (offset - data_start) / pcrc.block_bytes;
-	end_block = ((offset - data_start) + n_bytes - 1) / pcrc.block_bytes;  // last block containing updated bytes
-
-	// read in affected blocks
-	start_byte = data_start + (start_block * pcrc.block_bytes);
-	end_byte = data_start + ((end_block + 1) * pcrc.block_bytes);
-	bytes_to_read = end_byte - start_byte;
-	bytes_remaining = data_end - start_byte;
-	if (bytes_to_read > bytes_remaining)
-		bytes_to_read = bytes_remaining;
-	tmp_data = (ui1 *) malloc((size_t) bytes_to_read);
-	if (tmp_data == NULL)
-		goto PCRC_UPDATE_FAIL_m13;
-	if (fseek_m13(fp, start_byte, SEEK_SET))
-		goto PCRC_UPDATE_FAIL_m13;
-	nrw = fread_m13(tmp_data, sizeof(ui1), (size_t) bytes_to_read, fp);
-	if (nrw != bytes_to_read)
-		goto PCRC_UPDATE_FAIL_m13;
-
-	// overlay the new data onto the affected blocks in memory: new_data[0..n_bytes) is written at file offset `offset`,
-	// which lands at tmp_data index (offset - start_byte). start_byte is the file offset of the first affected block &
-	// is <= offset, so the index is >= 0. Copy exactly n_bytes (the new-data size), NOT the whole block span.
-	new_data = (ui1 *) ptr;
-	for (i = offset - start_byte, j = 0; j < n_bytes; ++i, ++j)
-		tmp_data[i] = new_data[j];
-
-	// update those values in pcrc crc array
-	for (i = start_block, td = tmp_data; i <= end_block; ++i, td += pcrc.block_bytes) {
-		if (bytes_remaining > pcrc.block_bytes)
-			bytes_to_read = pcrc.block_bytes;
-		else
-			bytes_to_read = bytes_remaining;
-		crcs[i] = CRC_calculate_m13(td, bytes_to_read);
-		bytes_remaining -= pcrc.block_bytes;
-	}
-
-	// write out updated values
-	if (fseek_m13(fp, pcrc_offset, SEEK_SET))
-		goto PCRC_UPDATE_FAIL_m13;
-	if (is_std == FALSE_m13) {
-		if ((m13_fp->flags & FILE_FLAGS_PARITY_m13) == 0) {
-			unset_parity_flag = TRUE_m13;
-			m13_fp->flags |= FILE_FLAGS_PARITY_m13;  // this function can be run with parity & non-parity files, don't want fwrite to call PRTY_update_m13() on this write
-		}  // if std file & not call fwrite_m13 with path, PRTY_update_m13() won't be called
-	}
-	nrw = fwrite_m13(crcs, sizeof(ui1), (size_t) crc_bytes, fp);
-	if (nrw != crc_bytes)
-		goto PCRC_UPDATE_FAIL_m13;
-	
-	r_val = TRUE_m13;
-	
-PCRC_UPDATE_FAIL_m13:
-	
-	// clean up
-	if (crcs)
-		free(crcs);
-	if (tmp_data)
-		free(tmp_data);
-	if (is_std == FALSE_m13 && unset_parity_flag == TRUE_m13)
-		m13_fp->flags &= ~FILE_FLAGS_PARITY_m13;
-	if (was_open == FALSE_m13)
-		fclose_m13(fp);
-	else if (fseek_m13(fp, offset, SEEK_SET))  // reset to incoming file position
-		r_val = FALSE_m13;  // reset error
-
-	return_m13(r_val);
-}
-
-
-tern	PRTY_find_damage_m13(const si1 *file_path, PRTY_BLOCK_m13 **bad_blocks, si4 *n_bad_blocks, ui4 *n_blocks)
-{
-	tern			r_val, valid, header_valid, body_valid, return_bb, localizing_crcs;
-	ui1			*bytes, *idx_bytes;
-	si1			idx_path[PATH_BYTES_m13];
-	ui4			n_b, type_code;
-	si4			n_bb, p_n_bb, bb_size, BAD_BLOCK_INCREMENT;
-	si8			i, len, idx_len, nr, offset, record_bytes, block_bytes;
-	si8			header_offset, read_offset, read_len;
-	FILE_m13		*fp, *idx_fp;
-	UH_m13			*uh;
-	GEN_IDX_m13		*idx;
-	REC_HDR_m13		*rh;
-	CMP_FIXED_BH_m13	*bh;
-	PRTY_BLOCK_m13		*bb, *p_bb;
-	PCRC_DATA_m13	pcrc;
-
-#ifdef FT_DEBUG_m13
-	G_push_function_m13();
-#endif
-
-	// validates a MED file's OWN CRCs & reports WHERE it is damaged
-	// bad_blocks & n_bad_blocks are returned only if BOTH are passed; n_blocks may be passed alone
-	// any of the three may be NULL - all three NULL is just a verdict, which is what PRTY_validate_m13() is
-	// returns TRUE_m13 if valid, FALSE_m13 if invalid, UNKNOWN_m13 for errors
-	//
-	// this was one varargs function serving both contracts (verdict & diagnostics).  In the verdict form the
-	// varargs branch was skipped, which left bad_blocks / n_bad_blocks / n_blocks UNINITIALISED on the stack &
-	// then wrote through them.  Real parameters make that unrepresentable.
-
-	return_bb = FALSE_m13;
-	BAD_BLOCK_INCREMENT = 5;
-	if (bad_blocks && n_bad_blocks) {
-		return_bb = TRUE_m13;
-		*bad_blocks = NULL;
-		*n_bad_blocks = 0;
-	}
-	if (n_blocks)
-		*n_blocks = 0;
-	bytes = NULL;
-	bb = NULL;
-	n_b = n_bb = bb_size = 0;
-
-	G_message_m13("Validating \"%s\" ... ", file_path);
-
-	if (G_exists_m13(file_path) == DOES_NOT_EXIST_m13) {
-		G_warning_message_m13("\n%s(): file \"%s\" does not exist\n", __FUNCTION__, file_path);
-		return_m13(UNKNOWN_m13);
-	}
-
-	// parity files have no universal header (body is xor of member file bytes): pcrc block crcs are the only validation
-	// (checked before the type code switch: parity file names carry member-type extensions)
-	if (PRTY_is_parity_m13(file_path, UNKNOWN_m13) == TRUE_m13) {
-		valid = PCRC_find_damage_m13(file_path, &bb, &n_bb, &n_b);
-		goto PRTY_VALIDATE_EXIT_m13;
-	}
-
-	type_code = G_MED_type_code_from_string_m13(file_path);
-	switch (type_code) {
-		case SESS_TYPE_CODE_m13:
-		case SSR_TYPE_CODE_m13:
-		case TS_CHAN_TYPE_CODE_m13:
-		case VID_CHAN_TYPE_CODE_m13:
-		case TS_SEG_TYPE_CODE_m13:
-		case VID_SEG_TYPE_CODE_m13:
-			G_warning_message_m13("\n%s(): \"%s\" is a MED directory, not file\n", __FUNCTION__, file_path);
-			return_m13(UNKNOWN_m13);
-		case REC_DATA_TYPE_CODE_m13:
-		case REC_INDS_TYPE_CODE_m13:
-		case TS_METADATA_TYPE_CODE_m13:
-		case TS_DATA_TYPE_CODE_m13:
-		case TS_INDS_TYPE_CODE_m13:
-		case VID_METADATA_TYPE_CODE_m13:
-		case VID_DATA_TYPE_CODE_m13:
-		case VID_INDS_TYPE_CODE_m13:
-			break;
-		case NO_TYPE_CODE_m13:
-		default:
-			G_warning_message_m13("\n%s(): file \"%s\" is not a MED type\n", __FUNCTION__, file_path);
-			return_m13(UNKNOWN_m13);
-	}
-	
-	fp = fopen_m13(file_path, "r");
-	if (fp == NULL)
-		return_m13(UNKNOWN_m13);
-	len = PCRC_offset_m13(fp, NULL, &pcrc);
-	if (len == FALSE_m13) {  // error
-		fclose_m13(fp);
-		return_m13(UNKNOWN_m13);
-	}
-	header_offset = G_header_offset_m13(fp, NULL);  // video data universal header is a footer (last covered element, before the pcrc trailer)
-	if (header_offset < 0 || (header_offset + (si8) UH_BYTES_m13) > len) {  // error (FALSE_m13) or malformed file
-		fclose_m13(fp);
-		return_m13(UNKNOWN_m13);
-	}
-	if (type_code == VID_DATA_TYPE_CODE_m13) {  // native container body is validated by pcrc block crcs (read from file by PCRC_validate_m13()): footer universal header is all that is needed here
-		read_offset = header_offset;
-		read_len = (si8) UH_BYTES_m13;
-	} else {
-		read_offset = 0;
-		read_len = len;
-	}
-	bytes = (ui1 *) malloc((size_t) read_len);
-	if (bytes == NULL) {
-		G_warning_message_m13("\n%s(): allocation error\n", __FUNCTION__);
-		fclose_m13(fp);
-		return_m13(UNKNOWN_m13);
-	}
-	fseek_m13(fp, read_offset, SEEK_SET);
-	nr = fread_m13(bytes, sizeof(ui1), (size_t) read_len, fp);
-	fclose_m13(fp);
-	if (nr != read_len) {
-		free(bytes);
-		return_m13(UNKNOWN_m13);
-	}
-
-	// check universal header CRCs
-	header_valid = body_valid = valid = UNKNOWN_m13;
-	// header CRC
-	uh = (UH_m13 *) bytes;  // read starts at header_offset, so universal header is at buffer start for all types
-	header_valid = CRC_validate_m13(bytes + UH_HEADER_CRC_START_OFFSET_m13, UH_BYTES_m13 - UH_HEADER_CRC_START_OFFSET_m13, uh->header_CRC);
-	if (header_valid == FALSE_m13) {
-		if (return_bb == TRUE_m13) {
-			if (n_bb == bb_size) {
-				bb_size += BAD_BLOCK_INCREMENT;
-				bb = (PRTY_BLOCK_m13 *) realloc_m13(bb, (size_t) bb_size * sizeof(PRTY_BLOCK_m13));
-			}
-			bb[n_bb].length = (si8) UH_BYTES_m13;
-			bb[n_bb].offset = header_offset;
-			++n_bb;
-		}
-	}
-	// body CRC
-	if (type_code == VID_DATA_TYPE_CODE_m13) {
-		// native containers carry no whole-body MED CRC: the pcrc block crcs are the body validation, when present
-		// (no pcrc data == body unvalidatable == UNKNOWN_m13, not an error: pcrcs arrive with parity generation)
-		if (pcrc.n_blocks) {
-			p_bb = NULL;
-			p_n_bb = 0;
-			body_valid = PCRC_find_damage_m13(file_path, &p_bb, &p_n_bb, &n_b);
-			if (p_n_bb) {  // merge pcrc bad blocks (universal header entry may precede them)
-				if (n_bb == 0) {
-					bb = p_bb;
-					bb_size = n_bb = p_n_bb;
-				} else {
-					bb_size = n_bb + p_n_bb;
-					bb = (PRTY_BLOCK_m13 *) realloc_m13(bb, (size_t) bb_size * sizeof(PRTY_BLOCK_m13));
-					memcpy(bb + n_bb, p_bb, (size_t) p_n_bb * sizeof(PRTY_BLOCK_m13));
-					n_bb = bb_size;
-					free_m13(p_bb);
-				}
-			}
-		}
-	} else {
-		body_valid = CRC_validate_m13(bytes + UH_BODY_CRC_START_OFFSET_m13, len - UH_BODY_CRC_START_OFFSET_m13, uh->body_CRC);
-		if (body_valid == FALSE_m13) {
-			if (return_bb == TRUE_m13) {
-				if (n_bb == bb_size) {
-					bb_size += BAD_BLOCK_INCREMENT;
-					bb = (PRTY_BLOCK_m13 *) realloc_m13(bb, (size_t) bb_size * sizeof(PRTY_BLOCK_m13));
-				}
-				bb[n_bb].length = len - (si8) UH_BODY_CRC_START_OFFSET_m13;
-				bb[n_bb].offset = (si8) UH_BODY_CRC_START_OFFSET_m13;
-				++n_bb;
-			}
-		}
-	}
-	if (header_valid == TRUE_m13 && body_valid == TRUE_m13)
-		valid = TRUE_m13;
-	else if (header_valid == FALSE_m13 || body_valid == FALSE_m13)
-		valid = FALSE_m13;
-
-	localizing_crcs = FALSE_m13;
-	if (body_valid != TRUE_m13 && return_bb == TRUE_m13)
-		if (type_code == REC_DATA_TYPE_CODE_m13 || type_code == TS_DATA_TYPE_CODE_m13 || (type_code != VID_DATA_TYPE_CODE_m13 && pcrc.n_blocks))  // video data pcrcs checked above (body validation, not localization)
-			localizing_crcs = TRUE_m13;
-
-	// check body CRCs (localize within in data files)
-	if (localizing_crcs == TRUE_m13) {
-		if (body_valid == FALSE_m13) {
-			if (bb[0].offset == 0)  // keep universal header entry, if present, overwrite body entry
-				n_bb = 1;
-			else
-				n_bb = 0;  // overwrite body entry
-		}
-		if (type_code == REC_DATA_TYPE_CODE_m13) {
-			idx_len = strcpy_m13(idx_path, file_path);
-			strcpy(idx_path + (idx_len - 4), REC_INDS_TYPE_STR_m13);
-			idx_fp = fopen_m13(idx_path, "r");
-			if (idx_fp == NULL)
-				goto PRTY_VALIDATE_EXIT_m13;
-			idx_len = flen_m13(idx_fp);
-			idx_bytes = (ui1 *) malloc((size_t) idx_len);
-			if (idx_bytes == NULL) {
-				G_warning_message_m13("\n%s(): allocation error\n", __FUNCTION__);
-				fclose_m13(idx_fp);
-				goto PRTY_VALIDATE_EXIT_m13;
-			}
-			nr = fread_m13(idx_bytes, sizeof(ui1), (size_t) idx_len, idx_fp);
-			fclose_m13(idx_fp);
-			if (nr != idx_len) {
-				free(idx_bytes);
-				G_warning_message_m13("\n%s(): index file read error\n", __FUNCTION__);
-				goto PRTY_VALIDATE_EXIT_m13;
-			}
-			idx = (GEN_IDX_m13 *) (idx_bytes + UH_BYTES_m13);
-			for (i = uh->n_entries - 1; i--; ++idx) {
-				offset = idx->file_offset;
-				rh = (REC_HDR_m13 *) (bytes + offset);
-				record_bytes = (idx + 1)->file_offset - offset;  // no discontinuities in record indices
-				r_val = CRC_validate_m13((ui1 *) rh + REC_HDR_CRC_START_OFFSET_m13, record_bytes - REC_HDR_CRC_START_OFFSET_m13, rh->record_CRC);
-				if (r_val == FALSE_m13) {
-					if (return_bb == TRUE_m13) {
-						if (n_bb == bb_size) {
-							bb_size += BAD_BLOCK_INCREMENT;
-							bb = (PRTY_BLOCK_m13 *) realloc_m13(bb, (size_t) bb_size * sizeof(PRTY_BLOCK_m13));
-						}
-						bb[n_bb].length = (si8) rh->total_record_bytes;
-						bb[n_bb].offset = offset;
-						++n_bb;
-					}
-				}
-			}
-		} else if (type_code == TS_DATA_TYPE_CODE_m13) {
-			idx_len = strcpy_m13(idx_path, file_path);
-			strcpy(idx_path + (idx_len - 4), TS_INDS_TYPE_STR_m13);
-			idx_fp = fopen_m13(idx_path, "r");
-			if (idx_fp == NULL)
-				goto PRTY_VALIDATE_EXIT_m13;
-			idx_len = flen_m13(idx_fp);
-			idx_bytes = (ui1 *) malloc((size_t) idx_len);
-			if (idx_bytes == NULL) {
-				G_warning_message_m13("\n%s(): allocation error\n", __FUNCTION__);
-				fclose_m13(idx_fp);
-				goto PRTY_VALIDATE_EXIT_m13;
-			}
-			nr = fread_m13(idx_bytes, sizeof(ui1), (size_t) idx_len, idx_fp);
-			fclose_m13(idx_fp);
-			if (nr != idx_len) {
-				free(idx_bytes);
-				G_warning_message_m13("\n%s(): index file read error\n", __FUNCTION__);
-				goto PRTY_VALIDATE_EXIT_m13;
-			}
-			idx = (GEN_IDX_m13 *) (idx_bytes + UH_BYTES_m13);
-			for (i = uh->n_entries - 1; i--; ++idx) {
-				offset = REMOVE_DISCONT_m13(idx->file_offset);  // discontinuities possible in time series indices
-				bh = (CMP_FIXED_BH_m13 *) (bytes + offset);
-				block_bytes = REMOVE_DISCONT_m13((idx + 1)->file_offset) - offset;
-				r_val = CRC_validate_m13((ui1 *) bh + CMP_BLOCK_CRC_START_OFFSET_m13, block_bytes - CMP_BLOCK_CRC_START_OFFSET_m13, bh->block_CRC);
-				if (r_val == FALSE_m13) {
-					if (return_bb == TRUE_m13) {
-						if (n_bb == bb_size) {
-							bb_size += BAD_BLOCK_INCREMENT;
-							bb = (PRTY_BLOCK_m13 *) realloc_m13(bb, (size_t) bb_size * sizeof(PRTY_BLOCK_m13));
-						}
-						bb[n_bb].length = (si8) bh->total_block_bytes;
-						bb[n_bb].offset = offset;
-						++n_bb;
-					}
-				}
-			}
-		} else {  // pcrc data present (video data never reaches here: its pcrcs are checked above as body validation)
-			valid = PCRC_find_damage_m13(file_path, &bb, &n_bb, &n_b);
-		}
-	}
-	
-PRTY_VALIDATE_EXIT_m13:
-	
-	free(bytes);
-	
-	if (return_bb == TRUE_m13 && n_bb) {
-		*bad_blocks = bb;
-		*n_bad_blocks = n_bb;
-	} else if (bb) {
-		free_m13(bb);
-	}
-	if (n_blocks)  // reported whenever asked for, not only alongside bad blocks
-		*n_blocks = n_b;
-
-	switch (valid) {
-		case FALSE_m13:
-			G_message_m13("%sinvalid%s\n", TC_RED_m13, TC_RESET_m13);
-			break;
-		case UNKNOWN_m13:
-			G_message_m13("%sprocessing error%s\n", TC_BLUE_m13, TC_RESET_m13);
-			break;
-		case TRUE_m13:
-			G_message_m13("%svalid%s\n", TC_GREEN_m13, TC_RESET_m13);
-			break;
-	}
-
-	return_m13(valid);
-}
-
-
 // verdict only: is this MED file's own content intact?  PRTY_find_damage_m13() answers where it is not.
 tern	PRTY_validate_m13(const si1 *file_path)
 {
@@ -48919,138 +50938,17 @@ tern	PRTY_validate_m13(const si1 *file_path)
 }
 
 
-tern	PCRC_find_damage_m13(const si1 *file_path, PRTY_BLOCK_m13 **bad_blocks, si4 *n_bad_blocks, ui4 *n_blocks)
+// TRUE  == every parity file in the session equals the xor of its members
+// FALSE == at least one does not (the parity is stale or damaged), or the traversal failed
+tern	PRTY_verify_m13(const si1 *session_path, ui4 flags, si4 segment_number)
 {
-	tern			return_bb;
-	ui1			*block;
-	ui4			n_b, *crcs, block_bytes;
-	si4			i, n_bb, bb_size, BAD_BLOCK_INCREMENT;
-	si8			len, offset, crc_bytes, pcrc_offset, data_start;
-	PCRC_DATA_m13	pcrc;
-	PRTY_BLOCK_m13		*bb;
-	FILE_m13		*fp;
-
-#ifdef FT_DEBUG_m13
-	G_push_function_m13();
-#endif
-
-	// validates a file's APPENDED block crcs (pcrc) & reports WHICH blocks fail
-	// bad_blocks & n_bad_blocks are returned only if BOTH are passed; n_blocks may be passed alone
-	// any of the three may be NULL - all three NULL is just a verdict, which is what PCRC_validate_m13() is,
-	// & in that form the walk stops at the first bad block instead of collecting them all
-	// returns TRUE_m13 if valid, FALSE_m13 if invalid, UNKNOWN_m13 for errors
-
-	return_bb = FALSE_m13;
-	BAD_BLOCK_INCREMENT = 5;
-	if (bad_blocks && n_bad_blocks) {
-		return_bb = TRUE_m13;
-		*bad_blocks = NULL;
-		*n_bad_blocks = 0;
-	}
-	if (n_blocks)
-		*n_blocks = 0;
-	bb = NULL;
-	n_b = bb_size = 0;
-
-	if (G_exists_m13(file_path) != FILE_EXISTS_m13) {
-		G_warning_message_m13("%s(): file \"%s\" does not exist => returning\n", __FUNCTION__, file_path);
-		return_m13(UNKNOWN_m13);
-	}
-		
-	// locate pcrc data
-	fp = fopen_m13(file_path, "r");
-	pcrc_offset = PCRC_offset_m13(fp, NULL, &pcrc);
-	if (pcrc_offset == FALSE_m13) {
-		fclose_m13(fp);
-		return_m13(UNKNOWN_m13);
-	}
-	if (pcrc.n_blocks == 0) {
-		G_warning_message_m13("%s(): file \"%s\" does not contain parity crc data\n", __FUNCTION__, file_path);
-		fclose_m13(fp);
-		return_m13(UNKNOWN_m13);
-	}
-
-	// covered region = [0, pcrc_offset): every file byte, universal headers included (header at file start, or video data footer at pcrc_offset - UH_BYTES)
-	// only the pcrc trailer itself is excluded - must mirror PCRC_write_m13(), which computes block crcs from offset zero
-	data_start = 0;
-	len = pcrc_offset;
-
-	// read in crcs
-	n_b = pcrc.n_blocks;
-	if (n_blocks)
-		*n_blocks = n_b;
-	block_bytes = pcrc.block_bytes;
-	crc_bytes = (si8) n_b * sizeof(ui4);
-	crcs = (ui4 *) malloc((size_t) crc_bytes);
-	if (crcs == NULL) {
-		G_set_error_m13(E_ALLOC_m13, NULL);
-		fclose_m13(fp);
-		return_m13(UNKNOWN_m13);
-	}
-	fseek_m13(fp, pcrc_offset, SEEK_SET);
-	fread_m13(crcs, sizeof(ui4), (size_t) n_b, fp);
-
-	// check crcs
-	block = (ui1 *) malloc((size_t) block_bytes);
-	if (block == NULL) {
-		G_set_error_m13(E_ALLOC_m13, NULL);
-		free(crcs);
-		fclose_m13(fp);
-		return_m13(UNKNOWN_m13);
-	}
-	fseek_m13(fp, data_start, SEEK_SET);
-	offset = data_start;  // bad block offsets are file absolute
-	n_bb = 0;
-	for (i = 0; i < n_b; ++i) {
-		if (len < block_bytes)
-			block_bytes = len;
-		fread_m13(block, sizeof(ui1), (size_t) block_bytes, fp);
-		if (crcs[i] != CRC_calculate_m13(block, block_bytes)) {
-			if (return_bb == TRUE_m13) {
-				if (n_bb == bb_size) {
-					bb_size += BAD_BLOCK_INCREMENT;
-					bb = (PRTY_BLOCK_m13 *) realloc_m13(bb, (size_t) bb_size * sizeof(PRTY_BLOCK_m13));
-				}
-				bb[n_bb].length = (si8) block_bytes;
-				bb[n_bb].offset = offset;
-				++n_bb;
-			} else {
-				fclose_m13(fp);
-				free(block);
-				free(crcs);
-				return_m13(FALSE_m13);
-			}
-		}
-		offset += block_bytes;  // advance for every block (bad block offsets were wrong when good blocks preceded bad ones)
-		len -= block_bytes;
-	}
-
-	// clean up
-	fclose_m13(fp);
-	free(block);
-	free(crcs);
-
-	if (n_blocks)
-		*n_blocks = n_b;
-	if (n_bb) {  // only reachable with return_bb set: the verdict form returns at the first bad block
-		*bad_blocks = bb;
-		*n_bad_blocks = n_bb;
-		return_m13(FALSE_m13);
-	}
-
-	return_m13(TRUE_m13);
+	return(PRTY_write_or_verify_m13(session_path, flags, segment_number, TRUE_m13));
 }
 
 
-// verdict only: are this file's appended block crcs intact?  PCRC_find_damage_m13() answers which blocks
-// are not, & is what a repair needs; this form stops at the first failure.
-tern	PCRC_validate_m13(const si1 *file_path)
+tern	PRTY_write_m13(const si1 *session_path, ui4 flags, si4 segment_number)
 {
-#ifdef FT_DEBUG_m13
-	G_push_function_m13();
-#endif
-
-	return_m13(PCRC_find_damage_m13(file_path, NULL, NULL, NULL));
+	return(PRTY_write_or_verify_m13(session_path, flags, segment_number, FALSE_m13));
 }
 
 
@@ -49552,198 +51450,6 @@ static tern	PRTY_write_or_verify_m13(const si1 *session_path, ui4 flags, si4 seg
 }
 
 
-tern	PRTY_write_m13(const si1 *session_path, ui4 flags, si4 segment_number)
-{
-	return(PRTY_write_or_verify_m13(session_path, flags, segment_number, FALSE_m13));
-}
-
-
-// TRUE  == every parity file in the session equals the xor of its members
-// FALSE == at least one does not (the parity is stale or damaged), or the traversal failed
-tern	PRTY_verify_m13(const si1 *session_path, ui4 flags, si4 segment_number)
-{
-	return(PRTY_write_or_verify_m13(session_path, flags, segment_number, TRUE_m13));
-}
-
-
-tern	PCRC_write_m13(const si1 *file_path, ui4 block_bytes)
-{
-	tern				r_val, vid_data, is_parity;
-	ui1				*bytes;
-	ui4				*crcs, n_blocks, max_block_bytes;
-	si4				i;
-	si8				len, old_flen, header_offset, ext_offset, member_bytes, crc_offset, nrw;
-	PCRC_DATA_m13		pcrc;
-	PRTY_IDENT_m13		*ext, *tmp_ext;
-	PRTY_MANIFEST_m13	ext_st;
-	FILE_m13			*fp;
-	UH_m13				uh;
-
-#ifdef FT_DEBUG_m13
-	G_push_function_m13();
-#endif
-
-	// function expects file to be closed
-	// pass zero for blocks_bytes to use default
-	// file_path can be any file, typically used for files that have no CRCs such as parity data and video data
-	// can be used to enhance localization in any file that has only one crc for the entire body, such as record or time series index files
-
-
-	if (G_exists_m13(file_path) != TRUE_m13) {  // might be directory
-		G_warning_message_m13("%s(): file \"%s\" does not exist\n", __FUNCTION__, file_path);
-		return_m13(FALSE_m13);
-	}
-
-	r_val = FALSE_m13;
-	bytes = NULL;
-	crcs = NULL;
-	ext = NULL;
-
-	// open file
-	fp = fopen_m13(file_path, "r+");
-	if (fp == NULL)
-		return_m13(FALSE_m13);
-	fp->flags |= FILE_FLAGS_PARITY_m13;  // pcrc bytes lie outside parity coverage by design (PRTY_build_m13() uses pcrc offset lengths): don't let fwrite_m13() invoke a parity update for them
-	old_flen = flen_m13(fp);
-	len = PCRC_offset_m13(fp, NULL, &pcrc);  // start of pcrc crcs, if they exist, otherwise where they should go
-
-	if (len == FALSE_m13) {  // error
-		fclose_m13(fp);
-		return_m13(FALSE_m13);
-	}
-
-	vid_data = G_is_video_data_m13(fp->path);
-	is_parity = PRTY_is_parity_m13(fp->path, TRUE_m13);
-	if (is_parity == TRUE_m13) {
-		// parity files have no universal header (body is xor of member files): identity comes from member file universal headers
-		vid_data = FALSE_m13;  // video data parity files have no universal header footer either
-		tmp_ext = PRTY_manifest_m13(fp, NULL, &ext_offset);  // existing extension will be regenerated: exclude it from data length
-		if (tmp_ext != NULL) {
-			len = ext_offset;
-			free(tmp_ext);
-		}
-		ext = PRTY_set_manifest_m13(&pcrc, fp->path);
-		if (ext == NULL)
-			goto PCRC_WRITE_FAIL;
-
-		// write extension after parity data (covered by the pcrc block crcs: transparent to pre-extension readers)
-		// on-disk layout: [ member file UIDs (ascending) ][ PRTY_MANIFEST_m13 ]  (session & segment UID travel in the pcrc trailer)
-		member_bytes = (si8) ext->n_members * (si8) sizeof(PRTY_MEMBER_m13);
-		memset(&ext_st, 0, sizeof(PRTY_MANIFEST_m13));
-		ext_st.version_major = PRTY_MANIFEST_VER_MAJOR_m13;
-		ext_st.version_minor = PRTY_MANIFEST_VER_MINOR_m13;
-		ext_st.n_members = ext->n_members;
-		ext_st.channel_UID = ext->channel_UID;
-		ext_st.tag = PRTY_MANIFEST_TAG_m13;
-		if (fseek_m13(fp, len, SEEK_SET))
-			goto PCRC_WRITE_FAIL;
-		if (member_bytes) {
-			nrw = fwrite_m13(ext->members, sizeof(ui1), (size_t) member_bytes, fp);
-			if (nrw != member_bytes)
-				goto PCRC_WRITE_FAIL;
-		}
-		nrw = fwrite_m13(&ext_st, sizeof(PRTY_MANIFEST_m13), (size_t) 1, fp);
-		if (nrw != 1)
-			goto PCRC_WRITE_FAIL;
-		len += member_bytes + (si8) sizeof(PRTY_MANIFEST_m13);
-	} else {
-		// read universal header
-		if (vid_data == TRUE_m13)
-			header_offset = len - UH_BYTES_m13;  // between end of video data & start of pcrc crcs
-		else
-			header_offset = 0;
-		if (fseek_m13(fp, header_offset, SEEK_SET))
-			goto PCRC_WRITE_FAIL;
-
-		nrw = fread_m13(&uh, sizeof(ui1), UH_BYTES_m13, fp);
-		if (nrw != UH_BYTES_m13)
-			goto PCRC_WRITE_FAIL;
-		pcrc.session_UID = uh.session_UID;
-		pcrc.segment_UID = uh.segment_UID;
-	}
-
-	// rewind
-	if (fseek_m13(fp, 0, SEEK_SET))
-		goto PCRC_WRITE_FAIL;
-
-	// allocate
-	if (block_bytes == 0)
-		block_bytes = PCRC_BLOCK_BYTES_DEFAULT_m13;
-	bytes = (ui1 *) malloc((size_t) block_bytes);
-	if (bytes == NULL) {
-		G_set_error_m13(E_ALLOC_m13, NULL);
-		goto PCRC_WRITE_FAIL;
-	}
-	n_blocks = pcrc.n_blocks = (ui4) ceil((sf8) len / (sf8) block_bytes);
-	crcs = (ui4 *) malloc((size_t) n_blocks * sizeof(ui4));
-	if (crcs == NULL) {
-		G_set_error_m13(E_ALLOC_m13, NULL);
-		goto PCRC_WRITE_FAIL;
-	}
-
-	// calculate crcs
-	crc_offset = len;  // crcs start where covered bytes end
-	max_block_bytes = 0;
-	for (i = 0; i < n_blocks; ++i) {
-		if (len < block_bytes)
-			block_bytes = len;
-		if (max_block_bytes < block_bytes)
-			max_block_bytes = block_bytes;  // capture largest block bytes (often less than block_bytes because only one block)
-
-		nrw = fread_m13(bytes, sizeof(ui1), block_bytes, fp);
-		if (nrw != block_bytes)
-			goto PCRC_WRITE_FAIL;
-		crcs[i] = CRC_calculate_m13(bytes, block_bytes);
-		len -= block_bytes;
-	}
-
-	// write crcs
-	if (fseek_m13(fp, crc_offset, SEEK_SET))  // explicit reposition: ANSI C requires a seek between read & write on update streams (unless at EOF, which is not guaranteed on rewrites)
-		goto PCRC_WRITE_FAIL;
-	nrw = fwrite_m13(crcs, sizeof(ui4), (size_t) n_blocks, fp);
-	if (nrw != n_blocks)
-		goto PCRC_WRITE_FAIL;
-
-	// write pcrc structure
-	pcrc.tag = PCRC_TAG_m13;
-	pcrc.n_blocks = n_blocks;
-	pcrc.block_bytes = max_block_bytes;
-	nrw = fwrite_m13(&pcrc, sizeof(PCRC_DATA_m13), (size_t) 1, fp);
-	if (nrw != 1)
-		goto PCRC_WRITE_FAIL;
-
-	// NOTE: the video universal header is NOT re-appended after the pcrc.  Video data file layout is
-	// [native container][UH][pcrc]: the UH is the last COVERED element (read above at len - UH_BYTES for the
-	// trailer UIDs), & the pcrc is an excluded appendage - exactly as for every other file type.  This is what
-	// the CSig/DGST video holdback expects (data_end == pcrc_offset: the rolling holdback lands on the UH), &
-	// it keeps the UH inside pcrc & parity coverage.  (An earlier version re-appended the UH after the trailer,
-	// which moved the trailer off the file end => PCRC_offset_m13() could no longer find it.)
-
-	// remove stale bytes (rewrites can shrink the trailer, e.g. regenerated extension with fewer members)
-	len = ftell_m13(fp);
-	if (len < old_flen)
-		if (ftruncate_m13(fp, (off_t) len))
-			goto PCRC_WRITE_FAIL;
-
-	r_val = TRUE_m13;
-
-PCRC_WRITE_FAIL:
-
-	// clean up
-	if (fp)
-		fclose_m13(fp);
-	if (bytes)
-		free(bytes);
-	if (crcs)
-		free(crcs);
-	if (ext)
-		free(ext);
-
-	return_m13(r_val);
-}
-
-
-//********************************************//
 // MARK: PASCAL STRING FUNCTIONS  (PSTR)
 //********************************************//
 
@@ -49916,6 +51622,7 @@ si4	RC_read_field_2_m13(const si1 *field_name, si1 **buffer, tern update_buffer_
 	si1	*default_value_ptr, default_value_str[RC_STRING_BYTES_m13];
 	si1	*field_value_ptr;
 	si4	type, option_number, *returned_val_type;
+	si4	default_fallbacks = 0;  // READ_RC_HANDLE_DEFAULT_m13 guard (same hazard as RC_read_field_m13)
 	si8	*int_val, item, default_item;
 	sf8	*float_val;
 	va_list	arg_p;
@@ -49968,10 +51675,20 @@ si4	RC_read_field_2_m13(const si1 *field_name, si1 **buffer, tern update_buffer_
 	}
 	*str_val = *type_str = *options_str = *default_value_str = 0;  // zero strings
 	
-	// find requested field entry
+	// find requested field entry. EXACT name match: the remainder of the FIELD line must be whitespace -
+	// otherwise "Level 1 Password" happily matches the "Level 1 Password Hint" entry (whichever comes
+	// first in the file wins) & the caller silently reads the wrong field's value.
 	c = *buffer;
 	sprintf_m13(tmp_str, "%%%% FIELD: %s", field_name);
-	if ((field_title_ptr = STR_match_end_m13(tmp_str, c)) == NULL) {
+	while ((field_title_ptr = STR_match_end_m13(tmp_str, c)) != NULL) {
+		c = field_title_ptr;
+		while (*c == (si1) 32)  // space
+			++c;
+		if (*c == '\r' || *c == '\n' || *c == 0)
+			break;  // exact match
+		// prefix of a longer field name - keep searching from here
+	}
+	if (field_title_ptr == NULL) {
 		G_set_error_m13(E_GEN_m13, "could not match field label \"%s\" in rc file", tmp_str);
 		return_m13(RC_ERR_m13);
 	}
@@ -50094,6 +51811,11 @@ si4	RC_read_field_2_m13(const si1 *field_name, si1 **buffer, tern update_buffer_
 	
 READ_RC_HANDLE_DEFAULT_m13:
 	
+	if (++default_fallbacks > 2) {  // value -> default -> (prompt ->) default is legal; further cycles are a malformed entry
+		G_set_error_m13(E_GEN_m13, "DEFAULT of field \"%s\" in rc file resolves to a value that is itself rejected", field_name);
+		return_m13(RC_ERR_m13);
+	}
+
 	// VALUE field is "DEFAULT", and default may be "PROMPT"
 	if (strcmp_m13(str_val, "DEFAULT") == 0) {
 		if (default_item) {
@@ -50264,6 +51986,8 @@ si4	RC_read_field_m13(const si1 *field_name, si1 **buffer, tern update_buffer_pt
 		free_field_value_str = TRUE_m13;
 	}
 	// prevent error if user passes NULL to expected type (value will still be in field_value_str)
+	si4	default_fallbacks = 0;  // READ_RC_HANDLE_DEFAULT_m13 guard: a DEFAULT that itself resolves to a
+					// rejected value (e.g. "NO ENTRY" under OPTIONS ONLY) previously looped forever
 	if (float_val == NULL)
 		float_val = &local_float_val;
 	if (int_val == NULL)
@@ -50273,10 +51997,20 @@ si4	RC_read_field_m13(const si1 *field_name, si1 **buffer, tern update_buffer_pt
 	// zero strings
 	*type_str = *options_str = *default_value_str = *field_value_str = 0;
 	
-	// find requested field entry
+	// find requested field entry. EXACT name match: the remainder of the FIELD line must be whitespace -
+	// otherwise "Level 1 Password" happily matches the "Level 1 Password Hint" entry (whichever comes
+	// first in the file wins) & the caller silently reads the wrong field's value.
 	c = *buffer;
 	sprintf_m13(tmp_str, "%%%% FIELD: %s", field_name);
-	if ((field_title_ptr = STR_match_end_m13(tmp_str, c)) == NULL) {
+	while ((field_title_ptr = STR_match_end_m13(tmp_str, c)) != NULL) {
+		c = field_title_ptr;
+		while (*c == (si1) 32)  // space
+			++c;
+		if (*c == '\r' || *c == '\n' || *c == 0)
+			break;  // exact match
+		// prefix of a longer field name - keep searching from here
+	}
+	if (field_title_ptr == NULL) {
 		G_set_error_m13(E_GEN_m13, "could not match field label \"%s\" in rc file", tmp_str);
 		return_m13(RC_ERR_m13);
 	}
@@ -50375,6 +52109,11 @@ si4	RC_read_field_m13(const si1 *field_name, si1 **buffer, tern update_buffer_pt
 	
 READ_RC_HANDLE_DEFAULT_m13:
 	
+	if (++default_fallbacks > 2) {  // value -> default -> (prompt ->) default is legal; further cycles are a malformed entry
+		G_set_error_m13(E_GEN_m13, "DEFAULT of field \"%s\" in rc file resolves to a value that is itself rejected", field_name);
+		return_m13(RC_ERR_m13);
+	}
+
 	// VALUE field is "DEFAULT", and default may be "PROMPT"
 	if (strcmp_m13(field_value_str, "DEFAULT") == 0) {
 		if (default_item) {
@@ -51272,6 +53011,8 @@ tern	SKC_put_m13(const ui1 *cache_id, const ui1 *master, const ui1 *fp, si4 time
 
 // Each backend below supplies the same three statics - store / fetch / remove - against a different OS
 // key store, & is guarded independently (no #elif chain), so any one can be read on its own.
+// (atomic unit: each backend's triplet + its helpers stay together inside their guard; internal
+//  order is store / fetch / remove, not alphabetical - filed as a whole at the section tail)
 
 #if SKC_BACKEND_m13 == SKC_BACKEND_KEYCHAIN_m13
 
@@ -52823,6 +54564,8 @@ void	*STR_time_m13(void *level_header, si8 uutc, void *time_str_ptr, tern fixed_
 	va_list 		arg_p;
 	struct tm 		ti;
 	LOCATION_INFO_m13	loc_info = {0};
+	TIMEZONE_INFO_m13	tz_info;
+	tern			tc_set;
 	PROC_GLOBS_m13		*pg;
 	
 #ifdef FT_DEBUG_m13
@@ -52867,9 +54610,20 @@ void	*STR_time_m13(void *level_header, si8 uutc, void *time_str_ptr, tern fixed_
 			return_m13(time_str_ptr);
 		case CURRENT_TIME_m13:
 			uutc = G_current_uutc_m13();
-			if (pg->time_constants.set == FALSE_m13)  // set global time constants to location of machine
-				if (G_location_info_m13(&loc_info, NULL, NULL, TRUE_m13, FALSE_m13) == FALSE_m13)
-					G_warning_message_m13("%s(): daylight change data not available\n", __FUNCTION__);
+			if (pg->time_constants.set == FALSE_m13) {  // set global time constants to location of machine
+				// the machine's own timezone configuration first (native, offline);
+				// IP geolocation (G_location_info_m13() - internet) only when the
+				// local answer cannot be settled against the timezone table
+				tc_set = FALSE_m13;
+				if (G_local_timezone_m13(&tz_info) == TRUE_m13) {
+					G_push_behavior_m13(SUPPRESS_OUTPUT_m13);
+					tc_set = G_set_time_constants_m13(NULL, &tz_info, 0, FALSE_m13);
+					G_pop_behavior_m13();
+				}
+				if (tc_set == FALSE_m13)
+					if (G_location_info_m13(&loc_info, NULL, NULL, TRUE_m13, FALSE_m13) == FALSE_m13)
+						G_warning_message_m13("%s(): daylight change data not available\n", __FUNCTION__);
+			}
 			break;
 	}
 	
@@ -56225,6 +57979,4757 @@ si1	*WN_windify_format_string_m13(const si1 *fmt)
 
 
 //*************************************//
+// MARK: WRITE FUNCTIONS  (WRT)
+
+//**********************************************************************************//
+//*******************************  Write API (WRT)  *******************************//
+//**********************************************************************************//
+// (merged from the medwrt_m13 development module 2026-08-11; design ledger & module notes in the
+// Write API section of medlib_m13.h)
+
+
+
+//**********************************************************************************//
+//****************************  MED write API (medwrt)  ***************************//
+//**********************************************************************************//
+
+// DESIGN-PHASE IMPLEMENTATION - see the header for the design summary & open decisions D1-D7.
+// The defaults functions are real; the API entry points are compiling stubs that fail cleanly with an
+// error, each carrying the implementation plan extracted from the manual reference (DHN_Acq MED_setup()
+// & its block processor), so the code IS the working design document.
+
+
+void	WRT_metadata_defaults_m13(METADATA_m13 *md)
+{
+	// D19: initialize a caller-held METADATA_m13 template to library defaults / NO_ENTRY conventions.
+	// Section 1 (hints, anonymized subject ID) defaults to empty; sections 2 & 3 via the library's own
+	// initializer (TS type; video via WRT_add_vid_channel_m13 when implemented). Section-3 time fields
+	// seed from this thread's time constants - typically not yet set at template time (create_session
+	// sets them per D20 & re-seeds the proto FPS then), so zeros here are correct & expected.
+	memset((void *) md, 0, sizeof(METADATA_m13));
+	G_init_metadata_struct_m13(md, TS_METADATA_TYPE_CODE_m13, FALSE_m13, NULL);
+
+	return;
+}
+
+
+void	WRT_options_defaults_m13(WRT_OPTIONS_m13 *opt)
+{
+	memset((void *) opt, 0, sizeof(WRT_OPTIONS_m13));
+
+	opt->codec = CPS_DF_PRED2_ALGORITHM_m13;
+	opt->fall_through_to_best = TRUE_m13;
+	opt->VDS_threshold = FILT_VDS_LFP_FC_DEFAULT_m13;
+	opt->VDS_LFP_high_fc = FILT_VDS_LFP_FC_DEFAULT_m13;
+	opt->time_mode = WRT_TIME_UUTC_m13;  // D19: moved from the (removed) write-metadata struct
+	opt->session_start_time = CURRENT_TIME_m13;
+	opt->section_2_encryption_level = NO_ENCRYPTION_m13;  // D21: all four levels are UH-map options (G_set_encryption_map_m13)
+	opt->section_3_encryption_level = NO_ENCRYPTION_m13;
+	opt->data_encryption_level = NO_ENCRYPTION_m13;
+	opt->video_data_encryption_level = NO_ENCRYPTION_m13;  // D25: adopted native video files
+	opt->encode_workers = 0;  // D26: caller-thread encode; > 0 = worker pool (acquisition)
+	opt->record_encryption_level = NO_ENCRYPTION_m13;
+	opt->apply_recording_time_offset = TRUE_m13;  // D17: privacy offset on by default; FALSE stores true times (UUTC mode)
+	opt->session_records = TRUE_m13;  // D17 record-structure defaults (match common G_alloc_session usage)
+	opt->seg_session_records = FALSE_m13;
+	opt->channel_records = FALSE_m13;
+	opt->segment_records = FALSE_m13;
+	opt->parity = WRT_PARITY_NONE_m13;
+	opt->line_noise_filter = FALSE_m13;
+	opt->noise_scores = 0;  // e.g. CPS_DF_ALL_NOISE_SCORES_m13 to enable all four
+	opt->decimation_frequency = RATE_NO_ENTRY_m13;  // no decimation (D8)
+	opt->amplitude_quantum = (sf8) 1.0;  // no requantization (caller units == recorded units)
+	opt->antialias_filter = UNKNOWN_m13;  // automatic (on when decimating; full-rate VDS handles its own)
+	opt->initial_block_samples = 0;  // D12: equal to steady-state block size (no stagger)
+	opt->discontinuity_mode = WRT_DISCONT_EXPLICIT_m13;  // D9: explicit marks only; online time jumps beyond tolerance are errors
+	opt->discontinuity_tolerance = (sf8) 1.5;  // sample periods
+	opt->block_duration = (sf8) 10.0;  // 10 s blocks (measured 2026-08-06: same size, 30-40% better VDS max error than 4096-sample blocks)
+	opt->block_samples = 0;  // 0 => use block_duration
+	opt->segmenting_mode = WRT_SEG_NONE_m13;  // D3
+	opt->auto_segment_hours = (sf8) 0.0;  // AUTO mode interval
+	opt->exists_behavior = WRT_EXISTS_FAIL_m13;
+	opt->threaded = FALSE_m13;  // reserved (D5)
+
+	return;
+}
+
+
+//**********************************************************************************//
+//******************************  RC field table (D18)  ***************************//
+//**********************************************************************************//
+// Single source of truth for the config reader, the template writer & the binding docs.
+// Names are the standard vocabulary (DHN_Acq's where a field existed there): EXACT match,
+// no aliases. Unknown fields in a file are ignored with a warning (app-specific fields
+// legitimately share rc files). Missing fields keep their defaults; an explicit "NO ENTRY"
+// is equivalent to the default for these fields.
+
+enum {  // value kinds
+	WRT_RC_KSTR_m13,	// string -> si1[bytes]
+	WRT_RC_KSF8_m13,	// float -> sf8 (struct_value = rc_value * scale)
+	WRT_RC_KSI1_m13,	// integer -> si1
+	WRT_RC_KSI4_m13,	// integer -> si4
+	WRT_RC_KUI4_m13,	// integer -> ui4
+	WRT_RC_KSI8_m13,	// integer -> si8
+	WRT_RC_KTERN_m13,	// ternary -> tern
+	WRT_RC_KMAP1_m13,	// OPTIONS ONLY -> si1 code (opt_vals)
+	WRT_RC_KMAP8_m13,	// OPTIONS ONLY -> ui8 flag (opt_vals)
+	WRT_RC_KLAT_m13,	// special: latitude staging (formatted into Geotag Data)
+	WRT_RC_KLON_m13,	// special: longitude staging
+	WRT_RC_KSCORES_m13	// special: ternary -> noise_scores directive mask
+};
+
+typedef struct {
+	const si1		*name;		// canonical %% FIELD name
+	const si1		*type;		// "string" | "float" | "integer" | "ternary"
+	const si1		*default_str;	// template DEFAULT line (must itself be a valid value)
+	const si1		*notes;		// '\n'-separated NOTES lines (NULL => none)
+	const si1 * const	*opts;		// option tokens (NULL => free entry)
+	tern			only;		// TRUE => OPTIONS ONLY (ternary rows list YES/NO as guidance but allow NO ENTRY -> UNKNOWN)
+	const si8		*opt_vals;	// stored value per option (parallel to opts)
+	si4			n_opts;
+	si1			dest;		// WRT_RC_MD_m13 / WRT_RC_OPT_m13
+	si1			kind;		// WRT_RC_K*
+	size_t			offset;		// into METADATA_m13 / WRT_OPTIONS_m13
+	si4			bytes;		// KSTR: destination size
+	sf8			scale;		// KSF8: struct_value = rc_value * scale
+	sf8			no_entry_f;	// KSF8: struct value that writes as "NO ENTRY" (NAN => never)
+	si8			no_entry_i;	// integer kinds: value that writes as "NO ENTRY" (WRT_RC_NO_SENT_m13 => never)
+} WRT_RC_FIELD_m13;
+
+static const si1 * const WRT_codec_opts_m13[] = {"RED2", "PRED2", "SRRED", "VDS", "MBE"};
+static const si8 WRT_codec_vals_m13[] = {(si8) CPS_DF_RED2_ALGORITHM_m13, (si8) CPS_DF_PRED2_ALGORITHM_m13, (si8) CPS_DF_SRRED_ALGORITHM_m13, (si8) CPS_DF_VDS_ALGORITHM_m13, (si8) CPS_DF_MBE_ALGORITHM_m13};
+static const si1 * const WRT_time_opts_m13[] = {"UUTC", "OUTC"};
+static const si8 WRT_time_vals_m13[] = {WRT_TIME_UUTC_m13, WRT_TIME_OUTC_m13};
+static const si1 * const WRT_discont_opts_m13[] = {"EXPLICIT", "IMPLICIT"};
+static const si8 WRT_discont_vals_m13[] = {WRT_DISCONT_EXPLICIT_m13, WRT_DISCONT_IMPLICIT_m13};
+static const si1 * const WRT_seg_opts_m13[] = {"NONE", "AUTO", "MANUAL"};
+static const si8 WRT_seg_vals_m13[] = {WRT_SEG_NONE_m13, WRT_SEG_AUTO_m13, WRT_SEG_MANUAL_m13};
+static const si1 * const WRT_parity_opts_m13[] = {"NONE", "ALL FILES", "ALL DATA FILES"};
+static const si8 WRT_parity_vals_m13[] = {WRT_PARITY_NONE_m13, WRT_PARITY_ALL_m13, WRT_PARITY_DATA_m13};
+static const si1 * const WRT_exists_opts_m13[] = {"FAIL", "OVERWRITE", "RENAME"};
+static const si8 WRT_exists_vals_m13[] = {WRT_EXISTS_FAIL_m13, WRT_EXISTS_OVERWRITE_m13, WRT_EXISTS_RENAME_m13};
+
+// RC defines & row builders (WRT_RC_*_m13, WRT_MDSTR_m13 & kin): medlib_m13.h
+
+static const si1 * const WRT_yes_no_opts_m13[] = {"YES", "NO"};
+
+static const WRT_RC_FIELD_m13	WRT_rc_fields_m13[] = {
+	// METADATA template: section 1
+	WRT_MDSTR_m13("Anonymized Subject ID", section_1.anonymized_subject_ID, "MED 1.1: metadata section 1 (moved from the universal header)"),
+	WRT_MDSTR_m13("Level 1 Password Hint", section_1.level_1_password_hint, NULL),
+	WRT_MDSTR_m13("Level 2 Password Hint", section_1.level_2_password_hint, NULL),
+	// METADATA template: section 2 (time series)
+	WRT_MDF8_m13("Sampling Frequency", time_series_section_2.sampling_frequency, "NO ENTRY", (sf8) RATE_NO_ENTRY_m13, "REQUIRED (here, in the template, or as the write-call argument): rate of the samples the caller provides.\nWhen Decimation Frequency is set, the RECORDED sampling frequency is the output rate (D19)."),
+	WRT_MDSTR_m13("Session Description", time_series_section_2.session_description, NULL),
+	WRT_MDSTR_m13("Channel Description", time_series_section_2.channel_description, "Session-wide default; per-channel values via channel overrides / CS file"),
+	WRT_MDSTR_m13("Segment Description", time_series_section_2.segment_description, "Updatable per segment at WRT_new_segment_m13()"),
+	WRT_MDSTR_m13("Equipment Description", time_series_section_2.equipment_description, NULL),
+	WRT_MDSTR_m13("Reference Description", time_series_section_2.reference_description, NULL),
+	{.name = "Acquisition Channel Number", .type = "integer", .default_str = "NO ENTRY", .notes = "Physical channel number; NO ENTRY => auto-set to channel add order",
+	.dest = WRT_RC_MD_m13, .kind = WRT_RC_KSI4_m13, .offset = offsetof(METADATA_m13, time_series_section_2.acquisition_channel_number), .no_entry_f = (sf8) NAN, .no_entry_i = (si8) METADATA_ACQUISITION_CHANNEL_NUMBER_NO_ENTRY_m13},
+	WRT_MDF8_m13("Low Frequency Filter Setting", time_series_section_2.low_frequency_filter_setting, "NO ENTRY", (sf8) RATE_NO_ENTRY_m13, "External provenance: what happened before the samples reached this API"),
+	WRT_MDF8_m13("High Frequency Filter Setting", time_series_section_2.high_frequency_filter_setting, "NO ENTRY", (sf8) RATE_NO_ENTRY_m13, NULL),
+	WRT_MDF8_m13("Line Filter Frequency Setting", time_series_section_2.line_filter_frequency_setting, "NO ENTRY", (sf8) RATE_NO_ENTRY_m13, "Line filtering applied OUTSIDE the library, any mechanism (library-applied filtering is per-block truth)"),
+	WRT_MDF8_m13("Power Line Frequency", time_series_section_2.power_line_frequency, "NO ENTRY", (sf8) RATE_NO_ENTRY_m13, "Mains fundamental at the recording site (50 or 60; harmonics implied).\nRequired for the line noise filter & line noise scores."),
+	WRT_MDF8_m13("Amplitude Units Conversion Factor", time_series_section_2.amplitude_units_conversion_factor, "NO ENTRY", (sf8) TS_METADATA_AMPLITUDE_UNITS_CONVERSION_FACTOR_NO_ENTRY_m13, "Multiply stored integers by this to recover amplitude units"),
+	WRT_MDSTR_m13("Amplitude Units Description", time_series_section_2.amplitude_units_description, NULL),
+	WRT_MDF8_m13("Time Base Units Conversion Factor", time_series_section_2.time_base_units_conversion_factor, "NO ENTRY", (sf8) TS_METADATA_TIME_BASE_UNITS_CONVERSION_FACTOR_NO_ENTRY_m13, NULL),
+	WRT_MDSTR_m13("Time Base Units Description", time_series_section_2.time_base_units_description, NULL),
+	// METADATA template: section 3
+	WRT_MDSTR_m13("Subject Name 1", section_3.subject_name_1, "e.g. first name"),
+	WRT_MDSTR_m13("Subject Name 2", section_3.subject_name_2, "e.g. middle name"),
+	WRT_MDSTR_m13("Subject Name 3", section_3.subject_name_3, "e.g. last name"),
+	WRT_MDSTR_m13("Subject ID", section_3.subject_ID, NULL),
+	WRT_MDSTR_m13("Recording Country", section_3.recording_country, "Timezone resolution input (D20); also seeded from the resolved timezone when omitted"),
+	WRT_MDSTR_m13("Recording Territory", section_3.recording_territory, NULL),
+	WRT_MDSTR_m13("Recording Locality", section_3.recording_locality, NULL),
+	WRT_MDSTR_m13("Recording Institution", section_3.recording_institution, NULL),
+	WRT_MDSTR_m13("Standard Timezone Acronym", section_3.standard_timezone_acronym, "Timezone resolution input (D20), e.g. MST"),
+	WRT_MDSTR_m13("Geotag Format", section_3.geotag_format, "Format of Geotag Data; the library writes \"ISO 6709\" when it formats the tag"),
+	WRT_MDSTR_m13("Geotag Data", section_3.geotag_data, "Raw geotag (wins over Recording Latitude/Longitude when both are given).\nRecommended: ISO 6709, e.g. +40.68941-074.04478+0025.0CRSWGS_84/"),
+	{.name = "Recording Latitude", .type = "float", .default_str = "NO ENTRY", .notes = "Decimal degrees, WGS 84, +N/-S. With Recording Longitude, formatted into Geotag Data (ISO 6709).\nNot stored as such - reads back as NO ENTRY (the geotag holds the value).",
+	.dest = WRT_RC_MD_m13, .kind = WRT_RC_KLAT_m13, .no_entry_f = (sf8) NAN, .no_entry_i = WRT_RC_NO_SENT_m13},
+	{.name = "Recording Longitude", .type = "float", .default_str = "NO ENTRY", .notes = "Decimal degrees, WGS 84, +E/-W",
+	.dest = WRT_RC_MD_m13, .kind = WRT_RC_KLON_m13, .no_entry_f = (sf8) NAN, .no_entry_i = WRT_RC_NO_SENT_m13},
+	// OPTIONS: compression
+	WRT_OPTMAP_m13(WRT_RC_KMAP8_m13, "Compression Algorithm", codec, "PRED2", WRT_codec_opts_m13, WRT_codec_vals_m13, "VDS is lossy (see VDS Threshold); all others are lossless"),
+	WRT_OPTTERN_m13("Fall Through To Best", fall_through_to_best, "YES", "Per block, use the smallest applicable encoding when the chosen algorithm is not it"),
+	WRT_OPTF8_m13("VDS Threshold", VDS_threshold, "NO ENTRY", (sf8) RATE_NO_ENTRY_m13, (sf8) 1.0, "VDS only. NO ENTRY => algorithmic threshold (scaled to the noise floor)"),
+	WRT_OPTF8_m13("VDS LFP Filter Cutoff", VDS_LFP_high_fc, "NO ENTRY", (sf8) RATE_NO_ENTRY_m13, (sf8) 1.0, "VDS only. NO ENTRY => use High Frequency Filter Setting"),
+	// OPTIONS: time
+	WRT_OPTMAP_m13(WRT_RC_KMAP1_m13, "Time Mode", time_mode, "UUTC", WRT_time_opts_m13, WRT_time_vals_m13, "UUTC: true wall time known (library generates the recording time offset).\nOUTC: no true wall time claimed - caller times are pure offsets (zero-based typical)."),
+	WRT_OPTINT_m13(WRT_RC_KSI8_m13, "Session Start Time", session_start_time, "NO ENTRY", (si8) CURRENT_TIME_m13, "uutc (microseconds). NO ENTRY => now (UUTC mode) / zero-based (OUTC mode)"),
+	WRT_OPTSTR_m13("Session Start Time String", session_start_string, "Human-readable alternative: YYYY-MM-DD HH:MM:SS[.ffffff], LOCAL time at the recording site.\nTranslated against the resolved timezone; used when Session Start Time is NO ENTRY."),
+	WRT_OPTTERN_m13("Apply Recording Time Offset", apply_recording_time_offset, "YES", "Privacy offset (UUTC mode). NO stores true times"),
+	// OPTIONS: security
+	WRT_OPTSTR_m13("Level 1 Password", level_1_password, "Passwords are never stored anywhere - remove them from copies of this file that travel"),
+	WRT_OPTSTR_m13("Level 2 Password", level_2_password, NULL),
+	WRT_OPTSTR_m13("Level 3 Password", level_3_password, "Master password (access recovery; not used to encrypt data)"),
+	WRT_OPTINT_m13(WRT_RC_KSI1_m13, "Metadata Section 2 Encryption Level", section_2_encryption_level, "0", WRT_RC_NO_SENT_m13, "0 = none, 1 = level 1, 2 = level 2"),
+	WRT_OPTINT_m13(WRT_RC_KSI1_m13, "Metadata Section 3 Encryption Level", section_3_encryption_level, "0", WRT_RC_NO_SENT_m13, NULL),
+	WRT_OPTINT_m13(WRT_RC_KSI1_m13, "Data Encryption Level", data_encryption_level, "0", WRT_RC_NO_SENT_m13, NULL),
+	WRT_OPTINT_m13(WRT_RC_KSI1_m13, "Video Data Encryption Level", video_data_encryption_level, "0", WRT_RC_NO_SENT_m13, "Adopted native video files (AES-256-CTR over the container bytes)"),
+	WRT_OPTINT_m13(WRT_RC_KSI4_m13, "Encode Workers", encode_workers, "0", WRT_RC_NO_SENT_m13, "Worker-pool size for packet-fed acquisition (0 = encode on the calling thread)"),
+	WRT_OPTINT_m13(WRT_RC_KSI1_m13, "Record Encryption Level", record_encryption_level, "0", WRT_RC_NO_SENT_m13, "All record types; per-type levels via the deep interface"),
+	// OPTIONS: library-applied processing
+	WRT_OPTTERN_m13("Line Noise Filter", line_noise_filter, "NO", "Template line noise filter on the way in (requires Power Line Frequency); sets the per-block filtered flag"),
+	{.name = "Noise Scores", .type = "ternary", .default_str = "NO", .notes = "Per-block noise scores (line noise, entropy deficit, spectral slope, amplitude); ~free when the line noise filter is on",
+	.opts = WRT_yes_no_opts_m13, .n_opts = 2, .dest = WRT_RC_OPT_m13, .kind = WRT_RC_KSCORES_m13, .offset = offsetof(WRT_OPTIONS_m13, noise_scores), .no_entry_f = (sf8) NAN, .no_entry_i = WRT_RC_NO_SENT_m13},
+	WRT_OPTF8_m13("Decimation Frequency", decimation_frequency, "NO ENTRY", (sf8) RATE_NO_ENTRY_m13, (sf8) 1.0, "Output rate; NO ENTRY => no decimation. The recorded sampling frequency becomes this rate"),
+	WRT_OPTTERN_m13("Antialias Filter", antialias_filter, "NO ENTRY", "NO ENTRY => automatic (on when decimating; full-rate VDS antialiases intrinsically)"),
+	// OPTIONS: blocking
+	WRT_OPTF8_m13("Block Duration", block_duration, "10000000", (sf8) NAN, (sf8) 1e-6, "Microseconds (DHN rc convention). 10000000 (10 s) measured best for VDS fidelity at equal size"),
+	WRT_OPTINT_m13(WRT_RC_KUI4_m13, "Block Samples", block_samples, "0", WRT_RC_NO_SENT_m13, "0 => use Block Duration"),
+	WRT_OPTINT_m13(WRT_RC_KUI4_m13, "Initial Block Samples", initial_block_samples, "0", WRT_RC_NO_SENT_m13, "First-block size for phase staggering across channels (acquisition); 0 => equal to steady-state"),
+	// OPTIONS: discontinuities & segmenting
+	WRT_OPTMAP_m13(WRT_RC_KMAP1_m13, "Discontinuity Mode", discontinuity_mode, "EXPLICIT", WRT_discont_opts_m13, WRT_discont_vals_m13, "EXPLICIT: only marked discontinuities create gaps (out-of-tolerance block start time is an error).\nIMPLICIT: out-of-tolerance block start times auto-mark discontinuities."),
+	WRT_OPTF8_m13("Discontinuity Tolerance", discontinuity_tolerance, "1.5", (sf8) NAN, (sf8) 1.0, "Sample periods"),
+	WRT_OPTMAP_m13(WRT_RC_KMAP1_m13, "Segmenting Mode", segmenting_mode, "NONE", WRT_seg_opts_m13, WRT_seg_vals_m13, "NONE: whole session is one segment. AUTO: duration rollover. MANUAL: WRT_new_segment_m13()"),
+	WRT_OPTF8_m13("Auto-Segment Interval", auto_segment_hours, "0", (sf8) NAN, (sf8) 1.0, "Hours (AUTO segmenting mode)"),
+	// OPTIONS: records, parity, behavior
+	WRT_OPTTERN_m13("Include Session Records", session_records, "YES", NULL),
+	WRT_OPTTERN_m13("Include Segmented Session Records", seg_session_records, "NO", NULL),
+	WRT_OPTTERN_m13("Include Channel Records", channel_records, "NO", NULL),
+	WRT_OPTTERN_m13("Include Segment Records", segment_records, "NO", NULL),
+	WRT_OPTMAP_m13(WRT_RC_KMAP1_m13, "Parity", parity, "NONE", WRT_parity_opts_m13, WRT_parity_vals_m13, NULL),
+	WRT_OPTMAP_m13(WRT_RC_KMAP1_m13, "Session Exists Behavior", exists_behavior, "FAIL", WRT_exists_opts_m13, WRT_exists_vals_m13, "RENAME appends a numeric suffix to the new session"),
+};
+
+
+// static prototypes (alphabetical order can place callers before callees)
+static si1	*WRT_rc_token_m13(const si1 *entry, const si1 *label, si1 *out);
+
+
+tern	WRT_config_read_m13(const si1 *rc_path, METADATA_m13 *md, WRT_OPTIONS_m13 *opt)
+{
+	si1				*buf, *c, *fld_ptr;
+	si1				name_str[RC_STRING_BYTES_m13], val_str[RC_STRING_BYTES_m13], tmp_str[RC_STRING_BYTES_m13];
+	ui1				*base, *fp8;
+	si4				i, ret;
+	si8				flen, int_val;
+	sf8				float_val, lat, lon;
+	tern				TERN_val, known;
+	FILE				*fp;
+	const WRT_RC_FIELD_m13		*row;
+
+	// defaults first: missing fields (& explicit NO ENTRY) keep them
+	if (md != NULL)
+		WRT_metadata_defaults_m13(md);
+	if (opt != NULL)
+		WRT_options_defaults_m13(opt);
+
+	// read the whole file (text; raw stdio by convention)
+	fp = fopen(rc_path, "rb");
+	if (fp == NULL) {
+		G_set_error_m13(E_FOPEN_m13, "could not open rc file \"%s\"", rc_path);
+		return(FALSE_m13);
+	}
+	fseek(fp, 0, SEEK_END);
+	flen = (si8) ftell(fp);
+	fseek(fp, 0, SEEK_SET);
+	buf = (si1 *) malloc((size_t) flen + 1);
+	if (buf == NULL) {
+		fclose(fp);
+		G_set_error_m13(E_ALLOC_m13, NULL);
+		return(FALSE_m13);
+	}
+	if (fread(buf, 1, (size_t) flen, fp) != (size_t) flen) {
+		fclose(fp);
+		free(buf);
+		G_set_error_m13(E_FREAD_m13, "could not read rc file \"%s\"", rc_path);
+		return(FALSE_m13);
+	}
+	fclose(fp);
+	buf[flen] = 0;
+
+	// pre-pass: PROMPT rejection (RC_read_field_m13()'s prompt is interactive stdin - it would hang a
+	// binding/mex) & unknown-field warnings (unknowns are legal - app-specific fields share rc files)
+	c = buf;
+	while ((c = STR_match_end_m13("%% FIELD:", c)) != NULL) {
+		while (*c == ' ')
+			++c;
+		*name_str = 0;
+		if (sscanf(c, RC_LINE_FMT_m13, name_str) == 1) {
+			si1	*e = name_str + strlen(name_str);
+			while (--e >= name_str && *e == ' ');
+			*++e = 0;
+		}
+		fld_ptr = c;
+		known = FALSE_m13;
+		for (i = 0; i < WRT_RC_N_FIELDS_m13; ++i) {
+			if (strcmp_m13(name_str, WRT_rc_fields_m13[i].name) == 0) {
+				known = TRUE_m13;
+				break;
+			}
+		}
+		if (known == FALSE_m13)
+			G_warning_message_m13("%s(): unrecognized rc field \"%s\" (ignored - standard field names are exact-match; app-specific fields are allowed)\n", __FUNCTION__, name_str);
+		if (WRT_rc_token_m13(fld_ptr, "%% VALUE:", val_str) != NULL) {
+			if (strcmp_m13(val_str, "DEFAULT") == 0)
+				WRT_rc_token_m13(fld_ptr, "%% DEFAULT:", val_str);  // entry order: DEFAULT precedes VALUE
+			if (strcmp_m13(val_str, "PROMPT") == 0) {
+				free(buf);
+				G_set_error_m13(E_GEN_m13, "rc field \"%s\" resolves to PROMPT: interactive prompting is not available through this interface - enter a value in \"%s\"", name_str, rc_path);
+				return(FALSE_m13);
+			}
+		}
+	}
+
+	// per-field reads
+	lat = lon = (sf8) NAN;
+	for (i = 0; i < WRT_RC_N_FIELDS_m13; ++i) {
+		row = WRT_rc_fields_m13 + i;
+		if (row->dest == WRT_RC_MD_m13) {
+			if (md == NULL)
+				continue;
+			base = (ui1 *) md;
+		} else {
+			if (opt == NULL)
+				continue;
+			base = (ui1 *) opt;
+		}
+		// tolerant-missing: probe before calling (RC_read_field_m13() errors on absent fields)
+		sprintf_m13(tmp_str, "%%%% FIELD: %s", row->name);
+		c = buf;  // exact-name probe (prefix-collision guard, mirrors RC_read_field_m13)
+		while ((fld_ptr = STR_match_end_m13(tmp_str, c)) != NULL) {
+			c = fld_ptr;
+			while (*c == ' ')
+				++c;
+			if (*c == '\r' || *c == '\n' || *c == 0)
+				break;
+		}
+		if (fld_ptr == NULL)
+			continue;
+		c = buf;
+		ret = RC_read_field_m13(row->name, &c, FALSE_m13, val_str, &float_val, &int_val, &TERN_val);
+		if (ret == RC_ERR_m13) {  // present but malformed: hard error (the lib error names the field)
+			free(buf);
+			return(FALSE_m13);
+		}
+		if (ret == RC_NO_ENTRY_m13)  // explicit NO ENTRY == keep the default
+			continue;
+		fp8 = base + row->offset;
+		switch (row->kind) {
+			case WRT_RC_KSTR_m13:
+				strncpy_m13((si1 *) fp8, val_str, row->bytes - 1);
+				break;
+			case WRT_RC_KSF8_m13:
+				*((sf8 *) fp8) = float_val * row->scale;
+				break;
+			case WRT_RC_KSI1_m13:
+				*((si1 *) fp8) = (si1) int_val;
+				break;
+			case WRT_RC_KSI4_m13:
+				*((si4 *) fp8) = (si4) int_val;
+				break;
+			case WRT_RC_KUI4_m13:
+				*((ui4 *) fp8) = (ui4) int_val;
+				break;
+			case WRT_RC_KSI8_m13:
+				*((si8 *) fp8) = int_val;
+				break;
+			case WRT_RC_KTERN_m13:
+				*((tern *) fp8) = TERN_val;
+				break;
+			case WRT_RC_KMAP1_m13:
+				if (ret >= 1 && ret <= row->n_opts)
+					*((si1 *) fp8) = (si1) row->opt_vals[ret - 1];
+				break;
+			case WRT_RC_KMAP8_m13:
+				if (ret >= 1 && ret <= row->n_opts)
+					*((ui8 *) fp8) = (ui8) row->opt_vals[ret - 1];
+				break;
+			case WRT_RC_KLAT_m13:
+				lat = float_val;
+				break;
+			case WRT_RC_KLON_m13:
+				lon = float_val;
+				break;
+			case WRT_RC_KSCORES_m13:
+				*((ui8 *) fp8) = (TERN_val == TRUE_m13) ? CPS_DF_ALL_NOISE_SCORES_m13 : 0;
+				break;
+		}
+	}
+	free(buf);
+
+	// latitude/longitude convenience -> geotag (raw Geotag Data wins if both were given - D19)
+	if (md != NULL && isnan(lat) == 0 && isnan(lon) == 0 && *md->section_3.geotag_data == 0) {
+		if (WRT_format_geotag_m13(lat, lon, (sf8) NAN, md->section_3.geotag_format, md->section_3.geotag_data) == FALSE_m13)
+			return(FALSE_m13);
+	}
+
+	return(TRUE_m13);
+}
+
+
+tern	WRT_config_write_m13(const si1 *rc_path, METADATA_m13 *md, WRT_OPTIONS_m13 *opt)
+{
+	// Template generator (D18): writes a COMPLETE standard-field rc file with current struct values
+	// (NULL structs => "DEFAULT"), so users edit a canonical file instead of typing field names from
+	// memory. Doubles as the vocabulary documentation & round-trips through WRT_config_read_m13().
+	const si1			*nts, *e;
+	si1				val_str[RC_STRING_BYTES_m13];
+	ui1				*base, *fp8;
+	si4				i, j;
+	sf8				fval;
+	si8				ival;
+	tern				tval;
+	FILE				*fp;
+	const WRT_RC_FIELD_m13		*row;
+
+	fp = fopen(rc_path, "w");
+	if (fp == NULL) {
+		G_set_error_m13(E_FOPEN_m13, "could not create rc file \"%s\"", rc_path);
+		return(FALSE_m13);
+	}
+	fprintf(fp, "MED write configuration (rc) file\n");
+	fprintf(fp, "----------------------------------\n\n");
+	fprintf(fp, "Lines not beginning with \"%%%%\" are comments.\n");
+	fprintf(fp, "Standard field names are exact-match; missing fields & \"NO ENTRY\" values keep the library defaults.\n");
+	fprintf(fp, "App-specific fields may be added freely - unrecognized fields are ignored (with a warning).\n");
+	fprintf(fp, "\"PROMPT\" values are not supported through the write API.\n\n");
+
+	for (i = 0; i < WRT_RC_N_FIELDS_m13; ++i) {
+		row = WRT_rc_fields_m13 + i;
+		fprintf(fp, "%%%% FIELD: %s\n", row->name);
+		for (nts = row->notes; nts != NULL; nts = (*e == 0) ? NULL : e + 1) {
+			e = nts;
+			while (*e && *e != '\n')
+				++e;
+			fprintf(fp, "%%%% NOTES: %.*s\n", (si4) (e - nts), nts);
+		}
+		fprintf(fp, "%%%% TYPE: %s\n", row->type);
+		if (row->opts != NULL) {
+			fprintf(fp, (row->only == TRUE_m13) ? "%%%% OPTIONS ONLY: " : "%%%% OPTIONS: ");
+			for (j = 0; j < row->n_opts; ++j)
+				fprintf(fp, "%s%s", row->opts[j], (j < row->n_opts - 1) ? ", " : "");
+			fprintf(fp, "\n");
+		} else {
+			fprintf(fp, "%%%% OPTIONS: NO ENTRY\n");
+		}
+		fprintf(fp, "%%%% DEFAULT: %s\n", row->default_str);
+
+		// value: from the structs when supplied, else DEFAULT
+		base = NULL;
+		if (row->dest == WRT_RC_MD_m13 && md != NULL)
+			base = (ui1 *) md;
+		else if (row->dest == WRT_RC_OPT_m13 && opt != NULL)
+			base = (ui1 *) opt;
+		if (base == NULL || row->kind == WRT_RC_KLAT_m13 || row->kind == WRT_RC_KLON_m13) {
+			// lat/lon are write-only conveniences: the value lives in Geotag Data
+			strcpy(val_str, (base == NULL) ? "DEFAULT" : "NO ENTRY");
+		} else {
+			fp8 = base + row->offset;
+			switch (row->kind) {
+				case WRT_RC_KSTR_m13:
+					if (*((si1 *) fp8) == 0)
+						strcpy(val_str, "NO ENTRY");
+					else
+						snprintf(val_str, RC_STRING_BYTES_m13, "%s", (si1 *) fp8);
+					break;
+				case WRT_RC_KSF8_m13:
+					fval = *((sf8 *) fp8);
+					if (isnan(row->no_entry_f) == 0 && fval == row->no_entry_f)
+						strcpy(val_str, "NO ENTRY");
+					else
+						sprintf(val_str, "%lg", fval / row->scale);
+					break;
+				case WRT_RC_KSI1_m13:
+				case WRT_RC_KSI4_m13:
+				case WRT_RC_KUI4_m13:
+				case WRT_RC_KSI8_m13:
+					if (row->kind == WRT_RC_KSI1_m13)
+						ival = (si8) *((si1 *) fp8);
+					else if (row->kind == WRT_RC_KSI4_m13)
+						ival = (si8) *((si4 *) fp8);
+					else if (row->kind == WRT_RC_KUI4_m13)
+						ival = (si8) *((ui4 *) fp8);
+					else
+						ival = *((si8 *) fp8);
+					if (row->no_entry_i != WRT_RC_NO_SENT_m13 && ival == row->no_entry_i)
+						strcpy(val_str, "NO ENTRY");
+					else
+						sprintf(val_str, "%ld", (long) ival);
+					break;
+				case WRT_RC_KTERN_m13:
+					tval = *((tern *) fp8);
+					strcpy(val_str, (tval == TRUE_m13) ? "YES" : (tval == FALSE_m13) ? "NO" : "NO ENTRY");
+					break;
+				case WRT_RC_KMAP1_m13:
+				case WRT_RC_KMAP8_m13:
+					ival = (row->kind == WRT_RC_KMAP1_m13) ? (si8) *((si1 *) fp8) : (si8) *((ui8 *) fp8);
+					strcpy(val_str, "DEFAULT");
+					for (j = 0; j < row->n_opts; ++j) {
+						if (row->opt_vals[j] == ival) {
+							strcpy(val_str, row->opts[j]);
+							break;
+						}
+					}
+					break;
+				case WRT_RC_KSCORES_m13:
+					strcpy(val_str, (*((ui8 *) fp8) != 0) ? "YES" : "NO");
+					break;
+			}
+		}
+		fprintf(fp, "%%%% VALUE: %s\n\n", val_str);
+	}
+	fclose(fp);
+
+	return(TRUE_m13);
+}
+
+
+si4	WRT_cs_read_m13(const si1 *cs_path, si1 ***chan_names, METADATA_m13 **md_overrides, WRT_OPTIONS_m13 **opt_overrides)
+{
+	// PLAN (D18): parse the CS (channel specification) file - names + per-channel columns
+	// (decimation_frequency, block size, algorithm, VDS knobs, antialias, LNF, description,
+	// acquisition_channel_number...) - into n_chans-length arrays of override structs initialized to
+	// NO_ENTRY (so unspecified columns inherit the session values via the D1 field-wise merge).
+	// Group/prefix expansion per the CS conventions (cs_read_file/cs_read_file_tsv are the reference).
+
+	G_set_error_m13(E_GEN_m13, "WRT_cs_read_m13() is not yet implemented (design phase)");
+	return(-1);
+}
+
+
+// extract & trim the single-line token following <label> at/after <entry>; returns NULL if label absent
+static si1	*WRT_rc_token_m13(const si1 *entry, const si1 *label, si1 *out)  // out: RC_STRING_BYTES_m13
+{
+	si1	*c, *e;
+	si4	items;
+
+	*out = 0;
+	if ((c = STR_match_end_m13(label, entry)) == NULL)
+		return(NULL);
+	while (*c == ' ')
+		++c;
+	items = sscanf(c, RC_LINE_FMT_m13, out);
+	if (items == 1) {
+		e = out + strlen(out);
+		while (--e >= out && *e == ' ');
+		*++e = 0;
+	}
+	return(c);
+}
+
+
+// D23: VM double-mapped ("magic") ring - the same physical pages mapped twice, contiguously, so
+// data[i] & data[i + len] alias & every window <= len is linear. Size is page-rounded up.
+// macOS: mach_vm_allocate + mach_vm_remap; Linux: memfd + double MAP_FIXED mmap;
+// Windows: CreateFileMapping + two MapViewOfFileEx (placement raced under a reserve/release, retried).
+#if defined MACOS_m13
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#endif
+
+// static prototypes (alphabetical order can place callers before callees)
+static void	WRT_apply_metadata_m13(METADATA_m13 *base, METADATA_m13 *tmpl);
+
+
+tern	WRT_acquire_geotag_m13(si1 *format_out, si1 *data_out)
+{
+	// D21: G_location_info_m13() (ipinfo.io via curl, 5 s connect timeout) supplies latitude/longitude.
+	// AIR-GAP SAFE by construction: entirely optional, single bounded network attempt, clean FALSE when
+	// offline - never required by any write path. set_timezone_globals FALSE: acquiring a geotag must
+	// not clobber the pg time constants as a side effect (D20 sets those deliberately).
+	LOCATION_INFO_m13	loc_info;
+
+	if (G_location_info_m13(&loc_info, NULL, NULL, FALSE_m13, FALSE_m13) == FALSE_m13) {
+		G_set_error_m13(E_GEN_m13, "could not acquire location (offline, or location service unavailable)");
+		return(FALSE_m13);
+	}
+	if (loc_info.latitude == (sf8) 0.0 && loc_info.longitude == (sf8) 0.0) {  // "loc:" absent from service reply
+		G_set_error_m13(E_GEN_m13, "location service reply contained no coordinates");
+		return(FALSE_m13);
+	}
+
+	return(WRT_format_geotag_m13(loc_info.latitude, loc_info.longitude, (sf8) NAN, format_out, data_out));
+}
+
+
+// field-wise template overlay (D19/D1): non-empty strings & non-NO_ENTRY numerics from the template
+// win over the base (the seeded proto metadata, or a session default in a per-channel merge)
+static void	WRT_apply_metadata_m13(METADATA_m13 *base, METADATA_m13 *tmpl)
+{
+	TS_METADATA_SECTION_2_m13	*b2, *t2;
+	METADATA_SECTION_3_m13		*b3, *t3;
+
+	// section 1
+	if (*tmpl->section_1.anonymized_subject_ID)
+		memcpy(base->section_1.anonymized_subject_ID, tmpl->section_1.anonymized_subject_ID, METADATA_ANONYMIZED_SUBJECT_ID_BYTES_m13);
+	if (*tmpl->section_1.level_1_password_hint)
+		memcpy(base->section_1.level_1_password_hint, tmpl->section_1.level_1_password_hint, PASSWORD_HINT_BYTES_m13);
+	if (*tmpl->section_1.level_2_password_hint)
+		memcpy(base->section_1.level_2_password_hint, tmpl->section_1.level_2_password_hint, PASSWORD_HINT_BYTES_m13);
+
+	// section 2 (time series)
+	b2 = &base->time_series_section_2;
+	t2 = &tmpl->time_series_section_2;
+	if (*t2->session_description)
+		memcpy(b2->session_description, t2->session_description, METADATA_SESSION_DESCRIPTION_BYTES_m13);
+	if (*t2->channel_description)
+		memcpy(b2->channel_description, t2->channel_description, METADATA_CHANNEL_DESCRIPTION_BYTES_m13);
+	if (*t2->segment_description)
+		memcpy(b2->segment_description, t2->segment_description, METADATA_SEGMENT_DESCRIPTION_BYTES_m13);
+	if (*t2->equipment_description)
+		memcpy(b2->equipment_description, t2->equipment_description, METADATA_EQUIPMENT_DESCRIPTION_BYTES_m13);
+	if (*t2->reference_description)
+		memcpy(b2->reference_description, t2->reference_description, TS_METADATA_REFERENCE_DESCRIPTION_BYTES_m13);
+	if (t2->acquisition_channel_number != METADATA_ACQUISITION_CHANNEL_NUMBER_NO_ENTRY_m13)
+		b2->acquisition_channel_number = t2->acquisition_channel_number;
+	if (t2->sampling_frequency != (sf8) RATE_NO_ENTRY_m13)
+		b2->sampling_frequency = t2->sampling_frequency;
+	if (t2->low_frequency_filter_setting != (sf8) RATE_NO_ENTRY_m13)
+		b2->low_frequency_filter_setting = t2->low_frequency_filter_setting;
+	if (t2->high_frequency_filter_setting != (sf8) RATE_NO_ENTRY_m13)
+		b2->high_frequency_filter_setting = t2->high_frequency_filter_setting;
+	if (t2->line_filter_frequency_setting != (sf8) RATE_NO_ENTRY_m13)
+		b2->line_filter_frequency_setting = t2->line_filter_frequency_setting;
+	if (t2->power_line_frequency != (sf8) RATE_NO_ENTRY_m13)
+		b2->power_line_frequency = t2->power_line_frequency;
+	if (t2->amplitude_units_conversion_factor != (sf8) TS_METADATA_AMPLITUDE_UNITS_CONVERSION_FACTOR_NO_ENTRY_m13)
+		b2->amplitude_units_conversion_factor = t2->amplitude_units_conversion_factor;
+	if (*t2->amplitude_units_description)
+		memcpy(b2->amplitude_units_description, t2->amplitude_units_description, TS_METADATA_AMPLITUDE_UNITS_DESCRIPTION_BYTES_m13);
+	if (t2->time_base_units_conversion_factor != (sf8) TS_METADATA_TIME_BASE_UNITS_CONVERSION_FACTOR_NO_ENTRY_m13)
+		b2->time_base_units_conversion_factor = t2->time_base_units_conversion_factor;
+	if (*t2->time_base_units_description)
+		memcpy(b2->time_base_units_description, t2->time_base_units_description, TS_METADATA_TIME_BASE_UNITS_DESCRIPTION_BYTES_m13);
+
+	// section 3 (subject & location; the time fields belong to the library via the pg constants - the
+	// template's tz inputs [country/territory/acronym] fed G_set_time_constants_m13() already & the
+	// proto was seeded from the RESOLVED constants, so only location & subject strings override here)
+	b3 = &base->section_3;
+	t3 = &tmpl->section_3;
+	if (*t3->subject_name_1)
+		memcpy(b3->subject_name_1, t3->subject_name_1, METADATA_SUBJECT_NAME_BYTES_m13);
+	if (*t3->subject_name_2)
+		memcpy(b3->subject_name_2, t3->subject_name_2, METADATA_SUBJECT_NAME_BYTES_m13);
+	if (*t3->subject_name_3)
+		memcpy(b3->subject_name_3, t3->subject_name_3, METADATA_SUBJECT_NAME_BYTES_m13);
+	if (*t3->subject_ID)
+		memcpy(b3->subject_ID, t3->subject_ID, METADATA_SUBJECT_ID_BYTES_m13);
+	if (*t3->recording_country)  // only override the library-seeded value when the caller supplied one
+		memcpy(b3->recording_country, t3->recording_country, METADATA_RECORDING_LOCATION_BYTES_m13);
+	if (*t3->recording_territory)
+		memcpy(b3->recording_territory, t3->recording_territory, METADATA_RECORDING_LOCATION_BYTES_m13);
+	if (*t3->recording_locality)
+		memcpy(b3->recording_locality, t3->recording_locality, METADATA_RECORDING_LOCATION_BYTES_m13);
+	if (*t3->recording_institution)
+		memcpy(b3->recording_institution, t3->recording_institution, METADATA_RECORDING_LOCATION_BYTES_m13);
+	if (*t3->geotag_format)
+		memcpy(b3->geotag_format, t3->geotag_format, METADATA_GEOTAG_FORMAT_BYTES_m13);
+	if (*t3->geotag_data)
+		memcpy(b3->geotag_data, t3->geotag_data, METADATA_GEOTAG_DATA_BYTES_m13);
+
+	return;
+}
+
+
+tern	WRT_format_geotag_m13(sf8 latitude, sf8 longitude, sf8 altitude_meters, si1 *format_out, si1 *data_out)
+{
+	// ISO 6709 point string, datum WGS 84 (see the note at the geolocation fields in medwrt_m13.h):
+	//   "+40.68941-074.04478/"  or with altitude  "+40.68941-074.04478+0025.0/"  + "CRSWGS_84" before '/'
+	// Zero-padded degree fields per the standard: sign + 2 digits latitude, sign + 3 digits longitude;
+	// 5 decimal places ~= 1.1 m of latitude - comparable to civilian GPS accuracy.
+
+	if (format_out == NULL || data_out == NULL) {
+		G_set_error_m13(E_GEN_m13, "output pointers are null");
+		return(FALSE_m13);
+	}
+	if (isnan(latitude) || isnan(longitude)) {
+		G_set_error_m13(E_GEN_m13, "latitude & longitude are required");
+		return(FALSE_m13);
+	}
+	if (latitude < (sf8) -90.0 || latitude > (sf8) 90.0) {
+		G_set_error_m13(E_GEN_m13, "latitude out of range [-90, 90]");
+		return(FALSE_m13);
+	}
+	if (longitude < (sf8) -180.0 || longitude > (sf8) 180.0) {
+		G_set_error_m13(E_GEN_m13, "longitude out of range [-180, 180]");
+		return(FALSE_m13);
+	}
+
+	strcpy(format_out, "ISO 6709");
+	if (isnan(altitude_meters))
+		sprintf_m13(data_out, "%+09.5f%+010.5f" "CRSWGS_84/", latitude, longitude);
+	else
+		sprintf_m13(data_out, "%+09.5f%+010.5f%+07.1f" "CRSWGS_84/", latitude, longitude, altitude_meters);
+
+	return(TRUE_m13);
+}
+
+
+si8	WRT_parse_time_string_m13(void *level_header, const si1 *time_str)
+{
+	// D22: "YYYY-MM-DD HH:MM:SS[.ffffff]" (space or 'T' separator; seconds & fraction optional),
+	// LOCAL time at the recording site -> uutc. The converter pattern (NRD2MED/CSC2MED): compose as
+	// GMT (timegm), then subtract the resolved standard UTC offset. Level-resolved constants (the
+	// 2026-08-10 writer-side reshape); unset constants => the string is treated as UTC (offset 0).
+	si4		items, year, month, day, hour, minute, second;
+	si8		usecs, uutc;
+	sf8		frac;
+	time_t		utc;
+	struct tm	tm_info = {0};
+	PROC_GLOBS_m13	*pg;
+
+	if (time_str == NULL || *time_str == 0) {
+		G_set_error_m13(E_GEN_m13, "no time string");
+		return(TIME_NO_ENTRY_m13);
+	}
+	second = 0;
+	frac = (sf8) 0.0;
+	items = sscanf(time_str, "%d-%d-%d%*1[ T]%d:%d:%d%lf", &year, &month, &day, &hour, &minute, &second, &frac);
+	if (items < 5) {
+		G_set_error_m13(E_GEN_m13, "could not parse time string \"%s\" (expected \"YYYY-MM-DD HH:MM:SS[.ffffff]\")", time_str);
+		return(TIME_NO_ENTRY_m13);
+	}
+	tm_info.tm_year = year - 1900;
+	tm_info.tm_mon = month - 1;
+	tm_info.tm_mday = day;
+	tm_info.tm_hour = hour;
+	tm_info.tm_min = minute;
+	tm_info.tm_sec = second;
+#if defined MACOS_m13 || defined LINUX_m13
+	utc = timegm(&tm_info);
+#endif
+#ifdef WINDOWS_m13
+	utc = _mkgmtime(&tm_info);
+#endif
+	pg = G_proc_globs_m13(level_header);
+	utc -= (time_t) pg->time_constants.standard_UTC_offset;  // local at the recording site -> UTC (standard-time interpretation)
+	usecs = (si8) (frac * (sf8) 1e6 + (sf8) 0.5);
+	uutc = ((si8) utc * (si8) 1000000) + usecs;
+
+	// DST (Matt, 2026-08-10: the library is DST-aware - local WALL time, DST or not, translates to
+	// uutc which is DST & TZ agnostic): if the date falls inside the resolved timezone's DST window,
+	// the wall clock was standard + DST offset - subtract it. NOTE G_DST_offset_m13() resolves its pg
+	// AMBIENTLY by design (documented model boundary; reshape candidate alongside the 2026-08-10
+	// level-resolved pair) - correct here in the common case where the ambient pg is this session's.
+	uutc -= (si8) G_DST_offset_m13(uutc) * (si8) 1000000;
+
+	return(uutc);
+}
+
+
+tern	WRT_ring_alloc_m13(WRT_RING_m13 *ring, si8 min_elements, si8 el_bytes)
+{
+	si8	page_size, bytes;
+
+	if (ring == NULL || min_elements < 1 || el_bytes < 1) {
+		G_set_error_m13(E_GEN_m13, "bad arguments");
+		return(FALSE_m13);
+	}
+	memset((void *) ring, 0, sizeof(WRT_RING_m13));
+	ring->el_bytes = el_bytes;
+	page_size = (si8) G_map_granularity_m13();  // HW_params' known value (Matt): page size on Unix; Windows ALLOCATION GRANULARITY (64 KB - MapViewOfFileEx placement requires it, not the page)
+	bytes = min_elements * el_bytes;
+	bytes = ((bytes + page_size - 1) / page_size) * page_size;  // page multiple
+
+#if defined MACOS_m13
+	{
+		kern_return_t		kr;
+		mach_vm_address_t	base = 0, second;
+		vm_prot_t		cur_prot, max_prot;
+
+		kr = mach_vm_allocate(mach_task_self(), &base, (mach_vm_size_t) bytes * 2, VM_FLAGS_ANYWHERE);
+		if (kr != KERN_SUCCESS) {
+			G_set_error_m13(E_ALLOC_m13, "mach_vm_allocate failed (%d)", (si4) kr);
+			return(FALSE_m13);
+		}
+		second = base + (mach_vm_address_t) bytes;
+		kr = mach_vm_deallocate(mach_task_self(), second, (mach_vm_size_t) bytes);
+		if (kr == KERN_SUCCESS)
+			kr = mach_vm_remap(mach_task_self(), &second, (mach_vm_size_t) bytes, 0,
+				VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, mach_task_self(), base, FALSE,
+				&cur_prot, &max_prot, VM_INHERIT_DEFAULT);
+		if (kr != KERN_SUCCESS) {
+			mach_vm_deallocate(mach_task_self(), base, (mach_vm_size_t) bytes * 2);
+			G_set_error_m13(E_ALLOC_m13, "mach_vm_remap failed (%d)", (si4) kr);
+			return(FALSE_m13);
+		}
+		ring->data = (void *) base;
+	}
+#endif
+#if defined LINUX_m13
+	{
+		si4	fd;
+		void	*base, *m1, *m2;
+
+		fd = memfd_create("med_ring", 0);
+		if (fd < 0 || ftruncate(fd, (off_t) bytes) < 0) {
+			if (fd >= 0)
+				close(fd);
+			G_set_error_m13(E_ALLOC_m13, "memfd_create/ftruncate failed");
+			return(FALSE_m13);
+		}
+		base = mmap(NULL, (size_t) bytes * 2, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);  // reserve
+		m1 = mmap(base, (size_t) bytes, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0);
+		m2 = mmap((ui1 *) base + bytes, (size_t) bytes, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fd, 0);
+		close(fd);  // mappings keep the memory alive
+		if (base == MAP_FAILED || m1 == MAP_FAILED || m2 == MAP_FAILED) {
+			if (base != MAP_FAILED)
+				munmap(base, (size_t) bytes * 2);
+			G_set_error_m13(E_ALLOC_m13, "ring mmap failed");
+			return(FALSE_m13);
+		}
+		ring->data = (void *) base;
+	}
+#endif
+#ifdef WINDOWS_m13
+	{
+		HANDLE	map;
+		void	*base, *m1, *m2;
+		si4	tries;
+
+		map = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE,
+			(DWORD) ((ui8) bytes >> 32), (DWORD) ((ui8) bytes & 0xFFFFFFFF), NULL);
+		if (map == NULL) {
+			G_set_error_m13(E_ALLOC_m13, "CreateFileMapping failed");
+			return(FALSE_m13);
+		}
+		m1 = m2 = NULL;
+		for (tries = 10; tries--;) {  // reserve, release, place two views (racy: retry)
+			base = VirtualAlloc(NULL, (SIZE_T) bytes * 2, MEM_RESERVE, PAGE_NOACCESS);
+			if (base == NULL)
+				continue;
+			VirtualFree(base, 0, MEM_RELEASE);
+			m1 = MapViewOfFileEx(map, FILE_MAP_ALL_ACCESS, 0, 0, (SIZE_T) bytes, base);
+			if (m1 == NULL)
+				continue;
+			m2 = MapViewOfFileEx(map, FILE_MAP_ALL_ACCESS, 0, 0, (SIZE_T) bytes, (ui1 *) base + bytes);
+			if (m2 != NULL)
+				break;
+			UnmapViewOfFile(m1);
+			m1 = NULL;
+		}
+		if (m2 == NULL) {
+			if (m1 != NULL)
+				UnmapViewOfFile(m1);
+			CloseHandle(map);
+			G_set_error_m13(E_ALLOC_m13, "could not place double mapping");
+			return(FALSE_m13);
+		}
+		ring->data = (void *) m1;
+		ring->_map_hdl = (void *) map;
+	}
+#endif
+	ring->len = bytes / el_bytes;
+
+	return(TRUE_m13);
+}
+
+
+void	WRT_ring_free_m13(WRT_RING_m13 *ring)
+{
+	si8	bytes;
+
+	if (ring == NULL || ring->data == NULL)
+		return;
+	bytes = ring->len * ring->el_bytes;
+#if defined MACOS_m13
+	mach_vm_deallocate(mach_task_self(), (mach_vm_address_t) ring->data, (mach_vm_size_t) bytes * 2);
+#endif
+#if defined LINUX_m13
+	munmap((void *) ring->data, (size_t) bytes * 2);
+#endif
+#ifdef WINDOWS_m13
+	UnmapViewOfFile((void *) ring->data);
+	UnmapViewOfFile((void *) ((ui1 *) ring->data + bytes));
+	CloseHandle((HANDLE) ring->_map_hdl);
+#endif
+	memset((void *) ring, 0, sizeof(WRT_RING_m13));
+
+	return;
+}
+
+
+tern	WRT_session_m13(const si1 *sess_path, si4 **samples, si4 n_chans, si8 n_samps, sf8 sampling_frequency,
+			      si1 **chan_names, METADATA_m13 *md, WRT_OPTIONS_m13 *opt)
+{
+	// Tier 1 - THE 90% PATH: "user just has arrays of samples by channel at some sampling rate & just
+	// wants them compressed into MED". Thin veneer over Tier 2. NULL opt => OUTC mode with zero-based
+	// times (no wall time is CLAIMED for data of unknown provenance; supply options to say more).
+	// sampling_frequency (direct argument) is authoritative when > 0; md may refine everything else.
+	si4			i;
+	METADATA_m13		md_l;
+	WRT_OPTIONS_m13	opt_l;
+	WRT_SESS_m13	*ws;
+
+	if (samples == NULL || n_chans < 1 || n_samps < 1) {
+		G_set_error_m13(E_GEN_m13, "bad arguments");
+		return(FALSE_m13);
+	}
+	if (md != NULL)
+		md_l = *md;
+	else
+		WRT_metadata_defaults_m13(&md_l);
+	if (opt != NULL) {
+		opt_l = *opt;
+	} else {
+		WRT_options_defaults_m13(&opt_l);
+		opt_l.time_mode = WRT_TIME_OUTC_m13;
+		opt_l.session_start_time = 0;
+	}
+	if (sampling_frequency > (sf8) 0.0)
+		md_l.time_series_section_2.sampling_frequency = sampling_frequency;
+
+	ws = WRT_create_session_m13(sess_path, &md_l, &opt_l);
+	if (ws == NULL)
+		return(FALSE_m13);
+	for (i = 0; i < n_chans; ++i) {
+		if (WRT_add_ts_channel_m13(ws, (chan_names != NULL) ? chan_names[i] : NULL, NULL, NULL) < 0) {
+			WRT_close_session_m13(ws);
+			return(FALSE_m13);
+		}
+	}
+	for (i = 0; i < n_chans; ++i) {
+		if (WRT_samples_m13(ws, i, samples[i], n_samps, TIME_NO_ENTRY_m13) == FALSE_m13) {
+			WRT_close_session_m13(ws);  // settle what exists; the error is already stored
+			return(FALSE_m13);
+		}
+	}
+
+	return(WRT_close_session_m13(ws));
+}
+
+
+// internal per-channel write state (becomes a public struct once the surface settles - D16)
+typedef struct {
+	si1			name[NAME_BYTES_m13];
+	METADATA_m13		metadata;	// merged channel template (session defaults + override - D1)
+	WRT_OPTIONS_m13	options;	// channel options (override or session copy)
+	sf8			fs;		// sampling frequency (input rate; decimation not yet implemented)
+	ui4			block_samples;		// CURRENT block size (initial_block_samples first - D12)
+	ui4			target_block_samples;	// steady state
+	// D24 symmetry: EVERY channel accumulates output in an si4 magic ring - the ring IS the block
+	// accumulator & the encoder reads its block as a LINEAR WINDOW straight from it (zero copy).
+	// Direct channels ingest caller samples here; chained channels' terminal stage writes here.
+	WRT_RING_m13		out_ring;
+	si8			out_ingest_idx;	// absolute si4 samples accumulated
+	si8			encoded_idx;	// absolute si4 samples encoded (pending == out_ingest - encoded)
+	si8			anchor_time;	// oUTC start of current continuous run
+	si8			anchor_out_idx;	// absolute out_ingest_idx AT anchor: output samples since anchor == out_ingest_idx -
+					// anchor_out_idx (times derive from these; no per-block rounding drift). Written ONLY at
+					// anchor events - out_ingest_idx keeps its single producer, so nothing here is shared
+					// (pool mode: the old anchor_samples counter had two writers & is gone)
+	si8			in_anchor_idx;	// chain channels: absolute ingest_idx at anchor - the INPUT-domain time base
+					// (chain output trails input by the stage lags, so expected-time checks against
+					// caller-supplied input times MUST use ingest progress, not emitted samples)
+	si8			seg_samples;	// samples WRITTEN this segment (next block's start_samp_num)
+	si8			seg_blocks;
+	si8			contig_blocks, contig_block_bytes, contig_samples;
+	si8			discontinuities;
+	tern			pending_discont;
+	tern			has_data;
+	si8			first_time;	// first block start (oUTC; SESSION scope)
+	si8			end_time;	// end of last staged/written sample (oUTC; session scope)
+	// segmenting (D3): the current segment's identity & bounds. Closed segments are SETTLED &
+	// their FPS structures freed; the slot re-initializes in place (G_alloc_segment_m13 reuse path)
+	// - memory stays flat over unlimited segments & a closed segment is immediately reader-valid
+	// (Matt: labs copy/analyze it while the session is live)
+	SEG_m13			*seg;		// current segment (segs[0] slot, re-initialized per segment)
+	si8			sess_samples;	// cumulative samples emitted, session scope
+	si8			seg_start_samp;	// this segment's absolute start sample (session_start_sample_number)
+	si8			seg_first_time;	// this segment's first block start (TIME_NO_ENTRY until first emit)
+	si8			seg_end_time;	// this segment's last sample end
+	// decimation (the DHN_Acq decimate() mechanics - anti-slip: output positions derive from
+	// ABSOLUTE input index via fractional carry; sf8 precision ok 7+ yrs @ 40 kHz @ 1/1000 sample)
+	// filter chain (D23): sf8 magic ring; stages are cursors with ABSOLUTE indices (anti-slip).
+	// ⚠️THREADING (Matt, 2026-08-10): cursors are plain si8 BECAUSE all stages run sequentially on
+	// the caller's thread (ingest -> LNF -> antialias -> terminal, one drain pass). If stages ever
+	// get their own threads, each cursor becomes _Atomic si8: store-RELEASE by its single owning
+	// stage after writing cells, load-ACQUIRE by the consumer before reading them - that pair is the
+	// ENTIRE synchronization (one writer per cursor; ring cells inherit ordering from it).
+	// ⭐DISTRIBUTOR MODE (Matt, 2026-08-10): DHN_Acq de-interleaves EN packets (all channels' values
+	// at time x) from ONE thread into every channel's ring, chains running on channel threads. Then
+	// TWO cursors cross threads & become _Atomic si8: ingest_idx (distributor writes/publishes with
+	// release, chain reads with acquire) & a published retain_from (chain maintains = min of its
+	// stage needs; distributor reads it for the free-space / rollover-backup check - it must NOT
+	// reach into stage internals). Everything else stays single-thread plain.
+	tern			chain_active;	// ring path engaged (any filter stage, or decimation)
+	WRT_RING_m13		ring;
+	si8			ingest_idx;	// absolute input samples ingested (ring pos = idx % len)
+	si8			avail_in_idx;	// stage availability bound: stages consume cells < this. Caller mode keeps it
+					// == ingest_idx; pool-mode workers bound it at unprocessed events, so no stage
+					// ever reads across a continuity boundary
+	si8			avail_out_idx;	// emit availability bound (== out_ingest_idx in caller mode; worker-bounded in pool mode)
+	si8			retain_from;	// published lowest chain-ring index still needed (worker RELEASE_STOREs
+					// after each visit; the distributor ACQUIRE_LOADs for its free-space check)
+	// pool mode (D26): worker-pool distributor contract. pool_state & the event mailbox are
+	// pool-mutex protected; the dist_* mirror is DISTRIBUTOR-PRIVATE (gap detection never touches
+	// worker-owned anchors - the worker re-anchors when it consumes the event).
+	ui1			pool_state;	// IDLE / QUEUED / RUNNING
+	si8			serviced_in_idx;// worker: chain input serviced through here (visit-pending check)
+	si8			visit_thresh;	// enqueue when unserviced input reaches this (chain: ~100 ms; direct: a block)
+	si4			n_events;	// pending boundary events (pool-mutex protected)
+	struct {
+		si8	at_in_idx;	// chain: boundary in INGEST domain (worker services/flushes to here first)
+		si8	at_out_idx;	// direct: boundary in OUT-RING domain
+		si8	new_time;	// oUTC anchor for the data after the boundary
+	}			events[8];
+	si8			dist_anchor_time;   // distributor's private time base (mirrors the worker's anchor)
+	si8			dist_anchor_in_idx;
+	tern			dist_anchored;
+	// telemetry (D27): worker-written, racy-read by the control/GUI thread (snapshot semantics)
+	sf8			visit_cost_ewma_us;
+	sf8			visit_cost_peak_us;
+	si8			visit_count;
+	ui1			last_line_noise_byte;	// most recent encoded block's line-noise score byte, captured at
+							// encode (params.noise_scores staging is memset after packing, so the
+							// telemetry tap cannot read it there); CMP_NS_NO_ENTRY_m13 until scored
+	si8			reset_at_idx;	// armed phase reset: continuity restarts at this absolute index
+	// LNF stage (D23, first in chain: LNF -> antialias -> decimate). Sliding-batch on the ring:
+	// FILT_line_noise_m13() over [save|span|trail-margin]; central span written back IN PLACE; the
+	// span's trailing margin saved RAW first (the next window's left context - cells behind
+	// lnf_finished_idx hold FILTERED values). Margin = template context (~1 s: cycles_per_template
+	// defaults to round(line_freq) cycles), so emitted outputs match a continuous run.
+	tern			lnf_active;
+	si8			lnf_finished_idx;	// absolute: ring cells < this are filtered
+	si8			lnf_start_idx;		// current continuity start (head semantics below it)
+	si8			lnf_margin;		// template context samples
+	si8			lnf_hop;		// steady-state central span
+	si8			lnf_first_span;		// D29 stagger: FIRST span of each continuity (uniform spread across
+						// channels so 512 LNF batch storms don't fire in lockstep - Matt:
+						// synchronous job arrival was the original enemy; stagger the cure)
+	si8			lnf_next_span;		// the next span to process (first_span at continuity start, hop after)
+	sf8			*lnf_y, *lnf_fy;	// batch scratch
+	sf8			*lnf_save;		// raw trailing-margin save
+	si8			lnf_save_len;		// valid samples in lnf_save (< margin only just after head)
+	ui1			lnf_score_byte;		// latest true score (deposited into noise_scores[0] per block)
+	sf8			lnf_line_freq;
+	// antialias stage (D23, between LNF & terminal): streaming zero-phase lowpass via
+	// FILT_filtfilt_head/mid/tail with CHUNKED mid (chunk = L default: the anticausal blast radius
+	// drops below IIR resolution - Matt). 6-pole Butterworth, cutoff = decimation_freq / 3.5
+	// samples-per-cycle, rolloff starting ~4 (the DHN_Acq constants).
+	tern			aa_active;
+	FILTPS_m13		*aa_filtps;
+	FILTFILT_DATA_m13	*aa_fd;
+	tern			aa_headed;	// head consumed for this continuity
+	si8			aa_head_len;	// FIXED head quantum (config constant): the head must be arrival-
+					// independent or visit/call boundaries change the mid-chunk alignment &
+					// outputs stop being deterministic (the D26 pool-equivalence lesson)
+	si8			aa_fed_idx;	// cells consumed into the filter
+	si8			aa_finished_idx;// zero-phase outputs written back through here
+	sf8			*aa_out;	// head/mid/tail output scratch
+	si8			aa_out_len;
+	// terminal quantizer (options.amplitude_quantum): applied on BOTH paths, as the last thing done
+	// to a sample before it reaches the codec. quantizing == FALSE_m13 keeps the si4-direct memcpy.
+	tern			quantizing;
+	sf8			quantum_recip;	// 1.0 / options.amplitude_quantum (multiply, not divide - m12 did the same)
+	si4			quantum_shift;	// log2(quantum) when it is an exact power of two, else 0 (float form).
+					// Measured 2026-08-14 on 20M samples: sign-corrected round+shift runs
+					// 0.42 ns/sample against 1.47 for the float form - 3.5x, & the two agree
+					// EXACTLY (see quantum_bench.c). The cost is CMP_round_si4_m13's branch &
+					// saturation checks, not the arithmetic; the divide was only 14% of it.
+	tern			decimating;
+	tern			dec_phase_reset; // consumed-once: a discontinuity boundary starts with the NEXT call's data
+					// (pending_discont is NOT usable here: it stays set until the first block EMITS)
+	sf8			in_fs;		// input rate (cs->fs stays the OUTPUT rate: block sizing & recorded fs - D19)
+	sf8			dec_step;	// in_fs / out_fs
+	sf8			next_out_in_idx; // ABSOLUTE input index of next output sample (fractional)
+} WRT_CHAN_m13;
+
+// D25 video channel state: adoption cursors & the walk-derived facts that settle video metadata
+typedef struct {
+	si1		name[NAME_BYTES_m13];
+	SEG_m13		*seg;		// current video segment
+	ui4		file_num;	// last adopted file number (1-based)
+	si8		seg_frames;	// present frames so far (file start frame = this)
+	si8		seg_keyframes;
+	si8		next_start_otc;	// derived start of the next file (contiguous mode)
+	si8		first_otc, end_otc;
+	tern		first_file_adopted;
+	// walk facts for the metadata settle (from the first parseable file; maxima across all)
+	sf8		frame_rate;
+	ui4		h_pixels, v_pixels;
+	tern		has_audio;
+	si1		video_format[VID_METADATA_VIDEO_FORMAT_BYTES_m13];
+	ui4		codec_config_bytes;
+	ui1		codec_config[VID_METADATA_CODEC_CONFIG_MAX_BYTES_m13];
+	si8		max_clip_frames, max_clip_bytes;
+	sf8		max_clip_dur;
+	si8		n_discont;
+	si8		run_clips, run_frames, run_bytes;
+	si8		max_contig_clips, max_contig_frames, max_contig_bytes;
+	si8		last_file_bytes;  // last adopted file's UNPADDED container length (terminal vidx entry)
+} WRT_VID_m13;
+
+typedef struct {	// hangs off ws->chan_state_int
+	WRT_VID_m13	*vids;		// D25: video channel states (separate array: chans[] is the flexible member)
+	si4		*packets_scratch;	// WRT_packets_m13 per-channel gather buffer
+	si8		packets_scratch_len;
+	// worker pool (D26): K persistent workers over a channel ready-queue. One distributor thread
+	// (WRT_packets_m13) ingests; workers drain. Queue & channel pool_state under pool_mutex.
+	tern			pool_active;
+	tern			pool_stop;
+	tern			pool_paused;	// quiesce barrier: workers finish current visits & idle
+	tern			pool_error;	// any worker failed (session is dead; error stored)
+	tern			roll_request;	// AUTO segment rollover requested by a worker (executed barriered by the distributor)
+	si4			pool_n_workers;	// live worker count (== pool_target_workers once resizes settle)
+	si4			pool_target_workers;	// D31b: resize target - workers with index >= target exit at their next loop top
+	si4			pool_workers_cap;	// pool_jobs[] capacity (fixed at start: live workers hold pointers into it)
+	si1			worker_affinity_str[64];	// persists for the jobs' affinity_str pointers (launch + resize)
+	si1			(*worker_aff_strs)[16];	// D33 stagger: per-worker one-PHYSICAL-core affinity ("4,5" / "27");
+							// NULL array or empty entry => shared worker_affinity_str (prior behavior)
+	si8			closed_seg_bytes;	// D32: bytes in CLOSED segments (current segment is measured live
+							// from the open files) - the app's session-size, compression &
+							// time-to-disk-full readouts all hang off this
+	si4			pool_n_running;
+	si4			pool_q_head;
+	si4			pool_q_count;
+	si4			*pool_q;	// ready-queue ring of channel indices (capacity n_chans)
+	PROC_JOB_m13		*pool_jobs;	// workers as PROC jobs: named, registered, priority applied at spawn
+	pthread_mutex_t_m13	pool_mutex;	// workers nap-poll the queue (codebase idiom; no cond-var wrapper exists & missed-wakeup bugs can't)
+	pthread_mutex_t_m13	control_mutex;	// D35 (2026-08-18): serializes CONTROL entry points (discontinuity marks, records,
+						// rolls, codec switches, resizes, close). WRT_pool_quiesce_m13() protects a drain
+						// against the WORKERS but not against a SECOND drain CALLER - two control threads
+						// both entered the visit loop & encoded through one CPS (the overnight midnight-
+						// roll SIGSEGV: reader marking the roll discontinuity vs catcher writing the roll
+						// record). The old contract line "control ops & ingest are the same thread ... or
+						// externally serialized" is retired: entry points are now safe by construction.
+						// Never touched by the data path (ingest batches & workers).
+	si8		session_start_otc;
+	si8		sess_first_otc;	// first block start of the whole session (set at first emit)
+	si8		rto;		// subtracted from caller times in UUTC mode (0 in OUTC mode)
+	tern		outc_mode;
+	si4		seg_num;	// current segment number (1-based)
+	WRT_CHAN_m13	chans[];
+} WRT_INT_m13;
+// accessor macro WRT_INT_m13(ws): medlib_m13.h
+
+
+// static prototypes (alphabetical order can place callers before callees)
+static tern	WRT_aa_process_m13(WRT_CHAN_m13 *cs, tern flush);
+static si8	WRT_chain_drain_m13(WRT_CHAN_m13 *cs);
+static tern	WRT_lnf_process_m13(WRT_CHAN_m13 *cs, tern flush);
+static si8	WRT_next_time_m13(WRT_CHAN_m13 *cs);
+
+
+// D23 antialias stage: streaming zero-phase lowpass between LNF & the terminal. Head consumes the
+// continuity's first pad_len + 1 samples (offline left-edge semantics) - the magic ring's linear
+// window feeds it STRAIGHT FROM THE RING, no copy; mid runs one-in/chunk-out (outputs L delayed);
+// tail (flush: discontinuity & end) drains with the offline right-edge semantics EXACTLY. Outputs
+// write back in place: cells in [aa_finished, aa_fed) were already consumed into filter state.
+static tern	WRT_aa_process_m13(WRT_CHAN_m13 *cs, tern flush)
+{
+	si8	upstream, avail, n, n_out, i, len, pad, need;
+	sf8	*rd;
+	FILTFILT_DATA_m13	*fd;
+
+	if (cs->aa_active == FALSE_m13)
+		return(TRUE_m13);
+	rd = (sf8 *) cs->ring.data;
+	len = cs->ring.len;
+	upstream = (cs->lnf_active == TRUE_m13) ? cs->lnf_finished_idx : cs->avail_in_idx;
+
+	// head (start-up phase)
+	if (cs->aa_headed == FALSE_m13) {
+		pad = ((si8) cs->aa_filtps->n_poles * 3) + 1;
+		avail = upstream - cs->aa_fed_idx;
+		if (flush == FALSE_m13) {
+			if (avail < cs->aa_head_len)
+				return(TRUE_m13);  // the head is a FIXED quantum: arrival patterns (call sizes,
+			n = cs->aa_head_len;	   // pool visits) must not change processing alignment
+		} else {
+			if (avail == 0)
+				return(TRUE_m13);
+			if (avail < pad + 1) {
+				// continuity shorter than the reflection pad: pass through raw (a filter needs
+				// more data than this stub holds; the samples are preserved rather than invented)
+				cs->aa_finished_idx = cs->aa_fed_idx = upstream;
+				return(TRUE_m13);
+			}
+			n = avail;  // boundary-determined (the flush position is the same in every mode)
+		}
+		need = n + 32768;  // head may emit up to n; L not yet known - generous
+		if (need > cs->aa_out_len) {
+			cs->aa_out_len = need;
+			cs->aa_out = (sf8 *) realloc(cs->aa_out, (size_t) cs->aa_out_len * sizeof(sf8));
+		}
+		fd = FILT_filtfilt_head_m13(cs->aa_fd, cs->aa_filtps, rd + (cs->aa_fed_idx % len), cs->aa_out, n, (sf8) 0.0, 0, &n_out);
+		if (fd == NULL)
+			return(FALSE_m13);
+		cs->aa_fd = fd;
+		for (i = 0; i < n_out; ++i)
+			rd[(cs->aa_finished_idx + i) % len] = cs->aa_out[i];
+		cs->aa_finished_idx += n_out;
+		cs->aa_fed_idx += n;
+		cs->aa_headed = TRUE_m13;
+	}
+
+	// mid (steady state; outputs arrive in bursts of "chunk" == L)
+	need = cs->aa_fd->L + cs->aa_fd->chunk + 16;
+	if (need > cs->aa_out_len) {
+		cs->aa_out_len = need;
+		cs->aa_out = (sf8 *) realloc(cs->aa_out, (size_t) cs->aa_out_len * sizeof(sf8));
+	}
+	while (cs->aa_fed_idx < upstream) {
+		n_out = FILT_filtfilt_mid_m13(cs->aa_fd, rd[cs->aa_fed_idx % len], cs->aa_out);
+		++cs->aa_fed_idx;
+		for (i = 0; i < n_out; ++i)
+			rd[(cs->aa_finished_idx + i) % len] = cs->aa_out[i];
+		cs->aa_finished_idx += n_out;
+	}
+
+	// tail (terminate phase: discontinuity & end - ALL buffers drained)
+	if (flush == TRUE_m13) {
+		n_out = FILT_filtfilt_tail_m13(cs->aa_fd, cs->aa_out);
+		for (i = 0; i < n_out; ++i)
+			rd[(cs->aa_finished_idx + i) % len] = cs->aa_out[i];
+		cs->aa_finished_idx += n_out;
+		cs->aa_headed = FALSE_m13;  // fd reusable via head for the next continuity
+	}
+
+	return(TRUE_m13);
+}
+
+
+// D23 terminal chain stage: drain the ring into si4 output scratch - decimating (the DHN_Acq
+// fractional-step port, now reading ring history directly: the between-calls partial sample needs no
+// carried value, the previous sample is still IN the ring) or 1:1 (filters without decimation).
+// limit = the preceding stage's finished index (no filter stages yet: the ingest index).
+static si8	WRT_chain_drain_m13(WRT_CHAN_m13 *cs)
+{
+	si8	limit, bottom, len, olen, n_out;
+	sf8	*rd, pos, step, frac, v;
+	si4	*od;
+
+	// each stage trails the previous (D23): terminal <- antialias <- LNF <- ingest
+	if (cs->aa_active == TRUE_m13)
+		limit = cs->aa_finished_idx;
+	else if (cs->lnf_active == TRUE_m13)
+		limit = cs->lnf_finished_idx;
+	else
+		limit = cs->avail_in_idx;
+	if (cs->dec_phase_reset == TRUE_m13) {  // consumed-once: continuity restarts at reset_at_idx
+		cs->next_out_in_idx = (sf8) cs->reset_at_idx;
+		cs->dec_phase_reset = FALSE_m13;
+	}
+	rd = (sf8 *) cs->ring.data;
+	len = cs->ring.len;
+	od = (si4 *) cs->out_ring.data;
+	olen = cs->out_ring.len;
+	n_out = 0;
+	pos = cs->next_out_in_idx;
+	step = (cs->decimating == TRUE_m13) ? cs->dec_step : (sf8) 1.0;
+	while (pos <= (sf8) (limit - 1)) {
+		if ((cs->out_ingest_idx - cs->encoded_idx) >= olen)
+			break;  // output ring full: caller emits & re-drains
+		bottom = (si8) pos;
+		frac = pos - (sf8) bottom;
+		if (bottom == limit - 1 && frac > (sf8) 0.0)
+			break;  // needs the next ingest's first sample: rides the absolute carry
+		v = rd[bottom % len];
+		if (frac > (sf8) 0.0)
+			v += frac * (rd[(bottom + 1) % len] - v);
+		// terminal quantizer, AFTER the filters & never before (see amplitude_quantum). Same two
+		// forms as the si4-direct terminal, chosen the same way, so both terminals agree by
+		// construction rather than by coincidence. Casting to si4 first is exact here: truncating a
+		// fraction below 1 cannot cross an integer boundary the shift has not already crossed, so
+		// the shift & float forms produce IDENTICAL values (quantum_bench.c: 0 of 20M disagree).
+		// The cast is in range by a wide margin - a 24-bit converter leaves si4 256x of headroom, &
+		// a 6-pole Butterworth's overshoot is small & bounded (Matt: anything past 32-bit A/D in
+		// this field is science fiction).
+		if (cs->quantizing == TRUE_m13) {
+			if (cs->quantum_shift) {
+				si4	iv = (si4) v, sh = cs->quantum_shift, rb = (si4) 1 << (sh - 1);
+
+				od[cs->out_ingest_idx % olen] = (iv >= 0) ? ((iv + rb) >> sh)
+									 : (si4) -((-((si8) iv) + rb) >> sh);
+			} else {  // non-power-of-two quantum
+				od[cs->out_ingest_idx % olen] = CMP_round_si4_m13(v * cs->quantum_recip);
+			}
+		} else {
+			od[cs->out_ingest_idx % olen] = CMP_round_si4_m13(v);  // round-half-AWAY-FROM-ZERO
+				// (m12 semantics; symmetric about zero, unlike an arithmetic shift, which floors)
+		}
+		++cs->out_ingest_idx;
+		++n_out;
+		pos += step;
+	}
+	cs->next_out_in_idx = pos;
+	cs->avail_out_idx = cs->out_ingest_idx;
+	if (n_out)
+		cs->has_data = TRUE_m13;
+
+	return(n_out);
+}
+
+
+// D23 LNF stage: process ready spans (steady state), or EVERYTHING on flush (the tail phase -
+// discontinuity & session end MUST drain: no sample may be left in a filter's pipeline). The batch
+// function's own edge handling provides the head (first window of a continuity) & tail semantics.
+static tern	WRT_lnf_process_m13(WRT_CHAN_m13 *cs, tern flush)
+{
+	si8	avail, span, lead, trail, y_len, i, len, need;
+	sf8	score, *y;
+
+	if (cs->lnf_active == FALSE_m13)
+		return(TRUE_m13);
+	len = cs->ring.len;
+	while (1) {
+		avail = cs->avail_in_idx - cs->lnf_finished_idx;
+		if (avail <= 0)
+			break;
+		if (flush == TRUE_m13) {
+			span = avail;		// tail: drain everything, batch right-edge handling
+			trail = 0;
+		} else {
+			if (avail < cs->lnf_next_span + cs->lnf_margin)
+				break;		// not enough future context yet
+			span = cs->lnf_next_span;
+			cs->lnf_next_span = cs->lnf_hop;  // D29: staggered first span consumed; steady hops follow
+			trail = cs->lnf_margin;
+		}
+		lead = cs->lnf_save_len;	// 0 on the first window of a continuity (head)
+		y_len = lead + span + trail;
+		y = cs->lnf_y;
+		memcpy((void *) y, (void *) cs->lnf_save, (size_t) lead * sizeof(sf8));
+		for (i = 0; i < span + trail; ++i)
+			y[lead + i] = ((sf8 *) cs->ring.data)[(cs->lnf_finished_idx + i) % len];
+		score = FILT_line_noise_m13(y, cs->lnf_fy, y_len, cs->in_fs, cs->lnf_line_freq, 0, TRUE_m13, FALSE_m13, NULL);
+		if (score >= (sf8) 0.0)	// deposited per block into noise_scores[0] (the switch semantics)
+			cs->lnf_score_byte = (ui1) ((score > (sf8) 1.0 ? (sf8) 1.0 : score) * (sf8) 254.0 + (sf8) 0.5);
+		// save the span's trailing margin RAW (next window's left context) BEFORE overwriting
+		need = (span < cs->lnf_margin) ? span : cs->lnf_margin;
+		if (span < cs->lnf_margin && cs->lnf_save_len) {  // short span: shift old save, append
+			si8	keep = cs->lnf_margin - span;
+			if (keep > cs->lnf_save_len)
+				keep = cs->lnf_save_len;
+			memmove((void *) cs->lnf_save, (void *) (cs->lnf_save + (cs->lnf_save_len - keep)), (size_t) keep * sizeof(sf8));
+			cs->lnf_save_len = keep;
+		} else {
+			cs->lnf_save_len = 0;
+		}
+		for (i = 0; i < need; ++i)
+			cs->lnf_save[cs->lnf_save_len + i] = ((sf8 *) cs->ring.data)[(cs->lnf_finished_idx + span - need + i) % len];
+		cs->lnf_save_len += need;
+		// write the filtered central span back into the ring
+		for (i = 0; i < span; ++i)
+			((sf8 *) cs->ring.data)[(cs->lnf_finished_idx + i) % len] = cs->lnf_fy[lead + i];
+		cs->lnf_finished_idx += span;
+		if (flush == TRUE_m13)
+			break;
+	}
+
+	return(TRUE_m13);
+}
+
+
+// oUTC time of the NEXT sample entering the channel (anchor-derived: immune to per-block rounding)
+static si8	WRT_next_time_m13(WRT_CHAN_m13 *cs)
+{
+	return(cs->anchor_time + (si8) ((((sf8) (cs->out_ingest_idx - cs->anchor_out_idx) * (sf8) 1e6) / cs->fs) + (sf8) 0.5));
+}
+
+
+static si8	WRT_chain_drain_m13(WRT_CHAN_m13 *cs);  // defined below
+static tern	WRT_lnf_process_m13(WRT_CHAN_m13 *cs, tern flush);  // defined below
+static tern	WRT_aa_process_m13(WRT_CHAN_m13 *cs, tern flush);  // defined below
+static tern	WRT_stage_m13(WRT_SESS_m13 *ws, si4 chan_idx, si4 *samps, si8 n_samps);  // defined below
+static tern	WRT_pool_start_m13(WRT_SESS_m13 *ws);  // defined below (D26 worker pool)
+static void	WRT_pool_stop_m13(WRT_SESS_m13 *ws);
+static tern	WRT_pool_quiesce_m13(WRT_SESS_m13 *ws);
+static void	WRT_pool_resume_m13(WRT_SESS_m13 *ws);
+static tern	WRT_packets_pool_m13(WRT_SESS_m13 *ws, void *packets, si8 n_packets, si8 packet_bytes, si8 samples_offset, si4 *chan_map, si8 start_time);
+static tern	WRT_toggle_boundary_m13(WRT_SESS_m13 *ws, si4 chan_idx);  // defined below
+static si8	WRT_chain_retain_m13(WRT_CHAN_m13 *cs);  // defined below
+static tern	WRT_chain_service_m13(WRT_SESS_m13 *ws, si4 chan_idx, si8 limit);  // defined below
+static tern	WRT_apply_time_m13(WRT_SESS_m13 *ws, si4 chan_idx, si8 start_time);  // defined below
+static tern	WRT_emit_pending_m13(WRT_SESS_m13 *ws, si4 chan_idx, tern all);  // defined below
+
+// static prototypes (alphabetical order can place callers before callees)
+static tern	WRT_chain_flush_m13(WRT_SESS_m13 *ws, si4 chan_idx, si8 limit);
+
+
+// D23 lifecycle: every stage TERMINATES at a discontinuity & at end - all buffers drained, nothing
+// left in any filter's pipeline. Restores head state for the next continuity.
+static tern	WRT_chain_flush_m13(WRT_SESS_m13 *ws, si4 chan_idx, si8 limit)
+{
+	si8		out_n;
+	WRT_CHAN_m13	*cs;
+
+	cs = ((WRT_INT_m13 *) ws->chan_state_int)->chans + chan_idx;
+	if (cs->chain_active == FALSE_m13) {  // direct flavor: "flush" = everything ingested becomes emittable
+		cs->avail_out_idx = (limit < 0) ? cs->out_ingest_idx : limit;  // pool: distributor-side cursor read by the (idled) control thread
+		return(TRUE_m13);
+	}
+	cs->avail_in_idx = (limit < 0) ? cs->ingest_idx : limit;  // negative == everything (caller mode); pool workers bound at events
+	if (WRT_lnf_process_m13(cs, TRUE_m13) == FALSE_m13)  // LNF tail
+		return(FALSE_m13);
+	if (WRT_aa_process_m13(cs, TRUE_m13) == FALSE_m13)  // antialias tail (exact offline right edge)
+		return(FALSE_m13);
+	do {	// terminal consumes through the flushed stages; emit frees out-ring space between passes
+		out_n = WRT_chain_drain_m13(cs);
+		if (WRT_emit_pending_m13(ws, chan_idx, FALSE_m13) == FALSE_m13)
+			return(FALSE_m13);
+	} while (out_n);
+	cs->lnf_save_len = 0;  // head state for the next continuity
+	cs->lnf_next_span = cs->lnf_first_span;  // D29: stagger re-arms at every continuity (like D12 blocks)
+	cs->lnf_start_idx = cs->lnf_finished_idx = cs->avail_in_idx;
+	cs->aa_fed_idx = cs->aa_finished_idx = cs->avail_in_idx;  // (aa_headed already FALSE from the tail)
+
+	return(TRUE_m13);
+}
+
+static tern	WRT_emit_block_m13(WRT_SESS_m13 *ws, si4 chan_idx);  // defined below
+
+// static prototypes (alphabetical order can place callers before callees)
+static tern	WRT_apply_time_m13(WRT_SESS_m13 *ws, si4 chan_idx, si8 start_time);
+static void	WRT_build_parity_m13(WRT_SESS_m13 *ws, si4 seg_num, tern session_close);
+static si8	WRT_chain_retain_m13(WRT_CHAN_m13 *cs);
+static tern	WRT_chain_service_m13(WRT_SESS_m13 *ws, si4 chan_idx, si8 limit);
+static tern	WRT_close_segment_files_m13(WRT_SESS_m13 *ws, si4 chan_idx);
+static tern	WRT_emit_pending_m13(WRT_SESS_m13 *ws, si4 chan_idx, tern all);
+static tern	WRT_enter_Sgmt_m13(WRT_SESS_m13 *ws, si8 seg_start, si8 seg_end, si8 start_idx, si8 end_idx, si4 seg_num, const si1 *desc);
+static tern	WRT_roll_segment_m13(WRT_SESS_m13 *ws, const si1 *new_desc);
+static tern	WRT_setup_seg_io_m13(WRT_SESS_m13 *ws, si4 chan_idx);
+static tern	WRT_stage_m13(WRT_SESS_m13 *ws, si4 chan_idx, si4 *samps, si8 n_samps);
+static tern	WRT_write_Sgmt_m13(FPS_m13 *rd_fps, FPS_m13 *ri_fps, si8 seg_start, si8 seg_end, si8 start_idx, si8 end_idx, sf8 rate, si4 seg_num, const si1 *desc);
+
+
+// start_time semantics (D2/D9) for a channel's next run of samples: TIME_NO_ENTRY == continuous flow;
+// otherwise the caller's wall-time estimate - within tolerance the derived time wins (jitter absorbed);
+// beyond tolerance EXPLICIT mode errors & IMPLICIT mode auto-marks a discontinuity.
+static tern	WRT_apply_time_m13(WRT_SESS_m13 *ws, si4 chan_idx, si8 start_time)
+{
+	si8		t, expected, delta, tol;
+	WRT_INT_m13	*wi;
+	WRT_CHAN_m13	*cs;
+
+	if (start_time == TIME_NO_ENTRY_m13)
+		return(TRUE_m13);
+	wi = (WRT_INT_m13 *) ws->chan_state_int;
+	cs = wi->chans + chan_idx;
+	t = start_time;  // times are oUTC universally (Matt 2026-08-11: RTO is added back only for display) - rto is NOT subtracted from ongoing time args
+	if (cs->has_data == FALSE_m13 && cs->out_ingest_idx == 0 && cs->ingest_idx == 0) {  // VERY first data only (a filling chain has ingest, no output yet - it must NOT re-anchor)
+		cs->anchor_time = cs->first_time = t;  // channel's first data defines its start
+		cs->in_anchor_idx = 0;
+	} else {
+		if (cs->chain_active == TRUE_m13)  // INPUT-domain expectation: chain output trails input by the stage lags
+			expected = cs->anchor_time + (si8) ((((sf8) (cs->ingest_idx - cs->in_anchor_idx) * (sf8) 1e6) / cs->in_fs) + (sf8) 0.5);
+		else
+			expected = WRT_next_time_m13(cs);
+		delta = t - expected;
+		tol = (si8) ((cs->options.discontinuity_tolerance * (sf8) 1e6 / cs->fs) + (sf8) 0.5);
+		if (delta > tol || delta < -tol) {
+			if (cs->options.discontinuity_mode == WRT_DISCONT_EXPLICIT_m13) {
+				G_set_error_m13(E_GEN_m13, "channel \"%s\": start_time is %ld usecs from the expected time (tolerance %ld): mark the discontinuity explicitly (WRT_mark_discontinuity_m13) or set IMPLICIT discontinuity mode", cs->name, (long) delta, (long) tol);
+				return(FALSE_m13);
+			}
+			// IMPLICIT: close the current block at the gap & restart time at t
+			if (WRT_chain_flush_m13(ws, chan_idx, (si8) -1) == FALSE_m13)  // drain every stage (D23 lifecycle)
+				return(FALSE_m13);
+			if (WRT_emit_pending_m13(ws, chan_idx, TRUE_m13) == FALSE_m13)
+				return(FALSE_m13);
+			cs->pending_discont = TRUE_m13;
+			cs->dec_phase_reset = TRUE_m13;
+			cs->anchor_time = t;
+			cs->anchor_out_idx = cs->out_ingest_idx;  // boundary fully drained: everything out belongs to the closed run
+			cs->in_anchor_idx = cs->ingest_idx;  // continuity restarts at the next ingested sample
+			cs->block_samples = (cs->options.initial_block_samples && cs->options.initial_block_samples < cs->target_block_samples) ? cs->options.initial_block_samples : cs->target_block_samples;  // D12 re-arm (see WRT_mark_discontinuity_m13)
+		}
+	}
+
+	return(TRUE_m13);
+}
+
+
+// parity per Matt's DHN_Acq pattern ("calling build_parity after segment closes"), synchronous here:
+// a closed segment is not DONE until its parity exists - the immediately-copyable guarantee includes
+// it. Failure warns rather than kills: the data files are already settled; parity is auxiliary.
+static void	WRT_build_parity_m13(WRT_SESS_m13 *ws, si4 seg_num, tern session_close)
+{
+	ui4	flags;
+
+	if (ws->options.parity == WRT_PARITY_NONE_m13)
+		return;
+	if (session_close == TRUE_m13) {  // final segment + session/channel-level files (the DHN_Acq terminate masks)
+		if (ws->options.parity == WRT_PARITY_ALL_m13)
+			flags = (ws->n_vid_chans > 0) ? PRTY_ALL_FILES_m13 : PRTY_ALL_TS_m13;
+		else  // DATA: data & metadata files, no indices
+			flags = PRTY_GLB_SESS_REC_DATA_m13 | PRTY_SEG_SESS_REC_DATA_m13 | PRTY_TS_CHAN_REC_DATA_m13 | PRTY_TS_SEG_REC_DATA_m13 | PRTY_TS_SEG_DAT_DATA_m13 | PRTY_TS_SEG_META_m13;
+	} else {  // a mid-recording segment close: segment-level files only
+		if (ws->options.parity == WRT_PARITY_ALL_m13)
+			flags = PRTY_TS_SEG_m13;
+		else
+			flags = PRTY_TS_SEG_REC_DATA_m13 | PRTY_TS_SEG_DAT_DATA_m13 | PRTY_TS_SEG_META_m13;
+	}
+	if (ws->n_vid_chans > 0) {  // D25: video parity classes (Matt: make sure video parity is built)
+		if (ws->options.parity == WRT_PARITY_ALL_m13)
+			flags |= PRTY_VID_SEG_m13;
+		else
+			flags |= PRTY_VID_SEG_DAT_DATA_m13 | PRTY_VID_SEG_META_m13;
+	}
+	if (PRTY_write_m13(ws->path, flags, seg_num) == FALSE_m13)
+		G_warning_message_m13("%s(): parity build failed for segment %d (data files are settled & unaffected)\n", __FUNCTION__, seg_num);
+
+	return;
+}
+
+
+// the lowest absolute chain-ring index any stage still needs. In caller-thread mode this bounds the
+// ingest free-space check; in distributor mode (D23 note in WRT_CHAN_m13) the drain side publishes it
+// as retain_from & the distributor reads it - it must NOT reach into stage internals beyond this.
+static si8	WRT_chain_retain_m13(WRT_CHAN_m13 *cs)
+{
+	si8	consumed;
+
+	consumed = (si8) cs->next_out_in_idx;  // terminal cursor: bottom sample retained for interpolation
+	if (cs->lnf_active == TRUE_m13 && cs->lnf_finished_idx < consumed)
+		consumed = cs->lnf_finished_idx;  // LNF still needs these cells raw
+
+	return(consumed);
+}
+
+
+// run the chain stages & emit completed blocks, until quiescent - the DRAIN half of the ingest/drain
+// seam. Caller-thread mode calls it between ingest chunks; distributor-mode workers call it as the
+// per-channel visit (the pool's work item).
+static tern	WRT_chain_service_m13(WRT_SESS_m13 *ws, si4 chan_idx, si8 limit)
+{
+	si8		out_n;
+	WRT_CHAN_m13	*cs;
+
+	cs = ((WRT_INT_m13 *) ws->chan_state_int)->chans + chan_idx;
+	cs->avail_in_idx = (limit < 0) ? cs->ingest_idx : limit;  // negative == everything ingested (caller mode)
+	if (WRT_lnf_process_m13(cs, FALSE_m13) == FALSE_m13)
+		return(FALSE_m13);
+	if (WRT_aa_process_m13(cs, FALSE_m13) == FALSE_m13)
+		return(FALSE_m13);
+	do {	// terminal -> out ring; emit frees out-ring space, so re-drain until quiescent
+		out_n = WRT_chain_drain_m13(cs);
+		if (WRT_emit_pending_m13(ws, chan_idx, FALSE_m13) == FALSE_m13)
+			return(FALSE_m13);
+	} while (out_n);
+
+	return(TRUE_m13);
+}
+
+
+// settle & close the current segment's files: FULL metadata, data UH, terminal ts index. After this
+// the segment is complete & READER-VALID - labs copy/analyze it while the session is live (D3).
+static tern	WRT_close_segment_files_m13(WRT_SESS_m13 *ws, si4 chan_idx)
+{
+	si8		len, seg_first, seg_end;
+	WRT_INT_m13	*wi;
+	WRT_CHAN_m13	*cs;
+	SEG_m13		*seg;
+	FPS_m13		*gen_fps;
+	UH_m13		*uh;
+
+	wi = WRT_INT_m13(ws);
+	cs = wi->chans + chan_idx;
+	seg = cs->seg;
+	seg_first = cs->seg_first_time;
+	seg_end = cs->seg_end_time;
+	if (seg_first == TIME_NO_ENTRY_m13)  // empty segment (possible but odd)
+		seg_first = seg_end = (wi->sess_first_otc != TIME_NO_ENTRY_m13) ? wi->sess_first_otc : wi->session_start_otc;
+
+	// metadata (FULL file at segment close)
+	gen_fps = seg->metadata_fps;
+	gen_fps->metadata->section_3.recording_time_offset = ws->pg->time_constants.recording_time_offset;
+	gen_fps->metadata->time_series_section_2.number_of_discontinuities = cs->discontinuities;
+	gen_fps->metadata->time_series_section_2.session_start_sample_number = cs->seg_start_samp;
+	uh = gen_fps->uh;
+	uh->session_start_time = (wi->sess_first_otc != TIME_NO_ENTRY_m13) ? wi->sess_first_otc : wi->session_start_otc;
+	uh->file_start_time = seg_first;
+	uh->file_end_time = seg_end;
+	uh->live = FALSE_m13;  // settled: no longer being recorded
+	gen_fps->direcs.flags |= (FPS_DF_CLOSE_AFTER_OP_m13 | FPS_DF_LEAVE_DECRYPTED_m13);
+	// ⚠️ LEAVE_DECRYPTED is load-bearing: the ROLL clones this metadata FPS as the NEXT segment's
+	// prototype. Default in-place encryption left ciphertext in memory -> the clone inherited it as
+	// "plaintext" -> encrypted AGAIN at its own close -> every segment after the first failed
+	// decrypt-validation on read (found on the first encrypted 2-segment real-stream session)
+	if (FPS_write_m13(gen_fps, FPS_FULL_FILE_m13, 0, 0) < 0)
+		return(FALSE_m13);
+
+	// time series data (final length captured BEFORE closing - post-close flen probes a NULL path)
+	gen_fps = seg->ts_data_fps;
+	len = gen_fps->params.fp->len;
+	uh = gen_fps->uh;
+	uh->session_start_time = (wi->sess_first_otc != TIME_NO_ENTRY_m13) ? wi->sess_first_otc : wi->session_start_otc;
+	uh->file_start_time = seg_first;
+	uh->file_end_time = seg_end;
+	uh->live = FALSE_m13;  // settled: no longer being recorded
+	FPS_write_m13(gen_fps, FPS_UH_ONLY_m13, 0, 0);
+	FPS_close_m13(gen_fps);
+
+	// time series indices + terminal index
+	gen_fps = seg->ts_inds_fps;
+	uh = gen_fps->uh;
+	uh->session_start_time = (wi->sess_first_otc != TIME_NO_ENTRY_m13) ? wi->sess_first_otc : wi->session_start_otc;
+	uh->file_start_time = seg_first;
+	uh->file_end_time = seg_end;
+	uh->live = FALSE_m13;  // settled: no longer being recorded
+	gen_fps->ts_inds->file_offset = len;
+	gen_fps->ts_inds->start_time = seg_end + 1;
+	gen_fps->ts_inds->start_samp_num = cs->seg_samples;
+	gen_fps->direcs.flags |= FPS_DF_CLOSE_AFTER_OP_m13;
+	FPS_write_m13(gen_fps, FPS_APPEND_m13, INDEX_BYTES_m13, 1);
+
+	return(TRUE_m13);
+}
+
+
+// emit every full block; with "all", the final partial too (boundaries: flush / discontinuity / close)
+static tern	WRT_emit_pending_m13(WRT_SESS_m13 *ws, si4 chan_idx, tern all)
+{
+	WRT_CHAN_m13	*cs;
+
+	cs = ((WRT_INT_m13 *) ws->chan_state_int)->chans + chan_idx;
+	while ((cs->avail_out_idx - cs->encoded_idx) >= (si8) cs->block_samples)
+		if (WRT_emit_block_m13(ws, chan_idx) == FALSE_m13)
+			return(FALSE_m13);
+	if (all == TRUE_m13 && cs->avail_out_idx > cs->encoded_idx)
+		if (WRT_emit_block_m13(ws, chan_idx) == FALSE_m13)
+			return(FALSE_m13);
+
+	return(TRUE_m13);
+}
+
+
+// per-segment Sgmt records at ALL enabled levels: session (channel-0 indices, or RATE_VARIABLE on
+// mixed rates) + channel (each channel's true rate & indices)
+static tern	WRT_enter_Sgmt_m13(WRT_SESS_m13 *ws, si8 seg_start, si8 seg_end, si8 start_idx, si8 end_idx, si4 seg_num, const si1 *desc)
+{
+	si4		i;
+	sf8		rate;
+	WRT_INT_m13	*wi;
+	WRT_CHAN_m13	*cs;
+	CHAN_m13	*chan;
+
+	wi = WRT_INT_m13(ws);
+	if (ws->options.session_records == TRUE_m13 && ws->sess->rec_data_fps != NULL) {
+		rate = wi->chans[0].fs;
+		for (i = 1; i < ws->n_chans; ++i)
+			if (wi->chans[i].fs != rate)
+				rate = (sf8) REC_Sgmt_v11_RATE_VARIABLE_m13;
+		if (WRT_write_Sgmt_m13(ws->sess->rec_data_fps, ws->sess->rec_inds_fps, seg_start, seg_end, start_idx, end_idx, rate, seg_num, desc) == FALSE_m13)
+			return(FALSE_m13);
+	}
+	if (ws->options.channel_records == TRUE_m13) {
+		for (i = 0; i < ws->n_chans; ++i) {
+			cs = wi->chans + i;
+			chan = ws->sess->ts_chans[i];
+			if (chan->rec_data_fps == NULL || chan->rec_inds_fps == NULL)
+				continue;
+			if (WRT_write_Sgmt_m13(chan->rec_data_fps, chan->rec_inds_fps,
+			    (cs->seg_first_time != TIME_NO_ENTRY_m13) ? cs->seg_first_time : seg_start,
+			    (cs->seg_end_time != TIME_NO_ENTRY_m13) ? cs->seg_end_time : seg_end,
+			    cs->seg_start_samp, cs->sess_samples - 1, cs->fs, seg_num, desc) == FALSE_m13)
+				return(FALSE_m13);
+		}
+	}
+
+	return(TRUE_m13);
+}
+
+
+// D3 segment rollover: boundary at the chain OUTPUT - filters KEEP SLIDING (obsoletes DHN_Acq's
+// "segment transition pending" drain wait; in-flight filter lag rides into the next segment;
+// si4-direct channels split exactly). The closing segment is settled & reader-valid on return.
+static tern	WRT_roll_segment_m13(WRT_SESS_m13 *ws, const si1 *new_desc)
+{
+	si1		num_str[FILE_NUMBERING_DIGITS_m13 + 1], seg_path[PATH_BYTES_m13];
+	si4		i;
+	si8		seg_start, seg_end;
+	ui8		saved_uid;
+	WRT_INT_m13	*wi;
+	WRT_CHAN_m13	*cs;
+	CHAN_m13	*chan;
+	FPS_m13		*old_md, *old_inds, *old_data;
+
+	wi = WRT_INT_m13(ws);
+
+	// close the current blocks (short) on every channel; D12 stagger re-arm (lockstep-refill argument)
+	for (i = 0; i < ws->n_chans; ++i) {
+		cs = wi->chans + i;
+		if (WRT_emit_pending_m13(ws, i, TRUE_m13) == FALSE_m13)
+			return(FALSE_m13);
+		cs->block_samples = (cs->options.initial_block_samples && cs->options.initial_block_samples < cs->target_block_samples) ? cs->options.initial_block_samples : cs->target_block_samples;
+	}
+
+	// session-level Sgmt record for the closing segment (bounds across channels; indices from channel 0)
+	seg_start = seg_end = TIME_NO_ENTRY_m13;
+	for (i = 0; i < ws->n_chans; ++i) {
+		cs = wi->chans + i;
+		if (cs->seg_first_time != TIME_NO_ENTRY_m13 && (seg_start == TIME_NO_ENTRY_m13 || cs->seg_first_time < seg_start))
+			seg_start = cs->seg_first_time;
+		if (cs->seg_end_time > seg_end || seg_end == TIME_NO_ENTRY_m13)
+			seg_end = cs->seg_end_time;
+	}
+	if (seg_start == TIME_NO_ENTRY_m13)
+		seg_start = seg_end = wi->session_start_otc;
+	if (WRT_enter_Sgmt_m13(ws, seg_start, seg_end, wi->chans[0].seg_start_samp, wi->chans[0].sess_samples - 1, wi->seg_num,
+	    wi->chans[0].seg->metadata_fps->metadata->time_series_section_2.segment_description) == FALSE_m13)
+		return(FALSE_m13);
+
+	{	// D32: bank the closing segment's size before its files are settled & the slot reused
+		si8	closing_bytes = 0;
+
+		(void) WRT_bytes_written_m13(ws, &closing_bytes);
+		wi->closed_seg_bytes += closing_bytes;
+	}
+
+	// per channel: settle & close; re-initialize the SAME segment slot for the next segment
+	for (i = 0; i < ws->n_chans; ++i) {
+		cs = wi->chans + i;
+		chan = ws->sess->ts_chans[i];
+		if (WRT_close_segment_files_m13(ws, i) == FALSE_m13)
+			return(FALSE_m13);
+		old_md = cs->seg->metadata_fps;
+		old_inds = cs->seg->ts_inds_fps;
+		old_data = cs->seg->ts_data_fps;
+		saved_uid = old_md->uh->segment_UID;
+		old_md->uh->segment_UID = UID_NO_ENTRY_m13;  // proto clone must REGENERATE for the new segment
+		STR_fixed_width_int_m13(num_str, FILE_NUMBERING_DIGITS_m13, (si8) wi->seg_num + 1);
+		sprintf_m13(seg_path, "%s/%s_s%s.%s", chan->path, chan->name, num_str, TS_SEG_TYPE_STR_m13);
+		if (G_alloc_segment_m13(cs->seg, old_md, seg_path, (LH_m13 *) chan, wi->seg_num + 1, FALSE_m13) == NULL) {
+			old_md->uh->segment_UID = saved_uid;
+			return(FALSE_m13);
+		}
+		FPS_free_m13(old_md);	// the closed segment's structures: files are settled, memory is done
+		FPS_free_m13(old_inds);	// (slot reuse keeps memory FLAT over unlimited segments)
+		FPS_free_m13(old_data);
+		if (new_desc != NULL && *new_desc) {  // D17: description entered at "segment now" (Matt: what's going on)
+			strncpy_m13(cs->metadata.time_series_section_2.segment_description, new_desc, METADATA_SEGMENT_DESCRIPTION_BYTES_m13 - 1);
+			strncpy_m13(cs->seg->metadata_fps->metadata->time_series_section_2.segment_description, new_desc, METADATA_SEGMENT_DESCRIPTION_BYTES_m13 - 1);
+		}
+		if (WRT_setup_seg_io_m13(ws, i) == FALSE_m13)
+			return(FALSE_m13);
+		// segment-scope counters
+		cs->seg_samples = 0;
+		cs->seg_blocks = 0;
+		cs->contig_blocks = cs->contig_block_bytes = cs->contig_samples = 0;
+		cs->discontinuities = 0;
+		cs->seg_start_samp = cs->sess_samples;
+		cs->seg_first_time = cs->seg_end_time = TIME_NO_ENTRY_m13;
+	}
+	WRT_build_parity_m13(ws, wi->seg_num, FALSE_m13);  // the closed segment's parity (Matt's pattern)
+	++wi->seg_num;
+
+	return(TRUE_m13);
+}
+
+
+// per-segment IO setup: initial UHs for data & indices + a fresh CPS with the channel's directives.
+// Called at session start & at every segment rollover (D3).
+static tern	WRT_setup_seg_io_m13(WRT_SESS_m13 *ws, si4 chan_idx)
+{
+	ui4		max_bs;
+	sf8		lfp_fc;
+	WRT_CHAN_m13	*cs;
+	SEG_m13		*seg;
+	FPS_m13		*gen_fps;
+	CPS_m13		*cps;
+
+	cs = ((WRT_INT_m13 *) ws->chan_state_int)->chans + chan_idx;
+	seg = cs->seg;
+	max_bs = cs->target_block_samples;
+
+	// time series data + CPS
+	gen_fps = seg->ts_data_fps;
+	gen_fps->direcs.flags &= ~FPS_DF_CLOSE_AFTER_OP_m13;
+	gen_fps->uh->live = TRUE_m13;  // being recorded (readers relax validation); cleared when the UH settles
+	FPS_write_m13(gen_fps, FPS_UH_ONLY_m13, 0, 0);
+	cps = CMP_allocate_CPS_m13(gen_fps, CMP_COMPRESSION_MODE_m13, 0, CMP_MAX_COMPRESSED_BYTES_m13(max_bs, 1), 0, max_bs, NULL, NULL);
+	if (cps == NULL)
+		return(FALSE_m13);
+	cps->direcs.flags = (cps->direcs.flags & ~CPS_DF_ALGORITHM_MASK_m13) | cs->options.codec;
+	if (cs->options.fall_through_to_best == TRUE_m13)
+		cps->direcs.flags |= CPS_DF_FALL_THROUGH_TO_BEST_ENCODING_m13;
+	else
+		cps->direcs.flags &= ~CPS_DF_FALL_THROUGH_TO_BEST_ENCODING_m13;
+	cps->direcs.flags |= cs->options.noise_scores;  // CPS_DF_*_SCORE_m13 mask (0 = none)
+	if (cs->lnf_active == TRUE_m13)
+		cps->direcs.flags |= CPS_DF_LINE_NOISE_FILTERED_m13;  // encoder stamps CMP_BF_LINE_NOISE_FILTERED_m13 (2026-08-09 switch semantics)
+	// ⚠️ RE-FIT after changing the algorithm. CMP_allocate_CPS_m13() fits scratch for the directive it
+	// was called with (the default family), & the codec from options is applied ABOVE - so a session
+	// created with a non-default codec got the WRONG family's buffers & died on the first block
+	// (RED2: params.count NULL -> SIGSEGV in CMP_get_counts_m13's memset). WRT_set_codec_m13() already
+	// re-fits when switching live; creation must do the same. Idempotent; encode never re-fits.
+	if (CMP_fit_CPS_scratch_m13(cps, CMP_COMPRESSION_MODE_m13, (ui4) max_bs) == FALSE_m13)
+		return(FALSE_m13);
+	cps->params.sampling_frequency = cs->fs;
+	cps->params.line_frequency = cs->metadata.time_series_section_2.power_line_frequency;  // the line-noise
+		// score estimator gates on line_frequency > 0 (stays RATE_NO_ENTRY -> scores silently absent)
+	if (cs->options.codec == CPS_DF_VDS_ALGORITHM_m13) {
+		if (cs->options.VDS_threshold != (sf8) RATE_NO_ENTRY_m13)
+			cps->params.VDS_threshold = cs->options.VDS_threshold;
+		lfp_fc = cs->options.VDS_LFP_high_fc;
+		if (lfp_fc == (sf8) RATE_NO_ENTRY_m13)
+			lfp_fc = cs->metadata.time_series_section_2.high_frequency_filter_setting;  // D17 rc convention
+		if (lfp_fc == (sf8) RATE_NO_ENTRY_m13)
+			lfp_fc = (sf8) 0.0;  // no filter
+		cps->params.VDS_LFP_high_fc = lfp_fc;
+	}
+
+	// time series indices
+	gen_fps = seg->ts_inds_fps;
+	gen_fps->uh->maximum_entry_size = INDEX_BYTES_m13;
+	gen_fps->direcs.flags &= ~FPS_DF_CLOSE_AFTER_OP_m13;
+	gen_fps->uh->live = TRUE_m13;  // being recorded (readers relax validation); cleared when the UH settles
+	FPS_write_m13(gen_fps, FPS_UH_ONLY_m13, 0, 0);
+
+	return(TRUE_m13);
+}
+
+
+static tern	WRT_stage_m13(WRT_SESS_m13 *ws, si4 chan_idx, si4 *samps, si8 n_samps)
+{
+	si8		free_space, chunk, olen;
+	si4		*od;
+	WRT_CHAN_m13	*cs;
+
+	cs = ((WRT_INT_m13 *) ws->chan_state_int)->chans + chan_idx;
+	od = (si4 *) cs->out_ring.data;
+	olen = cs->out_ring.len;
+	while (n_samps > 0) {
+		free_space = olen - (cs->out_ingest_idx - cs->encoded_idx);
+		chunk = (n_samps < free_space) ? n_samps : free_space;
+		if (chunk > 0) {  // linear window write (chunk <= olen: the magic-ring guarantee)
+			if (cs->quantizing == TRUE_m13) {  // terminal quantizer: costs the D30 zero copy on this path
+				si8	q;
+				si4	*qd = od + (cs->out_ingest_idx % olen), sh = cs->quantum_shift, rb, v;
+
+				if (sh) {  // power-of-two quantum: round-half-away-from-zero WITHOUT leaving integers.
+					rb = (si4) 1 << (sh - 1);  // ">>" floors, so negatives take the mirrored form -
+					for (q = 0; q < chunk; ++q) {	// an unguarded shift would bias every negative
+						v = samps[q];		// sample downward (Matt, 2026-08-14: "make sure
+									// rounding is sign sensitive")
+						qd[q] = (v >= 0) ? ((v + rb) >> sh)  // negate in si8: -v overflows at
+							: (si4) -((-((si8) v) + rb) >> sh);  // INT_MIN (free on 64-bit)
+					}
+				} else {  // non-power-of-two quantum
+					for (q = 0; q < chunk; ++q)
+						qd[q] = CMP_round_si4_m13((sf8) samps[q] * cs->quantum_recip);
+				}
+			} else {
+				memcpy((void *) (od + (cs->out_ingest_idx % olen)), (void *) samps, (size_t) chunk * sizeof(si4));
+			}
+			cs->out_ingest_idx += chunk;
+			cs->avail_out_idx = cs->out_ingest_idx;
+			samps += chunk;
+			n_samps -= chunk;
+			cs->has_data = TRUE_m13;
+		}
+		while ((cs->avail_out_idx - cs->encoded_idx) >= (si8) cs->block_samples)
+			if (WRT_emit_block_m13(ws, chan_idx) == FALSE_m13)
+				return(FALSE_m13);
+	}
+
+	return(TRUE_m13);
+}
+
+
+// Sgmt record (v1.1) into a record-file pair: index entry first (captures the data offset).
+// rate == RATE_VARIABLE (with NO_ENTRY indices) for mixed-rate session-level records; a channel's
+// own records always carry its TRUE rate & sample indices - the point of channel-level Sgmt records.
+static tern	WRT_write_Sgmt_m13(FPS_m13 *rd_fps, FPS_m13 *ri_fps, si8 seg_start, si8 seg_end, si8 start_idx, si8 end_idx, sf8 rate, si4 seg_num, const si1 *desc)
+{
+	// session-AWARE half of Sgmt writing (rates/indices/levels resolved by the callers); the
+	// format-aware half is REC_write_Sgmt_type_m13() - a sibling of its show/read functions in
+	// medrec (Matt's class pattern: add-a-record-type == add its support functions there)
+	REC_Sgmt_v11_m13	Sgmt;
+	REC_WRITE_m13		req;
+
+	memset((void *) &Sgmt, 0, sizeof(Sgmt));
+	Sgmt.end_time = seg_end;
+	if (rate == (sf8) REC_Sgmt_v11_RATE_VARIABLE_m13) {
+		Sgmt.start_idx = Sgmt.end_idx = SAMPLE_NUMBER_NO_ENTRY_m13;
+		Sgmt.rate = REC_Sgmt_v11_RATE_VARIABLE_m13;
+	} else {
+		Sgmt.start_idx = start_idx;
+		Sgmt.end_idx = end_idx;
+		Sgmt.rate = (sf4) rate;
+	}
+	Sgmt.seg_num = seg_num;
+	memset((void *) &req, 0, sizeof(req));
+	req.type_code = REC_Sgmt_TYPE_CODE_m13;
+	req.version_major = 1;
+	req.version_minor = 1;  // MED 1.1 native Sgmt record
+	req.encryption_level = NO_ENCRYPTION_m13;
+	req.start_time = seg_start;
+	req.body = (const void *) &Sgmt;
+	req.text = desc;
+
+	return(REC_write_m13(rd_fps, ri_fps, &req));
+}
+
+
+// SCAFFOLD (env WRT_VISIT_PROF; inert without it - strip with the DHN_ACQ_* scaffolds): per-phase visit
+// cost aggregates, printed to stderr every 4096 visits. Diagnosing the 2026-08-13 ~290 ms visit ewma.
+static si8	wrt_prof_visits = 0, wrt_prof_visit_us = 0, wrt_prof_mutex_us = 0, wrt_prof_chain_us = 0;
+static si8	wrt_prof_emits = 0, wrt_prof_encode_us = 0, wrt_prof_write_us = 0;
+static si4	wrt_prof_on = -1;
+
+// static prototypes (alphabetical order can place callers before callees)
+static tern	WRT_config_chain_m13(WRT_CHAN_m13 *cs);
+static tern	WRT_emit_block_m13(WRT_SESS_m13 *ws, si4 chan_idx);
+static tern	WRT_start_writing_m13(WRT_SESS_m13 *ws);
+
+
+si4	WRT_add_ts_channel_m13(WRT_SESS_m13 *ws, const si1 *chan_name, METADATA_m13 *md_override, WRT_OPTIONS_m13 *opt_override)
+{
+	// D1: metadata override merges FIELD-WISE over the session template (non-empty / non-NO_ENTRY
+	// fields win); an options override REPLACES the channel's options wholesale (options fields have
+	// no NO_ENTRY convention to merge against - copy ws->options & modify for a partial change).
+	// Returns the channel index. Channels cannot be added once writing has started.
+	si4		idx;
+	WRT_INT_m13	*wi;
+	WRT_CHAN_m13	*cs;
+
+	if (ws == NULL) {
+		G_set_error_m13(E_GEN_m13, "NULL write session");
+		return(-1);
+	}
+	if (ws->writing_started == TRUE_m13) {
+		G_set_error_m13(E_GEN_m13, "writing has started: channels can no longer be added");
+		return(-1);
+	}
+	idx = ws->n_chans;
+	// growth arrives ZEROED either way: calloc_m13 on first allocation (recalloc_m13 refuses a NULL
+	// ptr by contract), recalloc_m13 thereafter - the extension is zeroed, so the header is clean &
+	// every new channel slot arrives zeroed. (A plain realloc here left a DIRTY header: macOS's
+	// fresh-page zeroing masked it for days; glibc + valgrind on the Linux leg found it.)
+	if (ws->chan_state_int == NULL)
+		wi = (WRT_INT_m13 *) calloc_m13(sizeof(WRT_INT_m13) + sizeof(WRT_CHAN_m13), (size_t) 1);
+	else
+		wi = (WRT_INT_m13 *) recalloc_m13(ws->chan_state_int,
+			sizeof(WRT_INT_m13) + (size_t) idx * sizeof(WRT_CHAN_m13),
+			sizeof(WRT_INT_m13) + (size_t) (idx + 1) * sizeof(WRT_CHAN_m13), (si8) 1);
+	if (wi == NULL) {
+		G_set_error_m13(E_ALLOC_m13, NULL);
+		return(-1);
+	}
+	ws->chan_state_int = (void *) wi;
+	cs = wi->chans + idx;
+// (channel slot arrives zeroed from recalloc_m13 - no memset needed)
+	cs->last_line_noise_byte = CMP_NS_NO_ENTRY_m13;  // zero is a VALID score (clean) - unset must be 0xFF
+
+	if (chan_name != NULL && *chan_name)
+		strncpy_m13(cs->name, chan_name, NAME_BYTES_m13 - 1);
+	else
+		sprintf_m13(cs->name, "chan_%04d", idx + 1);  // fixed width: lists in proper order on all OSes
+	cs->metadata = ws->metadata;
+	if (md_override != NULL)
+		WRT_apply_metadata_m13(&cs->metadata, md_override);
+	cs->options = (opt_override != NULL) ? *opt_override : ws->options;
+	if (cs->metadata.time_series_section_2.acquisition_channel_number == METADATA_ACQUISITION_CHANNEL_NUMBER_NO_ENTRY_m13)
+		cs->metadata.time_series_section_2.acquisition_channel_number = idx + 1;  // D14: add order
+
+	ws->n_chans = idx + 1;
+
+	return(idx);
+}
+
+
+// D23 per-channel stage configuration in THREE STRICT PHASES - the killer of the ordering-bug class
+// (three instances in one day: chain engagement before stage activation; input rate read after a
+// stage redefined it; input rate never captured at all):
+//   1. CAPTURE   - read every input (merged metadata/options) ONCE; nothing here derives or mutates
+//   2. CONFIGURE - each stage INDEPENDENTLY: reads captures only, writes only its own fields,
+//                  declares its lag. A stage may not read another stage's outputs.
+//   3. ENGAGE    - aggregate: chain_active from stage actives; ring sized from the DECLARED lags
+//                  (the ring needs stage lookback + chunk granularity, NOT the block span - the si4
+//                  staging accumulates blocks downstream of the chain)
+static tern	WRT_config_chain_m13(WRT_CHAN_m13 *cs)
+{
+	si8	lags, ring_elements;
+
+	// ---- PHASE 1: CAPTURE ----
+	cs->in_fs = cs->metadata.time_series_section_2.sampling_frequency;  // caller's INPUT rate
+	cs->fs = cs->in_fs;			// output rate; decimation redefines it below (D19)
+	cs->lnf_line_freq = cs->metadata.time_series_section_2.power_line_frequency;
+	if (cs->in_fs <= (sf8) 0.0) {
+		G_set_error_m13(E_GEN_m13, "channel \"%s\": sampling frequency is required (session template or channel override)", cs->name);
+		return(FALSE_m13);
+	}
+
+	// ---- PHASE 2: CONFIGURE (each stage independent) ----
+
+	// LNF stage (first in chain - D23 order: LNF -> antialias -> decimate). Machinery is PRE-BUILT
+	// whenever power_line_frequency is known - exactly the channels that can ever toggle LNF on
+	// (D24) - so a mid-recording toggle allocates nothing (Matt: "get as much preprocessing done
+	// before acquisition is confirmed on as possible"). The ring stays lazy for si4-direct channels.
+	cs->lnf_active = FALSE_m13;
+	if (cs->options.line_noise_filter == TRUE_m13 && (cs->lnf_line_freq == (sf8) RATE_NO_ENTRY_m13 || cs->lnf_line_freq <= (sf8) 0.0)) {
+		G_set_error_m13(E_GEN_m13, "channel \"%s\": the line noise filter needs power_line_frequency in the metadata", cs->name);
+		return(FALSE_m13);
+	}
+	if (cs->lnf_line_freq != (sf8) RATE_NO_ENTRY_m13 && cs->lnf_line_freq > (sf8) 0.0) {
+		// margin = template context (cycles_per_template defaults to round(line_freq) cycles == ~1 s)
+		cs->lnf_margin = (si8) (cs->in_fs + (sf8) 0.5);
+		cs->lnf_hop = cs->lnf_margin;
+		cs->lnf_first_span = cs->lnf_next_span = cs->lnf_hop;  // D29 stagger overrides at start_writing
+		cs->lnf_y = (sf8 *) malloc((size_t) (3 * cs->lnf_margin + 16) * sizeof(sf8));
+		cs->lnf_fy = (sf8 *) malloc((size_t) (3 * cs->lnf_margin + 16) * sizeof(sf8));
+		cs->lnf_save = (sf8 *) malloc((size_t) cs->lnf_margin * sizeof(sf8));
+		if (cs->lnf_y == NULL || cs->lnf_fy == NULL || cs->lnf_save == NULL) {
+			G_set_error_m13(E_ALLOC_m13, NULL);
+			return(FALSE_m13);
+		}
+		cs->lnf_save_len = 0;
+		cs->lnf_finished_idx = cs->lnf_start_idx = 0;
+		cs->lnf_score_byte = CMP_NS_NO_ENTRY_m13;
+		cs->lnf_active = cs->options.line_noise_filter;  // TRUE => on from the start; else armed for the toggle
+	}
+
+	// terminal quantizer (see WRT_OPTIONS_m13.amplitude_quantum). Reciprocal cached once: the
+	// terminal touches every sample, & m12's equivalent loop multiplied by 1/2^SHIFT_BITS for the
+	// same reason. Rejected quietly to a no-op rather than erroring - a nonsense quantum should not
+	// take a recording down mid-session.
+	cs->quantizing = FALSE_m13;
+	cs->quantum_recip = (sf8) 1.0;
+	cs->quantum_shift = 0;
+	if (cs->options.amplitude_quantum > (sf8) 0.0 && cs->options.amplitude_quantum != (sf8) 1.0) {
+		cs->quantizing = TRUE_m13;
+		cs->quantum_recip = (sf8) 1.0 / cs->options.amplitude_quantum;
+		if (cs->options.amplitude_quantum >= (sf8) 2.0) {  // exact power of two => the shift form
+			sf8	q = cs->options.amplitude_quantum;
+			si4	sh = 0;
+
+			while (q > (sf8) 1.0 && (q - floor(q)) == (sf8) 0.0 && fmod(q, (sf8) 2.0) == (sf8) 0.0) {
+				q /= (sf8) 2.0;
+				++sh;
+			}
+			if (q == (sf8) 1.0)  // reached exactly 1: quantum was 2^sh (64 -> 6, the DHN_Acq case)
+				cs->quantum_shift = sh;
+		}
+	}
+
+	// antialias stage (before the rate change). UNKNOWN == automatic (D8): on when decimating, off
+	// otherwise. Explicit TRUE engages it WITHOUT decimation too (Matt, 2026-08-11: a full-rate
+	// antialias-shaped lowpass is useful in its own right) - the same samples-per-cycle rule applies
+	// at the unchanged output rate (cutoff = fs / 3.5, rolloff starting ~4 samples/cycle).
+	cs->aa_active = FALSE_m13;
+	if (cs->options.decimation_frequency != (sf8) RATE_NO_ENTRY_m13 || cs->options.antialias_filter == TRUE_m13) {  // BUILD whenever decimating (the D24 toggle may enable it later) or explicitly requested
+		cs->aa_filtps = (FILTPS_m13 *) calloc((size_t) 1, sizeof(FILTPS_m13));
+		if (cs->aa_filtps == NULL) {
+			G_set_error_m13(E_ALLOC_m13, NULL);
+			return(FALSE_m13);
+		}
+		cs->aa_filtps->order = 6;  // Butterworth; rolloff starts ~4 samples/cycle (DHN_Acq)
+		cs->aa_filtps->type = FILT_LOWPASS_TYPE_m13;
+		cs->aa_filtps->sampling_frequency = cs->in_fs;
+		cs->aa_filtps->data_length = 4096;  // coefficient generation only (streaming form owns the data path)
+		cs->aa_filtps->cutoffs[0] = ((cs->options.decimation_frequency != (sf8) RATE_NO_ENTRY_m13) ? cs->options.decimation_frequency : cs->in_fs) / (sf8) 3.5;  // SAMPLES_PER_CYCLE
+		FILT_butter_m13(cs->aa_filtps);
+		FILT_generate_initial_conditions_m13(cs->aa_filtps);
+		cs->aa_head_len = (si8) ((cs->in_fs / (sf8) 10.0) + (sf8) 0.5);  // ~100 ms; floor below
+		if (cs->aa_head_len < ((si8) cs->aa_filtps->n_poles * 3) + 2)
+			cs->aa_head_len = ((si8) cs->aa_filtps->n_poles * 3) + 2;
+		if (cs->options.decimation_frequency != (sf8) RATE_NO_ENTRY_m13)
+			cs->aa_active = (cs->options.antialias_filter != FALSE_m13) ? TRUE_m13 : FALSE_m13;  // UNKNOWN == auto-on
+		else
+			cs->aa_active = TRUE_m13;  // explicit TRUE brought us here
+		cs->aa_headed = FALSE_m13;
+		cs->aa_fed_idx = cs->aa_finished_idx = 0;
+		cs->aa_out_len = 0;
+	}
+
+	// decimation stage (terminal - rate changer)
+	cs->decimating = FALSE_m13;
+	if (cs->options.decimation_frequency != (sf8) RATE_NO_ENTRY_m13) {
+		if (cs->options.decimation_frequency > cs->in_fs) {
+			G_set_error_m13(E_GEN_m13, "channel \"%s\": decimation frequency exceeds the input rate", cs->name);
+			return(FALSE_m13);
+		}
+		cs->decimating = TRUE_m13;
+		cs->fs = cs->options.decimation_frequency;  // OUTPUT rate: block sizing, times & the RECORDED fs (D19)
+		cs->metadata.time_series_section_2.sampling_frequency = cs->fs;
+		cs->dec_step = cs->in_fs / cs->fs;
+		cs->next_out_in_idx = (sf8) 0.0;
+		cs->dec_phase_reset = TRUE_m13;  // session start is a discontinuity by definition
+		cs->reset_at_idx = 0;
+	}
+
+	// ---- PHASE 3: ENGAGE ----
+	// blocking (D12: initial may differ from target for phase staggering); OUTPUT-rate samples
+	cs->target_block_samples = cs->options.block_samples;
+	if (cs->target_block_samples == 0)
+		cs->target_block_samples = (ui4) ((cs->options.block_duration * cs->fs) + (sf8) 0.5);
+	if (cs->target_block_samples > (ui4) 16777216) {  // 16M samples: no sane block exceeds this - a
+		// misconfigured duration (e.g. microseconds where the OPTION takes SECONDS; the rc FILE takes
+		// usecs & converts) otherwise silently allocates GB-scale CPS buffers per channel
+		G_set_error_m13(E_GEN_m13, "channel \"%s\": block of %u samples (block_duration is SECONDS in WRT_OPTIONS_m13; the rc file field is usecs)", cs->name, cs->target_block_samples);
+		return(FALSE_m13);
+	}
+	if (cs->target_block_samples == 0) {
+		G_set_error_m13(E_GEN_m13, "channel \"%s\": zero block size (block_duration / block_samples)", cs->name);
+		return(FALSE_m13);
+	}
+	cs->block_samples = (cs->options.initial_block_samples && cs->options.initial_block_samples < cs->target_block_samples) ? cs->options.initial_block_samples : cs->target_block_samples;
+
+	// si4 OUTPUT ring: every channel (D24 symmetry) - the block accumulator; encoder reads linear windows
+	if (WRT_ring_alloc_m13(&cs->out_ring, 2 * ((si8) cs->target_block_samples + 4096), (si8) sizeof(si4)) == FALSE_m13)
+		return(FALSE_m13);
+	cs->out_ingest_idx = cs->encoded_idx = 0;
+	cs->avail_in_idx = cs->avail_out_idx = cs->retain_from = 0;
+
+	// sf8 PROCESSING ring: chained channels only
+	// aa_active belongs here: full-rate AA (explicit TRUE, no decimation, no LNF) is a chain stage
+	// with no other stage to carry it. Omitting it left chain_active FALSE, so the si4-direct path
+	// ran & the requested filter never touched the data - silently. The toggle-off site below
+	// already used the right predicate (decimating == FALSE && aa_active == FALSE); this matches it.
+	cs->chain_active = (cs->decimating == TRUE_m13 || cs->lnf_active == TRUE_m13 || cs->aa_active == TRUE_m13) ? TRUE_m13 : FALSE_m13;
+	if (cs->chain_active == TRUE_m13) {
+		lags = 0;
+		if (cs->lnf_margin)
+			lags += cs->lnf_hop + cs->lnf_margin;  // steady-state lookback before a span finishes
+		if (cs->aa_filtps != NULL)
+			lags += 16384;  // generous bound on filtfilt's L (measured at head time; the stall guard would catch a pathological case)
+		ring_elements = 2 * (lags + 4096);  // lags + chunk granularity headroom; page-rounded by alloc
+		if (WRT_ring_alloc_m13(&cs->ring, ring_elements, (si8) sizeof(sf8)) == FALSE_m13)
+			return(FALSE_m13);
+		cs->ingest_idx = 0;
+	}
+
+	return(TRUE_m13);
+}
+
+
+WRT_SESS_m13	*WRT_create_session_m13(const si1 *sess_path, METADATA_m13 *md, WRT_OPTIONS_m13 *opt)
+{
+	// Steps 0-3 of the MED_setup sequence (D20 order: time/location FIRST). Deferred to first write /
+	// add_channel: G_alloc_session_m13() (channel count known then - D14), per-channel CPS & buffers,
+	// blocking calculation, record-file UH writes.
+	si1			*ext, dir[PATH_BYTES_m13], name[PATH_BYTES_m13];
+	si4			i;
+	si8			rto_start_time;
+	tern			have_tz;
+	FPS_m13			*proto;
+	TIMEZONE_INFO_m13	tz = {0};
+	WRT_SESS_m13	*ws;
+	WRT_OPTIONS_m13	*o;
+
+	// handle + defaults for NULL args
+	ws = (WRT_SESS_m13 *) calloc((size_t) 1, sizeof(WRT_SESS_m13));
+	if (ws == NULL) {
+		G_set_error_m13(E_ALLOC_m13, NULL);
+		return(NULL);
+	}
+	if (md != NULL)
+		ws->metadata = *md;
+	else
+		WRT_metadata_defaults_m13(&ws->metadata);
+	if (opt != NULL)
+		ws->options = *opt;
+	else
+		WRT_options_defaults_m13(&ws->options);
+	o = &ws->options;
+
+	// STEP 0a: prototype FPS shell + session UID FIRST. G_proc_globs_new_m13() dedups by the session
+	// UID of a supplied level header - a writer has no files yet, so the proto IS the level. (Under
+	// crypto schema 1 the session UID is also the KDF salt, so it must precede password data anyway.)
+	proto = FPS_init_m13(NULL, "prototype.tmet", "w", FPS_PROTOTYPE_BYTES_m13, NULL);  // path never opened: prototype/inheritance only
+	if (proto == NULL) {
+		free(ws);
+		return(NULL);
+	}
+	FPS_set_open_flags_m13(proto, "w");
+	proto->direcs.flags &= ~FPS_DF_CLOSE_AFTER_OP_m13;
+	G_init_universal_header_m13(proto, TS_METADATA_TYPE_CODE_m13, TRUE_m13, FALSE_m13);
+	G_generate_UID_m13(&proto->uh->session_UID);
+
+	// STEP 0b (D7/D20a): claim this write session's proc globals. If the current thread's pg is
+	// already bound to a live session, a second same-thread write session must not share it - the
+	// "new" usage of G_proc_globs_new_m13().
+	ws->pg = G_proc_globs_m13(NULL);
+	if (ws->pg->current_session.UID != UID_NO_ENTRY_m13 || *ws->pg->current_session.path) {
+		ws->pg = G_proc_globs_new_m13(proto);
+		if (ws->pg == NULL) {
+			FPS_free_m13(proto);
+			free(ws);
+			return(NULL);
+		}
+	}
+
+	// STEP 1 (D20b): time/location context BEFORE anything touches times. Timezone inputs come from the
+	// template's section 3; prompt is FALSE always (interactive prompting would hang a binding/mex), so
+	// a genuinely ambiguous timezone becomes a clean error naming the fields that would disambiguate.
+	// The proto is passed as the LEVEL so the constants land in THIS session's pg (writer-side reshape,
+	// 2026-08-10: G_set_time_constants_m13 & G_generate_recording_time_offset_m13 take a level header;
+	// G_proc_globs_new_m13 linked the proto to the claimed pg, so routing is deterministic).
+	have_tz = FALSE_m13;
+	if (*ws->metadata.section_3.recording_country || *ws->metadata.section_3.recording_territory)
+		have_tz = TRUE_m13;
+	else if (*ws->metadata.section_3.standard_timezone_acronym)
+		if (strcmp_m13(ws->metadata.section_3.standard_timezone_acronym, GLOBALS_STANDARD_TIMEZONE_ACRONYM_DEFAULT_m13) != 0)
+			have_tz = TRUE_m13;  // "oUTC" is the library's NO-TIMEZONE-CLAIMED placeholder (seeded into templates from an unset pg), not a resolution request
+	if (have_tz == TRUE_m13) {
+		strncpy_m13(tz.country, ws->metadata.section_3.recording_country, METADATA_RECORDING_LOCATION_BYTES_m13 - 1);
+		strncpy_m13(tz.territory, ws->metadata.section_3.recording_territory, METADATA_RECORDING_LOCATION_BYTES_m13 - 1);
+		strncpy_m13(tz.standard_timezone_acronym, ws->metadata.section_3.standard_timezone_acronym, TIMEZONE_ACRONYM_BYTES_m13 - 1);
+		if (G_set_time_constants_m13(proto, &tz, 0, FALSE_m13) == FALSE_m13) {  // constants only; RTO below (after D22 string parse)
+			G_set_error_m13(E_GEN_m13, "could not resolve the recording timezone: add or refine Recording Territory / Standard Timezone Acronym in the metadata (interactive disambiguation is not available through this interface)");
+			FPS_free_m13(proto);
+			free(ws);
+			return(NULL);
+		}
+	}
+
+	// D22: human-readable start time - parsed AFTER timezone resolution (it is LOCAL time at the
+	// recording site); used only when session_start_time was not set explicitly
+	if (*o->session_start_string && o->session_start_time == CURRENT_TIME_m13) {
+		o->session_start_time = WRT_parse_time_string_m13(proto, o->session_start_string);
+		if (o->session_start_time == TIME_NO_ENTRY_m13) {
+			FPS_free_m13(proto);
+			free(ws);
+			return(NULL);
+		}
+	}
+
+	// RTO (D2): generated from the session start in UUTC mode with the privacy offset on
+	rto_start_time = 0;
+	if (o->time_mode == WRT_TIME_UUTC_m13 && o->apply_recording_time_offset == TRUE_m13)
+		rto_start_time = o->session_start_time;  // CURRENT_TIME_m13 sentinel passes through
+	if (rto_start_time)
+		G_generate_recording_time_offset_m13(proto, rto_start_time);
+
+	// STEP 2: exists behavior & session directory (".medd" appended if absent)
+	ext = (si1 *) strrchr(sess_path, '.');
+	if (ext != NULL && strcmp_m13(ext + 1, SESS_TYPE_STR_m13) == 0)
+		sprintf_m13(ws->path, "%s", sess_path);
+	else
+		sprintf_m13(ws->path, "%s.%s", sess_path, SESS_TYPE_STR_m13);
+	if (G_exists_m13(ws->path) != DOES_NOT_EXIST_m13) {
+		switch (o->exists_behavior) {
+			case WRT_EXISTS_OVERWRITE_m13:
+				if (rm_m13("-R", ws->path) == FALSE_m13) {
+					FPS_free_m13(proto);
+					free(ws);
+					return(NULL);
+				}
+				break;
+			case WRT_EXISTS_RENAME_m13:  // append a numeric suffix to the NEW session
+				sprintf_m13(name, "%s", ws->path);
+				ext = strrchr(name, '.');  // guaranteed present (appended above)
+				*ext = 0;
+				for (i = 1; i < 10000; ++i) {
+					sprintf_m13(dir, "%s_%d.%s", name, i, SESS_TYPE_STR_m13);
+					if (G_exists_m13(dir) == DOES_NOT_EXIST_m13)
+						break;
+				}
+				sprintf_m13(ws->path, "%s", dir);
+				break;
+			case WRT_EXISTS_FAIL_m13:
+			default:
+				G_set_error_m13(E_GEN_m13, "session \"%s\" exists (options.exists_behavior: FAIL is the default; OVERWRITE & RENAME are available)", ws->path);
+				FPS_free_m13(proto);
+				free(ws);
+				return(NULL);
+		}
+	}
+	if (mkdir_m13(ws->path) == FALSE_m13) {
+		FPS_free_m13(proto);
+		free(ws);
+		return(NULL);
+	}
+
+	// STEP 3: metadata init (AFTER step 1: seeds section 3 from the resolved constants - D20c)
+	G_init_metadata_m13(proto, TRUE_m13);  // (init_for_update TRUE: running aggregates zeroed for writing)
+	WRT_apply_metadata_m13(proto->metadata, &ws->metadata);  // caller's explicit values win (D19)
+
+	// bind the pg NOW (UID-stamp-at-creation, the two-session-fix principle): without this, a second
+	// same-thread create before the first write would pass the step-0 test, reuse this pg & silently
+	// overwrite this session's time constants
+	ws->pg->current_session.UID = proto->uh->session_UID;
+	strncpy_m13(ws->pg->current_session.path, ws->path, PATH_BYTES_m13 - 1);
+
+	// passwords & encryption stamps (D21: levels are UH fields; negative == encrypt on write).
+	// The write machinery requires PROCESSED password data even for unencrypted sessions:
+	// with passwords -> G_generate_password_data_m13(); without -> G_process_password_data_m13(fps,
+	// NULL), which marks the pg's password data processed regardless of access
+	if (*o->level_1_password || *o->level_2_password || *o->level_3_password) {
+		if (G_generate_password_data_m13(proto, *o->level_1_password ? o->level_1_password : NULL,
+				*o->level_2_password ? o->level_2_password : NULL,
+				*o->level_3_password ? o->level_3_password : NULL,
+				*ws->metadata.section_1.level_1_password_hint ? ws->metadata.section_1.level_1_password_hint : NULL,
+				*ws->metadata.section_1.level_2_password_hint ? ws->metadata.section_1.level_2_password_hint : NULL,
+				0, TRUE_m13) == FALSE_m13) {
+			FPS_free_m13(proto);
+			free(ws);
+			return(NULL);
+		}
+	} else {
+		if (o->section_2_encryption_level > 0 || o->section_3_encryption_level > 0 || o->data_encryption_level > 0 || o->record_encryption_level > 0) {
+			G_set_error_m13(E_GEN_m13, "an encryption level is set but no password was provided");
+			FPS_free_m13(proto);
+			free(ws);
+			return(NULL);
+		}
+		G_process_password_data_m13(proto, NULL);  // unencrypted session: mark processed
+	}
+	proto->uh->metadata_section_2_encryption = -o->section_2_encryption_level;  // negative == encrypt on write (metadata sections only)
+	proto->uh->metadata_section_3_encryption = -o->section_3_encryption_level;
+	proto->uh->time_series_data_encryption = o->data_encryption_level;  // POSITIVE: G_encrypt_time_series_m13() encrypts blocks at write when level > 0 (negative is a read-side decrypted-transient marker & invalid here)
+
+	ws->proto_fps = proto;
+	pthread_mutex_init_m13(&ws->start_mutex, NULL);
+	ws->sess = NULL;  // G_alloc_session_m13() runs at first write, when the channel count is known (D14)
+	ws->n_chans = 0;
+	ws->writing_started = FALSE_m13;
+
+	// REMAINING (lands with WRT_add_ts_channel_m13 / first write):
+	//   - G_alloc_session_m13(proto, ws->path, n_chans, 0, 1, names, NULL, o->session_records,
+	//     o->seg_session_records, o->channel_records, o->segment_records) + record-file UH writes
+	//   - blocking: block_samples = o->block_samples ? o->block_samples : round(block_duration * fs)
+	//   - per-channel CPS (codec directive + FIND_DERIVATIVE_LEVEL, encryption, noise scores, VDS
+	//     params), staging buffers, section-2 aggregates, ts indices, LNF state (deposit + block flag)
+
+	return(ws);
+}
+
+
+// encode & write the staged samples as one block + its index entry; update the section-2 aggregates
+// (the DHN_Acq block_processor recipe, via its NAT2MED m13 port - cross-verified line for line)
+static tern	WRT_emit_block_m13(WRT_SESS_m13 *ws, si4 chan_idx)
+{
+	ui4				n, block_keysamps;
+	si8				block_start;
+	sf8				block_duration;
+	WRT_CHAN_m13			*cs;
+	SEG_m13				*seg;
+	FPS_m13				*gen_fps;
+	CPS_m13				*cps;
+	CMP_FIXED_BH_m13		*bh;
+	CMP_RED_MODEL_FIXED_HDR_m13	*RED_model;
+	CMP_PRED_MODEL_FIXED_HDR_m13	*PRED_model;
+	CMP_VDS_MODEL_FIXED_HDR_m13	*VDS_model;
+	TS_METADATA_SECTION_2_m13	*tsm2;
+	TS_IDX_m13			*tsi;
+
+	si8	pending;
+
+	cs = WRT_INT_m13(ws)->chans + chan_idx;
+	pending = cs->avail_out_idx - cs->encoded_idx;
+	if (pending <= 0)
+		return(TRUE_m13);
+	n = (pending < (si8) cs->block_samples) ? (ui4) pending : cs->block_samples;
+	seg = cs->seg;
+
+	// compress: the block is a LINEAR WINDOW of the si4 output ring (n <= block <= len/2 - D24).
+	// pending samples ALWAYS belong to the current continuity (boundaries fully drain before the
+	// anchor resets), so the block's first sample sits at encoded_idx - anchor_out_idx, anchor-relative
+	block_start = cs->anchor_time + (si8) ((((sf8) (cs->encoded_idx - cs->anchor_out_idx) * (sf8) 1e6) / cs->fs) + (sf8) 0.5);
+	cps = seg->ts_data_fps->params.cps;
+	if (cs->lnf_active == TRUE_m13)
+		cps->params.noise_scores[0] = cs->lnf_score_byte;  // deposited TRUE score (consumed & reset by the encoder)
+	cps->input_buffer = ((si4 *) cs->out_ring.data) + (cs->encoded_idx % cs->out_ring.len);
+	if (cs->pending_discont == TRUE_m13) {
+		cps->params.discontinuity = TRUE_m13;
+		++cs->discontinuities;
+	}
+	{	// SCAFFOLD timing wrap (WRT_VISIT_PROF)
+		si8	et0 = (wrt_prof_on > 0) ? G_current_uutc_m13() : 0;
+		if (CMP_encode_m13(seg->ts_data_fps, block_start, cs->metadata.time_series_section_2.acquisition_channel_number, n) == FALSE_m13)
+			return(FALSE_m13);
+		if (wrt_prof_on > 0) {
+			__sync_fetch_and_add(&wrt_prof_encode_us, G_current_uutc_m13() - et0);
+			__sync_fetch_and_add(&wrt_prof_emits, 1);
+		}
+	}
+
+	// telemetry tap: the block's line-noise score byte (the staging array is memset after packing,
+	// so read the PACKED parameter of the block just encoded - the map is still addressed to it)
+	if (CMP_BLOCK_PARAM_PRESENT_m13(cps, CMP_PF_NOISE_SCORES_IDX_m13))
+		cs->last_line_noise_byte = (ui1) (CMP_BLOCK_PARAM_m13(cps, CMP_PF_NOISE_SCORES_IDX_m13, ui4) & (ui4) 0xFF);
+
+	// time series index (file_offset captured BEFORE the data append; negated on discontinuity)
+	tsi = seg->ts_inds_fps->ts_inds;
+	tsi->file_offset = seg->ts_data_fps->params.fp->len;
+	tsi->start_time = block_start;
+	tsi->start_samp_num = cs->seg_samples;
+	cs->seg_samples += (si8) n;
+	if (cs->pending_discont == TRUE_m13) {
+		cs->contig_blocks = cs->contig_block_bytes = cs->contig_samples = 0;
+		tsi->file_offset = -tsi->file_offset;
+		cs->pending_discont = FALSE_m13;
+	}
+	++cs->contig_blocks;
+	cs->contig_samples += (si8) n;
+
+	// update section-2 aggregates
+	tsm2 = &seg->metadata_fps->metadata->time_series_section_2;
+	tsm2->number_of_blocks = ++cs->seg_blocks;
+	bh = cps->block_header;
+	cs->contig_block_bytes += (si8) bh->total_block_bytes;
+	if ((si8) bh->total_block_bytes > tsm2->maximum_block_bytes)
+		seg->ts_data_fps->uh->maximum_entry_size = tsm2->maximum_block_bytes = (si8) bh->total_block_bytes;
+	tsm2->number_of_samples += (si8) bh->number_of_samples;
+	if (bh->number_of_samples > tsm2->maximum_block_samples)
+		tsm2->maximum_block_samples = bh->number_of_samples;
+	block_keysamps = 0;
+	if (bh->block_flags & (CMP_BF_RED1_ENCODING_m13 | CMP_BF_RED2_ENCODING_m13)) {
+		RED_model = (CMP_RED_MODEL_FIXED_HDR_m13 *) cps->params.model_region;
+		block_keysamps = RED_model->n_keysample_bytes;
+	} else if (bh->block_flags & (CMP_BF_PRED1_ENCODING_m13 | CMP_BF_PRED2_ENCODING_m13)) {
+		PRED_model = (CMP_PRED_MODEL_FIXED_HDR_m13 *) cps->params.model_region;
+		block_keysamps = PRED_model->n_keysample_bytes;
+	} else if (bh->block_flags & CMP_BF_VDS_ENCODING_m13) {
+		VDS_model = (CMP_VDS_MODEL_FIXED_HDR_m13 *) cps->params.model_region;
+		if (VDS_model->flags & (CMP_VDS_FLAGS_AMPLITUDE_RED1_m13 | CMP_VDS_FLAGS_AMPLITUDE_RED2_m13)) {
+			RED_model = (CMP_RED_MODEL_FIXED_HDR_m13 *) (cps->params.model_region + CMP_VDS_MODEL_FIXED_HDR_BYTES_m13);
+			block_keysamps = RED_model->n_keysample_bytes;
+		} else if (VDS_model->flags & (CMP_VDS_FLAGS_AMPLITUDE_PRED1_m13 | CMP_VDS_FLAGS_AMPLITUDE_PRED2_m13)) {
+			PRED_model = (CMP_PRED_MODEL_FIXED_HDR_m13 *) (cps->params.model_region + CMP_VDS_MODEL_FIXED_HDR_BYTES_m13);
+			block_keysamps = PRED_model->n_keysample_bytes;
+		}
+		if (block_keysamps > tsm2->maximum_block_keysample_bytes)
+			tsm2->maximum_block_keysample_bytes = block_keysamps;
+		block_keysamps = 0;
+		if (VDS_model->flags & (CMP_VDS_FLAGS_TIME_RED1_m13 | CMP_VDS_FLAGS_TIME_RED2_m13)) {
+			RED_model = (CMP_RED_MODEL_FIXED_HDR_m13 *) (cps->params.model_region + CMP_VDS_MODEL_FIXED_HDR_BYTES_m13 + VDS_model->amplitude_block_total_bytes);
+			block_keysamps = RED_model->n_keysample_bytes;
+		} else if (VDS_model->flags & (CMP_VDS_FLAGS_TIME_PRED1_m13 | CMP_VDS_FLAGS_TIME_PRED2_m13)) {
+			PRED_model = (CMP_PRED_MODEL_FIXED_HDR_m13 *) (cps->params.model_region + CMP_VDS_MODEL_FIXED_HDR_BYTES_m13 + VDS_model->amplitude_block_total_bytes);
+			block_keysamps = PRED_model->n_keysample_bytes;
+		}
+	}
+	if (block_keysamps > tsm2->maximum_block_keysample_bytes)
+		tsm2->maximum_block_keysample_bytes = block_keysamps;
+	block_duration = ((sf8) bh->number_of_samples * (sf8) 1e6) / tsm2->sampling_frequency;
+	if (block_duration > tsm2->maximum_block_duration)
+		tsm2->maximum_block_duration = block_duration;
+	tsm2->number_of_discontinuities = cs->discontinuities;
+	if (cs->contig_blocks > tsm2->maximum_contiguous_blocks)
+		tsm2->maximum_contiguous_blocks = cs->contig_blocks;
+	if (cs->contig_block_bytes > tsm2->maximum_contiguous_block_bytes)
+		tsm2->maximum_contiguous_block_bytes = cs->contig_block_bytes;
+	if (cs->contig_samples > tsm2->maximum_contiguous_samples)
+		tsm2->maximum_contiguous_samples = cs->contig_samples;
+
+	// write (data block, then its index entry)
+	{	// SCAFFOLD timing wrap (WRT_VISIT_PROF)
+		si8	wt0 = (wrt_prof_on > 0) ? G_current_uutc_m13() : 0;
+		gen_fps = seg->ts_data_fps;
+		if (FPS_write_m13(gen_fps, FPS_APPEND_m13, (si8) bh->total_block_bytes, 1) < 0)
+			return(FALSE_m13);
+		gen_fps = seg->ts_inds_fps;
+		if (FPS_write_m13(gen_fps, FPS_APPEND_m13, INDEX_BYTES_m13, 1) < 0)
+			return(FALSE_m13);
+		if (wrt_prof_on > 0)
+			__sync_fetch_and_add(&wrt_prof_write_us, G_current_uutc_m13() - wt0);
+	}
+
+	cs->encoded_idx += (si8) n;
+	cs->sess_samples += (si8) n;
+	if (cs->seg_first_time == TIME_NO_ENTRY_m13)
+		cs->seg_first_time = block_start;
+	cs->seg_end_time = block_start + (si8) ((((sf8) n * (sf8) 1e6) / cs->fs) + (sf8) 0.5) - 1;
+	{
+		WRT_INT_m13	*wi = WRT_INT_m13(ws);
+		if (wi->sess_first_otc == TIME_NO_ENTRY_m13 || block_start < wi->sess_first_otc)
+			wi->sess_first_otc = block_start;
+	}
+	cs->block_samples = cs->target_block_samples;  // initial (staggered) size applies to the first block only (D12)
+
+	return(TRUE_m13);
+}
+
+
+tern	WRT_samples_m13(WRT_SESS_m13 *ws, si4 chan_idx, si4 *samps, si8 n_samps, si8 start_time)
+{
+	// Any length: the library blocks & buffers. start_time semantics (D2/D9): TIME_NO_ENTRY_m13 ==
+	// continuous flow (time derives from the sample count); otherwise the caller's wall-time estimate
+	// for samps[0] - within tolerance the derived time wins (jitter absorbed); beyond tolerance,
+	// EXPLICIT mode errors & IMPLICIT mode auto-marks a discontinuity. UUTC-mode times are true uutc
+	// (the library subtracts the RTO); OUTC-mode times are pure offsets & pass through.
+	WRT_INT_m13	*wi;
+	WRT_CHAN_m13	*cs;
+
+	if (ws == NULL || samps == NULL || n_samps < 1 || chan_idx < 0 || chan_idx >= ws->n_chans) {
+		G_set_error_m13(E_GEN_m13, "bad arguments");
+		return(FALSE_m13);
+	}
+	if (ws->writing_started == FALSE_m13) {  // first-write latch (per-channel writer threads may race this)
+		pthread_mutex_lock_m13(&ws->start_mutex);
+		if (ws->writing_started == FALSE_m13) {
+			if (WRT_start_writing_m13(ws) == FALSE_m13) {
+				pthread_mutex_unlock_m13(&ws->start_mutex);
+				return(FALSE_m13);
+			}
+		}
+		pthread_mutex_unlock_m13(&ws->start_mutex);
+	}
+	wi = WRT_INT_m13(ws);
+	if (wi->pool_active == TRUE_m13) {
+		G_set_error_m13(E_GEN_m13, "pool mode (encode_workers > 0) ingests through WRT_packets_m13 only");
+		return(FALSE_m13);
+	}
+	cs = wi->chans + chan_idx;
+
+	// timing (factored: WRT_packets_m13 shares it)
+	if (WRT_apply_time_m13(ws, chan_idx, start_time) == FALSE_m13)
+		return(FALSE_m13);
+
+	// D23 chain path: ingest into the sf8 ring in free-space chunks, draining stages between chunks
+	// (the ring needn't fit a whole call). Phase reset arms at the call boundary: continuity restarts
+	// at the first sample ingested by THIS call. Ingest & drain are the two halves of the distributor
+	// seam: here one thread alternates them; in distributor mode they run on different threads.
+	if (cs->chain_active == TRUE_m13) {
+		si8	free_space, chunk, i;
+
+		if (cs->dec_phase_reset == TRUE_m13)
+			cs->reset_at_idx = cs->ingest_idx;
+		while (n_samps > 0) {
+			free_space = cs->ring.len - (cs->ingest_idx - WRT_chain_retain_m13(cs));
+			chunk = (n_samps < free_space) ? n_samps : free_space;
+			if (chunk == 0) {
+				G_set_error_m13(E_GEN_m13, "channel \"%s\": ring stalled (ring too small for the stage lags)", cs->name);
+				return(FALSE_m13);
+			}
+			for (i = 0; i < chunk; ++i)
+				((sf8 *) cs->ring.data)[(cs->ingest_idx + i) % cs->ring.len] = (sf8) samps[i];
+			cs->ingest_idx += chunk;
+			samps += chunk;
+			n_samps -= chunk;
+			if (WRT_chain_service_m13(ws, chan_idx, (si8) -1) == FALSE_m13)
+				return(FALSE_m13);
+		}
+		if (cs->has_data == FALSE_m13)
+			return(TRUE_m13);  // nothing crossed the chain yet; carry holds the phase
+		cs->end_time = WRT_next_time_m13(cs) - 1;
+		if (ws->options.segmenting_mode == WRT_SEG_AUTO_m13 && ws->options.auto_segment_hours > (sf8) 0.0)
+			if (cs->seg_first_time != TIME_NO_ENTRY_m13 && (cs->seg_end_time - cs->seg_first_time) >= (si8) (ws->options.auto_segment_hours * (sf8) 3600e6))
+				if (WRT_roll_segment_m13(ws, NULL) == FALSE_m13)
+					return(FALSE_m13);
+		return(TRUE_m13);
+	}
+
+	// si4 DIRECT path (Matt: "a real path for some") - unfiltered samples straight to staging
+	if (WRT_stage_m13(ws, chan_idx, samps, n_samps) == FALSE_m13)
+		return(FALSE_m13);
+	cs->end_time = WRT_next_time_m13(cs) - 1;
+
+	// D3 AUTO segmenting: duration rollover, checked at block granularity. Touches EVERY channel
+	// (control-flow: single-writer contract; threaded channel writers need external coordination)
+	if (ws->options.segmenting_mode == WRT_SEG_AUTO_m13 && ws->options.auto_segment_hours > (sf8) 0.0)
+		if (cs->seg_first_time != TIME_NO_ENTRY_m13 && (cs->seg_end_time - cs->seg_first_time) >= (si8) (ws->options.auto_segment_hours * (sf8) 3600e6))
+			if (WRT_roll_segment_m13(ws, NULL) == FALSE_m13)
+				return(FALSE_m13);
+
+	return(TRUE_m13);
+}
+
+
+
+// first-write machinery: G_alloc_session_m13() runs HERE, when the channel count is known (D14)
+static tern	WRT_start_writing_m13(WRT_SESS_m13 *ws)
+{
+	si1			**names, **vid_names;
+	si4			i;
+	WRT_INT_m13		*wi;
+	WRT_CHAN_m13		*cs;
+	SEG_m13			*seg;
+	FPS_m13			*gen_fps;
+	WRT_OPTIONS_m13	*o;
+
+	wi = WRT_INT_m13(ws);
+	pthread_mutex_init_m13(&wi->control_mutex, NULL);  // D35: before any control op can be issued; struct
+								   // layout is final here (the setup recallocs are done)
+	o = &ws->options;
+	if (ws->n_chans < 1) {
+		G_set_error_m13(E_GEN_m13, "no channels: call WRT_add_ts_channel_m13() before writing");
+		return(FALSE_m13);
+	}
+
+	// v1 surface limits (each lands in a later pass; refusing beats silently ignoring)
+	if (ws->n_vid_chans > 0 && o->segmenting_mode != WRT_SEG_NONE_m13) {
+		G_set_error_m13(E_GEN_m13, "video channels require segmenting NONE for now (multi-segment video is coming)");
+		return(FALSE_m13);
+	}
+	if (o->seg_session_records == TRUE_m13 || o->segment_records == TRUE_m13) {
+		G_set_error_m13(E_GEN_m13, "segmented-session & segment record files are not yet implemented (set FALSE; session & channel levels are available)");
+		return(FALSE_m13);
+	}
+	for (i = 0; i < ws->n_chans; ++i) {
+		if (WRT_config_chain_m13(wi->chans + i) == FALSE_m13)
+			return(FALSE_m13);
+	}
+
+	// session start: resolve the CURRENT_TIME sentinel & convert to oUTC
+	wi->outc_mode = (o->time_mode == WRT_TIME_OUTC_m13) ? TRUE_m13 : FALSE_m13;
+	wi->seg_num = 1;
+	wi->sess_first_otc = TIME_NO_ENTRY_m13;
+	wi->rto = 0;
+	if (wi->outc_mode == TRUE_m13) {
+		wi->session_start_otc = (o->session_start_time == CURRENT_TIME_m13) ? 0 : o->session_start_time;  // caller times ARE offsets
+	} else {
+		wi->rto = ws->pg->time_constants.recording_time_offset;  // 0 when no RTO was generated
+		wi->session_start_otc = ((o->session_start_time == CURRENT_TIME_m13) ? G_current_uutc_m13() : o->session_start_time) - wi->rto;
+	}
+
+	// allocate the session hierarchy from the prototype
+	names = (si1 **) calloc_2D_m13((size_t) ws->n_chans, (size_t) NAME_BYTES_m13, sizeof(si1));
+	if (names == NULL)
+		return(FALSE_m13);
+	for (i = 0; i < ws->n_chans; ++i)
+		strncpy_m13(names[i], wi->chans[i].name, NAME_BYTES_m13 - 1);
+	vid_names = NULL;
+	if (ws->n_vid_chans > 0) {
+		vid_names = (si1 **) calloc_2D_m13((size_t) ws->n_vid_chans, (size_t) NAME_BYTES_m13, sizeof(si1));
+		if (vid_names == NULL) {
+			free_m13((void *) names);
+			return(FALSE_m13);
+		}
+		for (i = 0; i < ws->n_vid_chans; ++i)
+			strncpy_m13(vid_names[i], wi->vids[i].name, NAME_BYTES_m13 - 1);
+	}
+	ws->sess = G_alloc_session_m13(ws->proto_fps, ws->path, ws->n_chans, ws->n_vid_chans, 1, names, vid_names, o->session_records, FALSE_m13, o->channel_records, FALSE_m13);
+	free_m13((void *) names);
+	if (vid_names != NULL)
+		free_m13((void *) vid_names);
+	if (ws->sess == NULL)
+		return(FALSE_m13);
+	FPS_free_m13(ws->proto_fps);  // inheritance complete (NAT2MED pattern); pg keeps refs via the hierarchy
+	ws->proto_fps = NULL;
+
+	// session record files: initial universal headers
+	if (o->session_records == TRUE_m13) {
+		gen_fps = ws->sess->rec_data_fps;
+		gen_fps->uh->segment_number = UH_SESSION_LEVEL_CODE_m13;
+		gen_fps->direcs.flags &= ~FPS_DF_CLOSE_AFTER_OP_m13;
+		gen_fps->uh->live = TRUE_m13;  // being recorded; cleared at settle
+		FPS_write_m13(gen_fps, FPS_UH_ONLY_m13, 0, 0);
+		gen_fps = ws->sess->rec_inds_fps;
+		gen_fps->uh->segment_number = UH_SESSION_LEVEL_CODE_m13;
+		gen_fps->uh->maximum_entry_size = INDEX_BYTES_m13;
+		gen_fps->direcs.flags &= ~FPS_DF_CLOSE_AFTER_OP_m13;
+		gen_fps->uh->live = TRUE_m13;  // being recorded; cleared at settle
+		FPS_write_m13(gen_fps, FPS_UH_ONLY_m13, 0, 0);
+	}
+
+	// channel record files: initial universal headers (channel-level codes)
+	if (o->channel_records == TRUE_m13) {
+		for (i = 0; i < ws->n_chans; ++i) {
+			gen_fps = ws->sess->ts_chans[i]->rec_data_fps;
+			gen_fps->uh->segment_number = UH_CHANNEL_LEVEL_CODE_m13;
+			gen_fps->direcs.flags &= ~FPS_DF_CLOSE_AFTER_OP_m13;
+			gen_fps->uh->live = TRUE_m13;  // being recorded; cleared at settle
+			FPS_write_m13(gen_fps, FPS_UH_ONLY_m13, 0, 0);
+			gen_fps = ws->sess->ts_chans[i]->rec_inds_fps;
+			gen_fps->uh->segment_number = UH_CHANNEL_LEVEL_CODE_m13;
+			gen_fps->uh->maximum_entry_size = INDEX_BYTES_m13;
+			gen_fps->direcs.flags &= ~FPS_DF_CLOSE_AFTER_OP_m13;
+			gen_fps->uh->live = TRUE_m13;  // being recorded; cleared at settle
+			FPS_write_m13(gen_fps, FPS_UH_ONLY_m13, 0, 0);
+		}
+	}
+
+	// video channels (D25): current segment shortcut + initial vidx universal header
+	for (i = 0; i < ws->n_vid_chans; ++i) {
+		wi->vids[i].seg = ws->sess->vid_chans[i]->segs[0];
+		gen_fps = wi->vids[i].seg->vid_inds_fps;
+		gen_fps->uh->maximum_entry_size = INDEX_BYTES_m13;
+		gen_fps->direcs.flags &= ~FPS_DF_CLOSE_AFTER_OP_m13;
+		gen_fps->uh->live = TRUE_m13;  // being recorded; cleared at settle
+		FPS_write_m13(gen_fps, FPS_UH_ONLY_m13, 0, 0);
+		wi->vids[i].next_start_otc = wi->session_start_otc;
+	}
+
+	// per-channel segment files: apply channel metadata, initial UHs, CPS, staging
+	for (i = 0; i < ws->n_chans; ++i) {
+		cs = wi->chans + i;
+		seg = ws->sess->ts_chans[i]->segs[0];
+
+		// channel metadata over the inherited session defaults (D1 merge already ran at add_channel)
+		WRT_apply_metadata_m13(seg->metadata_fps->metadata, &cs->metadata);
+
+
+		cs->seg = ws->sess->ts_chans[i]->segs[0];  // (also set below with the other segment state; needed first here)
+		if (WRT_setup_seg_io_m13(ws, i) == FALSE_m13)  // data/inds UHs + CPS (shared with segment rollover - D3)
+			return(FALSE_m13);
+
+		// segment state (D3): current segment = the allocated slot; counters segment-scoped
+		cs->seg = ws->sess->ts_chans[i]->segs[0];
+		cs->sess_samples = 0;
+		cs->seg_start_samp = 0;
+		cs->seg_first_time = cs->seg_end_time = TIME_NO_ENTRY_m13;
+
+		// time state (accumulation lives in the si4 out ring - D24)
+		cs->anchor_time = wi->session_start_otc;
+		cs->anchor_out_idx = 0;
+		cs->in_anchor_idx = 0;
+		cs->pending_discont = TRUE_m13;  // the first data of a session is a discontinuity BY DEFINITION
+		cs->has_data = FALSE_m13;
+		cs->first_time = cs->end_time = wi->session_start_otc;
+	}
+
+	// D29: CHAIN-AWARE STAGGER (Matt, 2026-08-11: "synchronous arrival of jobs was what caused me to
+	// put stagger in in the first place, & was probably the most effective thing I did" - & the 512-
+	// channel VDS+LNF storm showed the chain stages re-cohere without it: D12 covered block sizes
+	// only). Within each group of channels sharing a work quantum, channel k of m gets (k+1)/m of the
+	// quantum as its FIRST unit - the DHN_Acq formula - so steady-state boundaries spread uniformly.
+	// Values derive from channel index & config only: output stays deterministic per session shape.
+	// Applied where the app set nothing itself (options.initial_block_samples == 0).
+	{
+		si4		k, m, w2;
+		WRT_CHAN_m13	*c2;
+
+		for (i = 0; i < ws->n_chans; ++i) {
+			cs = wi->chans + i;
+			// block-size group membership (k of m among channels with the same target)
+			k = m = 0;
+			for (w2 = 0; w2 < ws->n_chans; ++w2) {
+				c2 = wi->chans + w2;
+				if (c2->target_block_samples == cs->target_block_samples) {
+					++m;
+					if (w2 <= i)
+						++k;
+				}
+			}
+			if (m > 1 && cs->options.initial_block_samples == 0 && k < m) {  // k == m keeps the full block (no stagger for the last)
+				cs->options.initial_block_samples = (ui4) (((si8) cs->target_block_samples * (si8) k + m - 1) / (si8) m);  // ceil(target*k/m); every D12 re-arm site now inherits it
+				cs->block_samples = cs->options.initial_block_samples;
+			}
+			// LNF first-span stagger (same spread over one hop)
+			if (cs->lnf_active == TRUE_m13 && m > 1 && k < m) {
+				cs->lnf_first_span = ((cs->lnf_hop * (si8) k) + (si8) m - 1) / (si8) m;
+				if (cs->lnf_first_span < 16)
+					cs->lnf_first_span = 16;  // floor: a batch needs a non-trivial span
+				cs->lnf_next_span = cs->lnf_first_span;
+			}
+			// AA head-length stagger (spread over one base head; floor = reflection pad + 2)
+			if (cs->aa_filtps != NULL && m > 1 && k < m) {
+				si8	floor_len = ((si8) cs->aa_filtps->n_poles * 3) + 2;
+				cs->aa_head_len = (cs->aa_head_len * (si8) k) / (si8) m;
+				if (cs->aa_head_len < floor_len)
+					cs->aa_head_len = floor_len;
+			}
+		}
+	}
+
+	if (ws->options.encode_workers > 0) {  // D26: distributor mode - spawn the pool before any data flows
+		if (WRT_pool_start_m13(ws) == FALSE_m13)
+			return(FALSE_m13);
+	}
+	ws->writing_started = TRUE_m13;
+
+	return(TRUE_m13);
+}
+
+
+//*************************************************//
+// D26: worker pool (distributor mode)
+//*************************************************//
+// One distributor thread ingests (WRT_packets_m13); K persistent workers drain channels through the
+// chain & encoder. Work item = a channel with >= visit_thresh unserviced samples (or a pending
+// boundary event). Cross-thread cursors use RELEASE_STORE/ACQUIRE_LOAD per the WRT_CHAN_m13 contract;
+// pool_state, the ready-queue & event mailboxes live under pool_mutex; everything else keeps a single
+// owner. Control operations (discontinuity, flush, segment, toggles, close) QUIESCE the pool, run the
+// existing single-threaded logic, & resume - they are rare, human-scale events.
+
+// static prototypes (alphabetical order can place callers before callees)
+static void	WRT_control_lock_m13(WRT_SESS_m13 *ws);
+static void	WRT_control_unlock_m13(WRT_SESS_m13 *ws);
+static tern	WRT_engage_chain_m13(WRT_CHAN_m13 *cs);
+static tern	WRT_mark_discontinuity_ctl_m13(WRT_SESS_m13 *ws, si8 new_start_time);
+static tern	WRT_new_segment_ctl_m13(WRT_SESS_m13 *ws, const si1 *segment_description);
+static tern	WRT_packets_pool_m13(WRT_SESS_m13 *ws, void *packets, si8 n_packets, si8 packet_bytes, si8 samples_offset, si4 *chan_map, si8 start_time);
+static tern	WRT_pool_drain_m13(WRT_SESS_m13 *ws);
+static void	WRT_pool_enqueue_locked_m13(WRT_INT_m13 *wi, si4 n_chans, si4 chan_idx);
+static tern	WRT_pool_pending_m13(WRT_CHAN_m13 *cs);
+static tern	WRT_pool_quiesce_m13(WRT_SESS_m13 *ws);
+static void	WRT_pool_resume_m13(WRT_SESS_m13 *ws);
+static tern	WRT_pool_start_m13(WRT_SESS_m13 *ws);
+static void	WRT_pool_stop_m13(WRT_SESS_m13 *ws);
+static tern	WRT_pool_visit_m13(WRT_SESS_m13 *ws, si4 chan_idx);
+static pthread_rval_m13	WRT_pool_worker_m13(void *arg);
+static tern	WRT_record_ctl_m13(WRT_SESS_m13 *ws, struct REC_WRITE_m13 *req_tagged);
+static tern	WRT_set_codec_ctl_m13(WRT_SESS_m13 *ws, si4 chan_idx, ui4 codec);
+static tern	WRT_set_encode_workers_ctl_m13(WRT_SESS_m13 *ws, si4 n_workers);
+static void	WRT_stagger_workers_m13(WRT_INT_m13 *wi);
+static tern	WRT_toggle_boundary_m13(WRT_SESS_m13 *ws, si4 chan_idx);
+
+
+si4	WRT_add_vid_channel_m13(WRT_SESS_m13 *ws, const si1 *chan_name)
+{
+	// D25: register a video channel; the hierarchy (directories, vidx & metadata FPS sets) is built
+	// at first write with the time-series channels. Video requires segmenting NONE in v1.
+	si4		idx;
+	WRT_INT_m13	*wi;
+	WRT_VID_m13	*vs;
+
+	if (ws == NULL) {
+		G_set_error_m13(E_GEN_m13, "NULL write session");
+		return(-1);
+	}
+	if (ws->writing_started == TRUE_m13) {
+		G_set_error_m13(E_GEN_m13, "writing has started: channels can no longer be added");
+		return(-1);
+	}
+	if (ws->chan_state_int == NULL) {  // first channel of any kind allocates the internal block
+		ws->chan_state_int = calloc_m13((size_t) 1, sizeof(WRT_INT_m13));
+		if (ws->chan_state_int == NULL) {
+			G_set_error_m13(E_ALLOC_m13, NULL);
+			return(-1);
+		}
+	}
+	wi = (WRT_INT_m13 *) ws->chan_state_int;
+	idx = ws->n_vid_chans;
+	wi->vids = (WRT_VID_m13 *) realloc(wi->vids, (size_t) (idx + 1) * sizeof(WRT_VID_m13));
+	if (wi->vids == NULL) {
+		G_set_error_m13(E_ALLOC_m13, NULL);
+		return(-1);
+	}
+	vs = wi->vids + idx;
+	memset((void *) vs, 0, sizeof(WRT_VID_m13));
+	if (chan_name != NULL && *chan_name)
+		strncpy_m13(vs->name, chan_name, NAME_BYTES_m13 - 1);
+	else
+		sprintf_m13(vs->name, "cam_%d", idx + 1);  // the DHN_Acq convention
+	vs->frame_rate = (sf8) RATE_NO_ENTRY_m13;
+	vs->first_file_adopted = FALSE_m13;  // tern: zeroed memory is UNKNOWN, not FALSE
+	ws->n_vid_chans = idx + 1;
+
+	return(idx);
+}
+
+
+si8	WRT_bytes_written_m13(WRT_SESS_m13 *ws, si8 *segment_bytes)
+{
+	// D32: bytes actually on disk for this session. The app needs it for session/segment size, the
+	// compression readout (bits/sample) & the time-to-disk-full projection - m12 accumulated it in
+	// the block processor, which the engine cut removed, leaving those displays reading ~0.
+	// The CURRENT segment is measured live from the open files (FPS lengths are maintained by every
+	// write); closed segments are accumulated at each roll. Racy by design: a snapshot for display.
+	si4		i;
+	si8		seg_bytes;
+	WRT_INT_m13	*wi;
+	SEG_m13		*seg;
+
+	if (segment_bytes != NULL)
+		*segment_bytes = 0;
+	if (ws == NULL || ws->sess == NULL || ws->writing_started == FALSE_m13)
+		return(0);
+	wi = (WRT_INT_m13 *) ws->chan_state_int;
+	if (wi == NULL)
+		return(0);
+
+	seg_bytes = 0;
+	for (i = 0; i < ws->n_chans; ++i) {
+		seg = ws->sess->ts_chans[i]->segs[0];
+		if (seg == NULL)
+			continue;
+		if (seg->ts_data_fps != NULL && seg->ts_data_fps->params.fp != NULL)
+			seg_bytes += seg->ts_data_fps->params.fp->len;
+		if (seg->ts_inds_fps != NULL && seg->ts_inds_fps->params.fp != NULL)
+			seg_bytes += seg->ts_inds_fps->params.fp->len;
+		if (seg->metadata_fps != NULL)  // written at segment close; count its eventual size all along
+			seg_bytes += (si8) METADATA_FILE_BYTES_m13;
+	}
+	if (ws->sess->rec_data_fps != NULL && ws->sess->rec_data_fps->params.fp != NULL)
+		seg_bytes += ws->sess->rec_data_fps->params.fp->len;
+	if (ws->sess->rec_inds_fps != NULL && ws->sess->rec_inds_fps->params.fp != NULL)
+		seg_bytes += ws->sess->rec_inds_fps->params.fp->len;
+	if (segment_bytes != NULL)
+		*segment_bytes = seg_bytes;
+
+	return(wi->closed_seg_bytes + seg_bytes);
+}
+
+
+tern	WRT_close_session_m13(WRT_SESS_m13 *ws)
+{
+	// The wrap-up recipe (DHN_Acq via NAT2MED): flush partials as short blocks; per channel - settle
+	// section 2/3 & universal-header times, FULL metadata write, close data, terminal ts index; session
+	// records - Sgmt record + settled UHs + terminal record index. The library settles every UH so no
+	// caller can forget (the codec_file_test lesson).
+	si4		i;
+	si8		sess_start, sess_end, len;
+	WRT_INT_m13	*wi;
+	WRT_CHAN_m13	*cs;
+	FPS_m13		*gen_fps;
+	UH_m13		*uh;
+	REC_IDX_m13	*ri;
+
+	if (ws == NULL)
+		return(TRUE_m13);
+	if (ws->writing_started == FALSE_m13) {  // nothing written: free create-phase resources only
+		if (ws->proto_fps != NULL)
+			FPS_free_m13(ws->proto_fps);
+		if (ws->chan_state_int != NULL)
+			free(ws->chan_state_int);
+		free(ws);
+		return(TRUE_m13);
+	}
+	wi = WRT_INT_m13(ws);
+	WRT_control_lock_m13(ws);  // D35: serialize against in-flight control ops; released below - the
+				   // post-stop close is single-threaded by construction (workers are gone, &
+				   // a control call AFTER close is an app contract violation regardless)
+	if (wi->pool_active == TRUE_m13) {  // D26: idle the workers, then close single-threaded
+		if (WRT_pool_drain_m13(ws) == FALSE_m13)
+			G_warning_message_m13("%s(): a pool worker failed - closing what was written\n", __FUNCTION__);
+		WRT_pool_stop_m13(ws);
+	}
+	WRT_control_unlock_m13(ws);
+
+	// flush partials; session bounds
+	sess_start = sess_end = TIME_NO_ENTRY_m13;
+	for (i = 0; i < ws->n_chans; ++i) {
+		cs = wi->chans + i;
+		if (WRT_chain_flush_m13(ws, i, (si8) -1) == FALSE_m13)  // drain every stage (D23 lifecycle: end == tail)
+			return(FALSE_m13);
+		if (WRT_emit_pending_m13(ws, i, TRUE_m13) == FALSE_m13)
+			return(FALSE_m13);
+		if (cs->has_data == TRUE_m13)  // pool mode: nothing updated end_time during recording
+			cs->end_time = WRT_next_time_m13(cs) - 1;
+		if (sess_start == TIME_NO_ENTRY_m13 || cs->first_time < sess_start)
+			sess_start = cs->first_time;
+		if (sess_end == TIME_NO_ENTRY_m13 || cs->end_time > sess_end)
+			sess_end = cs->end_time;
+	}
+	if (sess_start == TIME_NO_ENTRY_m13)  // no data at all
+		sess_start = sess_end = wi->session_start_otc;
+
+	// per-channel: settle & close the FINAL segment (D3 helper - same procedure every segment used)
+	for (i = 0; i < ws->n_chans; ++i)
+		if (WRT_close_segment_files_m13(ws, i) == FALSE_m13)
+			return(FALSE_m13);
+
+	// session records: final segment's Sgmt record, settled UHs, terminal record index
+	if (ws->options.session_records == TRUE_m13 && ws->sess->rec_data_fps != NULL) {
+		si8	fseg_start, fseg_end;
+
+		fseg_start = fseg_end = TIME_NO_ENTRY_m13;
+		for (i = 0; i < ws->n_chans; ++i) {
+			cs = wi->chans + i;
+			if (cs->seg_first_time != TIME_NO_ENTRY_m13 && (fseg_start == TIME_NO_ENTRY_m13 || cs->seg_first_time < fseg_start))
+				fseg_start = cs->seg_first_time;
+			if (cs->seg_end_time > fseg_end || fseg_end == TIME_NO_ENTRY_m13)
+				fseg_end = cs->seg_end_time;
+		}
+		if (fseg_start == TIME_NO_ENTRY_m13)
+			fseg_start = fseg_end = sess_start;
+		if (WRT_enter_Sgmt_m13(ws, fseg_start, fseg_end, wi->chans[0].seg_start_samp, wi->chans[0].sess_samples - 1, wi->seg_num,
+		    ws->metadata.time_series_section_2.segment_description) == FALSE_m13)
+			return(FALSE_m13);
+		gen_fps = ws->sess->rec_data_fps;
+
+		// record data: settle & close (length captured before close - see the ts data note)
+		len = gen_fps->params.fp->len;
+		uh = gen_fps->uh;
+		uh->session_start_time = uh->file_start_time = sess_start;
+		uh->file_end_time = sess_end;
+		uh->live = FALSE_m13;  // settled: no longer being recorded
+		FPS_write_m13(gen_fps, FPS_UH_ONLY_m13, 0, 0);
+		FPS_close_m13(gen_fps);
+
+		// record indices: settle + terminal index
+		gen_fps = ws->sess->rec_inds_fps;
+		uh = gen_fps->uh;
+		uh->session_start_time = uh->file_start_time = sess_start;
+		uh->file_end_time = sess_end;
+		uh->live = FALSE_m13;  // settled: no longer being recorded
+		ri = gen_fps->rec_inds;
+		ri->file_offset = len;
+		ri->start_time = sess_end + 1;
+		ri->type_code = REC_Term_TYPE_CODE_m13;
+		ri->version_major = 0xFF;
+		ri->version_minor = 0xFF;
+		ri->encryption_level = NO_ENCRYPTION_m13;
+		gen_fps->direcs.flags |= FPS_DF_CLOSE_AFTER_OP_m13;
+		FPS_write_m13(gen_fps, FPS_APPEND_m13, INDEX_BYTES_m13, 1);
+	}
+
+	// channel record files: settle & close (terminal Term index, as at session level)
+	if (ws->options.channel_records == TRUE_m13) {
+		for (i = 0; i < ws->n_chans; ++i) {
+			CHAN_m13	*chan = ws->sess->ts_chans[i];
+
+			if (chan->rec_data_fps == NULL || chan->rec_inds_fps == NULL)
+				continue;
+			gen_fps = chan->rec_data_fps;
+			len = gen_fps->params.fp->len;  // captured before close (the post-close flen lesson)
+			uh = gen_fps->uh;
+			uh->session_start_time = uh->file_start_time = sess_start;
+			uh->file_end_time = sess_end;
+			uh->live = FALSE_m13;  // settled: no longer being recorded
+			FPS_write_m13(gen_fps, FPS_UH_ONLY_m13, 0, 0);
+			FPS_close_m13(gen_fps);
+			gen_fps = chan->rec_inds_fps;
+			uh = gen_fps->uh;
+			uh->session_start_time = uh->file_start_time = sess_start;
+			uh->file_end_time = sess_end;
+			uh->live = FALSE_m13;  // settled: no longer being recorded
+			ri = gen_fps->rec_inds;
+			ri->file_offset = len;
+			ri->start_time = sess_end + 1;
+			ri->type_code = REC_Term_TYPE_CODE_m13;
+			ri->version_major = 0xFF;
+			ri->version_minor = 0xFF;
+			ri->encryption_level = NO_ENCRYPTION_m13;
+			gen_fps->direcs.flags |= FPS_DF_CLOSE_AFTER_OP_m13;
+			FPS_write_m13(gen_fps, FPS_APPEND_m13, INDEX_BYTES_m13, 1);
+		}
+	}
+
+	// video channels (D25): terminal vidx entry + metadata settled from the walk facts
+	for (i = 0; i < ws->n_vid_chans; ++i) {
+		WRT_VID_m13		*vs = wi->vids + i;
+		VID_METADATA_SECTION_2_m13 *vmd2;
+
+		if (vs->seg == NULL)
+			continue;
+		// vidx: times + terminal entry (virtual next clip bounding the last real one)
+		gen_fps = vs->seg->vid_inds_fps;
+		uh = gen_fps->uh;
+		uh->session_start_time = sess_start;
+		uh->file_start_time = (vs->first_file_adopted == TRUE_m13) ? vs->first_otc : sess_start;
+		uh->file_end_time = (vs->first_file_adopted == TRUE_m13) ? vs->end_otc : sess_end;
+		uh->live = FALSE_m13;  // settled: no longer being recorded
+		gen_fps->vid_inds->file_offset = vs->last_file_bytes;  // last file's UNPADDED container length (Matt, 2026-08-11): bounds the last clip & records the original native length
+		gen_fps->vid_inds->start_time = uh->file_end_time;
+		gen_fps->vid_inds->start_frame_num = (ui4) vs->seg_frames;  // one past the last real frame
+		gen_fps->vid_inds->vid_file_num = VID_IDX_TERMINAL_VID_FILE_NUMBER_m13;
+		gen_fps->direcs.flags |= FPS_DF_CLOSE_AFTER_OP_m13;
+		FPS_write_m13(gen_fps, FPS_APPEND_m13, INDEX_BYTES_m13, 1);
+
+		// video metadata: the walk facts (the NAT2MED settle)
+		gen_fps = vs->seg->metadata_fps;
+		vmd2 = &gen_fps->metadata->video_section_2;
+		vmd2->session_start_frame_number = 0;
+		vmd2->number_of_frames = vs->seg_frames;
+		vmd2->frame_rate = (vs->frame_rate == (sf8) RATE_NO_ENTRY_m13) ? VID_METADATA_FRAME_RATE_NO_ENTRY_m13 : vs->frame_rate;
+		vmd2->number_of_clips = vs->seg_keyframes;  // clip == GOP == keyframe
+		vmd2->maximum_clip_bytes = vs->max_clip_bytes;
+		vmd2->maximum_clip_frames = (ui4) vs->max_clip_frames;
+		vmd2->number_of_video_files = (si4) vs->file_num;
+		vmd2->maximum_clip_duration = vs->max_clip_dur;
+		vmd2->number_of_discontinuities = vs->n_discont;
+		vmd2->maximum_contiguous_clips = vs->max_contig_clips;
+		vmd2->maximum_contiguous_clip_bytes = vs->max_contig_bytes;
+		vmd2->maximum_contiguous_frames = vs->max_contig_frames;
+		vmd2->horizontal_pixels = vs->h_pixels;
+		vmd2->vertical_pixels = vs->v_pixels;
+		strncpy_m13(vmd2->video_format, vs->video_format, VID_METADATA_VIDEO_FORMAT_BYTES_m13 - 1);
+		vmd2->display_transform = VID_METADATA_DISPLAY_TRANSFORM_NO_ENTRY_m13;
+		vmd2->video_flags = (vs->has_audio == TRUE_m13) ? VID_METADATA_VIDEO_FLAGS_EMBEDDED_AUDIO_MASK_m13 : VID_METADATA_VIDEO_FLAGS_NO_ENTRY_m13;
+		if (vs->codec_config_bytes) {
+			vmd2->codec_config_bytes = (ui2) vs->codec_config_bytes;
+			memcpy(vmd2->codec_config, vs->codec_config, (size_t) vs->codec_config_bytes);
+		}
+		gen_fps->metadata->section_3.recording_time_offset = ws->pg->time_constants.recording_time_offset;
+		uh = gen_fps->uh;
+		uh->session_start_time = sess_start;
+		uh->file_start_time = (vs->first_file_adopted == TRUE_m13) ? vs->first_otc : sess_start;
+		uh->file_end_time = (vs->first_file_adopted == TRUE_m13) ? vs->end_otc : sess_end;
+		uh->live = FALSE_m13;  // settled: no longer being recorded
+		gen_fps->direcs.flags |= FPS_DF_CLOSE_AFTER_OP_m13;
+		FPS_write_m13(gen_fps, FPS_FULL_FILE_m13, 0, 0);
+	}
+
+	// parity: final segment + session/channel-level files (Matt's terminate-state masks)
+	WRT_build_parity_m13(ws, wi->seg_num, TRUE_m13);
+
+	// complete the pg's session facts: create stamped UID & path (so a same-process reader will NOT
+	// re-trigger session-directory discovery), which obliges the writer to supply the times too -
+	// otherwise G_condition_slice_m13() turns a BEGINNING_OF_TIME slice into NO_ENTRY (session-
+	// relative arithmetic against an unset current_session.start_time)
+	ws->pg->current_session.start_time = sess_start;
+	ws->pg->current_session.end_time = sess_end;
+	ws->pg->current_session.n_segments = wi->seg_num;
+
+	// free
+	for (i = 0; i < ws->n_chans; ++i) {
+		WRT_ring_free_m13(&wi->chans[i].out_ring);
+		WRT_ring_free_m13(&wi->chans[i].ring);
+		if (wi->chans[i].lnf_y != NULL)
+			free(wi->chans[i].lnf_y);
+		if (wi->chans[i].lnf_fy != NULL)
+			free(wi->chans[i].lnf_fy);
+		if (wi->chans[i].lnf_save != NULL)
+			free(wi->chans[i].lnf_save);
+		if (wi->chans[i].aa_fd != NULL)
+			FILT_filtfilt_free_m13(&wi->chans[i].aa_fd);
+		if (wi->chans[i].aa_filtps != NULL) {
+			if (wi->chans[i].aa_filtps->numerators != NULL)
+				free_m13(wi->chans[i].aa_filtps->numerators);
+			if (wi->chans[i].aa_filtps->denominators != NULL)
+				free_m13(wi->chans[i].aa_filtps->denominators);
+			if (wi->chans[i].aa_filtps->initial_conditions != NULL)
+				free_m13(wi->chans[i].aa_filtps->initial_conditions);
+			free(wi->chans[i].aa_filtps);
+		}
+		if (wi->chans[i].aa_out != NULL)
+			free(wi->chans[i].aa_out);
+	}
+	G_free_session_m13(ws->sess);
+	if (wi->vids != NULL)
+		free(wi->vids);
+	if (wi->packets_scratch != NULL)
+		free(wi->packets_scratch);
+	free_m13(ws->chan_state_int);
+	free(ws);
+
+	return(TRUE_m13);
+}
+
+
+// quiesce, then FINISH everything pending - visits & boundary events - on this thread. Control ops
+// & close use this (a bare quiesce would leave unprocessed events in the mailboxes: their boundaries
+// would then be flushed across as one continuity - the D26 lagging-LNF lesson).
+// D35 control serialization: lock held across each control op's full quiesce->work->resume span.
+// NULL wi (pre-setup, single-threaded by construction) => no-op. Non-recursive: no control entry
+// point calls another (verified 2026-08-18 - the *_ctl_m13 cores are called ONLY by their wrappers).
+static void	WRT_control_lock_m13(WRT_SESS_m13 *ws)
+{
+	WRT_INT_m13	*wi = (WRT_INT_m13 *) ws->chan_state_int;
+
+	if (wi != NULL)
+		pthread_mutex_lock_m13(&wi->control_mutex);
+	return;
+}
+
+static void	WRT_control_unlock_m13(WRT_SESS_m13 *ws)
+{
+	WRT_INT_m13	*wi = (WRT_INT_m13 *) ws->chan_state_int;
+
+	if (wi != NULL)
+		pthread_mutex_unlock_m13(&wi->control_mutex);
+	return;
+}
+
+// engage the chain mid-write for a channel that was si4-direct (first toggle-on of a filter)
+static tern	WRT_engage_chain_m13(WRT_CHAN_m13 *cs)
+{
+	si8	lags, ring_elements;
+
+	if (cs->chain_active == TRUE_m13)
+		return(TRUE_m13);
+	if (cs->ring.data == NULL) {
+		lags = 0;
+		if (cs->lnf_margin)
+			lags += cs->lnf_hop + cs->lnf_margin;
+		ring_elements = 2 * (lags + 4096);
+		if (WRT_ring_alloc_m13(&cs->ring, ring_elements, (si8) sizeof(sf8)) == FALSE_m13)
+			return(FALSE_m13);
+	}
+	cs->ingest_idx = 0;  // fresh absolute index space; stage cursors are already 0 / reset by flushes
+	cs->lnf_finished_idx = cs->lnf_start_idx = 0;
+	cs->lnf_save_len = 0;
+	cs->aa_fed_idx = cs->aa_finished_idx = 0;
+	cs->next_out_in_idx = (sf8) 0.0;
+	cs->chain_active = TRUE_m13;
+
+	return(TRUE_m13);
+}
+
+
+tern	WRT_flush_m13(WRT_SESS_m13 *ws)
+{
+	// D15: deep-user flush - staged partials written as SHORT blocks, NO discontinuity mark
+	si4	i;
+
+	if (ws == NULL || ws->writing_started == FALSE_m13)
+		return(TRUE_m13);
+	if (WRT_pool_drain_m13(ws) == FALSE_m13)  // D26: single-threaded op; drain finishes pending visits & boundary events first
+		return(FALSE_m13);
+	for (i = 0; i < ws->n_chans; ++i) {
+		if (WRT_chain_flush_m13(ws, i, (si8) -1) == FALSE_m13)  // drain every stage (D23 lifecycle)
+			return(FALSE_m13);
+		if (WRT_emit_pending_m13(ws, i, TRUE_m13) == FALSE_m13)
+			return(FALSE_m13);
+		{	// D12 re-arm (see WRT_mark_discontinuity_m13)
+			WRT_CHAN_m13	*cs = ((WRT_INT_m13 *) ws->chan_state_int)->chans + i;
+			cs->block_samples = (cs->options.initial_block_samples && cs->options.initial_block_samples < cs->target_block_samples) ? cs->options.initial_block_samples : cs->target_block_samples;
+		}
+	}
+	WRT_pool_resume_m13(ws);
+
+	return(TRUE_m13);
+}
+
+
+static tern	WRT_mark_discontinuity_ctl_m13(WRT_SESS_m13 *ws, si8 new_start_time)
+{
+	// D9 EXPLICIT path, all channels (D2): staged partials close as short blocks at the gap; the next
+	// block on every channel starts at new_start_time & carries the discontinuity flag
+	si4		i;
+	si8		t;
+	WRT_INT_m13	*wi;
+	WRT_CHAN_m13	*cs;
+
+	if (ws == NULL || new_start_time == TIME_NO_ENTRY_m13) {
+		G_set_error_m13(E_GEN_m13, "a discontinuity needs the new start time");
+		return(FALSE_m13);
+	}
+	if (ws->writing_started == FALSE_m13) {
+		if (WRT_start_writing_m13(ws) == FALSE_m13)
+			return(FALSE_m13);
+	}
+	wi = WRT_INT_m13(ws);
+	if (WRT_pool_drain_m13(ws) == FALSE_m13)  // D26: single-threaded op; drain finishes pending visits & boundary events first
+		return(FALSE_m13);
+	t = new_start_time;  // oUTC universally - rto only for display
+	for (i = 0; i < ws->n_chans; ++i) {
+		cs = wi->chans + i;
+		if (WRT_chain_flush_m13(ws, i, (si8) -1) == FALSE_m13)  // drain every stage (D23 lifecycle)
+			return(FALSE_m13);
+		if (WRT_emit_pending_m13(ws, i, TRUE_m13) == FALSE_m13)
+			return(FALSE_m13);
+		cs->pending_discont = TRUE_m13;
+		cs->dec_phase_reset = TRUE_m13;
+		cs->anchor_time = t;
+		cs->anchor_out_idx = cs->out_ingest_idx;  // flush drained everything: closed run's samples are all out
+		cs->in_anchor_idx = cs->ingest_idx;  // input-domain time base restarts here (chain channels)
+		// D12: re-arm the initial (staggered) block size - the flush emptied every channel's staging
+		// at the same instant, so without this the channels refill & encode in lockstep (DHN_Acq)
+		cs->block_samples = (cs->options.initial_block_samples && cs->options.initial_block_samples < cs->target_block_samples) ? cs->options.initial_block_samples : cs->target_block_samples;
+	}
+	WRT_pool_resume_m13(ws);
+
+	return(TRUE_m13);
+}
+
+
+tern	WRT_mark_discontinuity_m13(WRT_SESS_m13 *ws, si8 new_start_time)
+{
+	tern	ret;
+
+	if (ws == NULL) {
+		G_set_error_m13(E_GEN_m13, "NULL write session");
+		return(FALSE_m13);
+	}
+
+	WRT_control_lock_m13(ws);
+	ret = WRT_mark_discontinuity_ctl_m13(ws, new_start_time);
+	WRT_control_unlock_m13(ws);
+
+	return(ret);
+}
+
+
+static tern	WRT_new_segment_ctl_m13(WRT_SESS_m13 *ws, const si1 *segment_description)
+{
+	// D3 MANUAL segmenting - the DHN_Acq "segment now" button (Matt: labs bracket experiments; the
+	// closed segment is immediately available for copy/analysis without worrying about live status).
+	// Allowed in AUTO mode too (resets that segment's duration clock); NONE => error. The description
+	// applies to the NEW segment (D17); NULL keeps the current one. Control-thread operation.
+	si4		i;
+	WRT_INT_m13	*wi;
+
+	if (ws == NULL) {
+		G_set_error_m13(E_GEN_m13, "NULL write session");
+		return(FALSE_m13);
+	}
+	if (ws->writing_started == FALSE_m13) {  // nothing to close yet: description applies to segment 1
+		if (segment_description != NULL && *segment_description) {
+			strncpy_m13(ws->metadata.time_series_section_2.segment_description, segment_description, METADATA_SEGMENT_DESCRIPTION_BYTES_m13 - 1);
+			if (ws->chan_state_int != NULL) {
+				wi = (WRT_INT_m13 *) ws->chan_state_int;
+				for (i = 0; i < ws->n_chans; ++i)
+					strncpy_m13(wi->chans[i].metadata.time_series_section_2.segment_description, segment_description, METADATA_SEGMENT_DESCRIPTION_BYTES_m13 - 1);
+			}
+		}
+		return(TRUE_m13);
+	}
+	if (ws->options.segmenting_mode == WRT_SEG_NONE_m13) {
+		G_set_error_m13(E_GEN_m13, "segmenting_mode is NONE: set MANUAL (or AUTO) to use WRT_new_segment_m13()");
+		return(FALSE_m13);
+	}
+
+	if (WRT_pool_drain_m13(ws) == FALSE_m13)  // D26: single-threaded op; drain finishes pending visits & boundary events first
+		return(FALSE_m13);
+	if (WRT_roll_segment_m13(ws, segment_description) == FALSE_m13)
+		return(FALSE_m13);
+	WRT_pool_resume_m13(ws);
+
+	return(TRUE_m13);
+}
+
+tern	WRT_new_segment_m13(WRT_SESS_m13 *ws, const si1 *segment_description)
+{
+	tern	ret;
+
+	if (ws == NULL) {
+		G_set_error_m13(E_GEN_m13, "NULL write session");
+		return(FALSE_m13);
+	}
+
+	WRT_control_lock_m13(ws);
+	ret = WRT_new_segment_ctl_m13(ws, segment_description);
+	WRT_control_unlock_m13(ws);
+
+	return(ret);
+}
+
+
+
+tern	WRT_packets_m13(WRT_SESS_m13 *ws, void *packets, si8 n_packets, si8 packet_bytes, si8 samples_offset, si4 *chan_map, si8 start_time)
+{
+	// The INTERLEAVED entry point (acquisition packets, DAT-style sources): each packet holds every
+	// channel's value at one sample time. packet_bytes is the stride; samples_offset locates the si4
+	// value array within a packet (timestamps/headers skipped); chan_map[w] = the packet slot feeding
+	// WRT channel w (NULL => identity; a negative slot skips the channel - excluded/unlabeled inputs
+	// need no reverse map in the caller). start_time carries packet[0]'s time with WRT_samples_m13()
+	// semantics (D2/D9), applied identically to every mapped channel.
+	//
+	// Already-split sources (CSC, Python/MATLAB, MED, EDF records) keep calling WRT_samples_m13() per
+	// channel - both entries feed the same seam & produce identical output (equivalence-tested).
+	//
+	// v1 runs the gather per channel into a scratch run, then the standard per-channel path: correct,
+	// cache-sane (sequential writes; the packet batch is re-scanned per channel but a typical batch
+	// sits in L2). The distributor/pool work item split arrives with worker mode.
+	si1		*base;
+	si4		w, slot, *scratch;
+	si8		i;
+	WRT_INT_m13	*wi;
+
+	if (ws == NULL || packets == NULL || n_packets < 1 || packet_bytes < (si8) sizeof(si4)) {
+		G_set_error_m13(E_GEN_m13, "bad arguments");
+		return(FALSE_m13);
+	}
+	if (ws->writing_started == FALSE_m13) {  // first-write latch (same as WRT_samples_m13)
+		pthread_mutex_lock_m13(&ws->start_mutex);
+		if (ws->writing_started == FALSE_m13) {
+			if (WRT_start_writing_m13(ws) == FALSE_m13) {
+				pthread_mutex_unlock_m13(&ws->start_mutex);
+				return(FALSE_m13);
+			}
+		}
+		pthread_mutex_unlock_m13(&ws->start_mutex);
+	}
+	wi = WRT_INT_m13(ws);
+	if (wi->pool_active == TRUE_m13)  // D26 distributor mode: workers drain; this thread only ingests
+		return(WRT_packets_pool_m13(ws, packets, n_packets, packet_bytes, samples_offset, chan_map, start_time));
+
+	// gather scratch: one channel's run
+	if (wi->packets_scratch_len < n_packets) {
+		scratch = (si4 *) realloc((void *) wi->packets_scratch, (size_t) n_packets * sizeof(si4));
+		if (scratch == NULL) {
+			G_set_error_m13(E_ALLOC_m13, NULL);
+			return(FALSE_m13);
+		}
+		wi->packets_scratch = scratch;
+		wi->packets_scratch_len = n_packets;
+	}
+	scratch = wi->packets_scratch;
+
+	base = (si1 *) packets + samples_offset;
+	for (w = 0; w < ws->n_chans; ++w) {
+		slot = (chan_map == NULL) ? w : chan_map[w];
+		if (slot < 0)
+			continue;
+		for (i = 0; i < n_packets; ++i)  // strided gather -> sequential run
+			scratch[i] = *((si4 *) (base + (i * packet_bytes) + ((si8) slot * (si8) sizeof(si4))));
+		if (WRT_samples_m13(ws, w, scratch, n_packets, start_time) == FALSE_m13)
+			return(FALSE_m13);
+	}
+
+	return(TRUE_m13);
+}
+
+
+// the distributor's per-batch ingest (pool path of WRT_packets_m13). Gap detection uses the
+// distributor-PRIVATE mirror; boundaries become events PUSHED BEFORE the post-gap samples publish,
+// so a worker can never service across an unseen boundary.
+static tern	WRT_packets_pool_m13(WRT_SESS_m13 *ws, void *packets, si8 n_packets, si8 packet_bytes, si8 samples_offset, si4 *chan_map, si8 start_time)
+{
+	si1		*base;
+	si4		w, slot, waited;
+	si8		i, t, expected, delta, tol, in_count, free_space, chunk, done;
+	sf8		*rd;
+	si4		*od;
+	WRT_INT_m13	*wi;
+	WRT_CHAN_m13	*cs;
+
+	wi = (WRT_INT_m13 *) ws->chan_state_int;
+	if (wi->pool_error == TRUE_m13) {
+		G_set_error_m13(E_GEN_m13, "a pool worker failed - session cannot continue");  // causal error already stored
+		return(FALSE_m13);
+	}
+	if (wi->roll_request == TRUE_m13) {  // AUTO rollover, barriered (D35: a control op like any other)
+		wi->roll_request = FALSE_m13;
+		WRT_control_lock_m13(ws);
+		if (WRT_pool_drain_m13(ws) == FALSE_m13) {
+			WRT_control_unlock_m13(ws);
+			return(FALSE_m13);
+		}
+		if (WRT_roll_segment_m13(ws, NULL) == FALSE_m13) {
+			WRT_control_unlock_m13(ws);
+			return(FALSE_m13);
+		}
+		WRT_pool_resume_m13(ws);
+		WRT_control_unlock_m13(ws);
+	}
+
+	base = (si1 *) packets + samples_offset;
+	for (w = 0; w < ws->n_chans; ++w) {
+		slot = (chan_map == NULL) ? w : chan_map[w];
+		if (slot < 0)
+			continue;
+		cs = wi->chans + w;
+
+		// timing: distributor-private mirror (workers re-anchor via events)
+		in_count = (cs->chain_active == TRUE_m13) ? cs->ingest_idx : cs->out_ingest_idx;  // distributor-owned cursors
+		if (cs->dist_anchored == FALSE_m13) {
+			if (start_time != TIME_NO_ENTRY_m13) {
+				t = start_time;  // oUTC universally - no rto handling on ongoing times
+				cs->dist_anchor_time = t;
+				cs->anchor_time = cs->first_time = t;  // pre-first-data: no worker has touched this channel
+			} else {
+				cs->dist_anchor_time = cs->anchor_time;  // session start (set at start_writing)
+			}
+			cs->dist_anchor_in_idx = in_count;
+			cs->dist_anchored = TRUE_m13;
+		} else if (start_time != TIME_NO_ENTRY_m13) {
+			t = start_time;  // oUTC universally
+			expected = cs->dist_anchor_time + (si8) ((((sf8) (in_count - cs->dist_anchor_in_idx) * (sf8) 1e6) / ((cs->chain_active == TRUE_m13) ? cs->in_fs : cs->fs)) + (sf8) 0.5);
+			delta = t - expected;
+			tol = (si8) ((cs->options.discontinuity_tolerance * (sf8) 1e6 / ((cs->chain_active == TRUE_m13) ? cs->in_fs : cs->fs)) + (sf8) 0.5);
+			if (delta > tol || delta < -tol) {
+				if (cs->options.discontinuity_mode == WRT_DISCONT_EXPLICIT_m13) {
+					G_set_error_m13(E_GEN_m13, "channel \"%s\": start_time is %ld usecs from the expected time (tolerance %ld): mark the discontinuity explicitly or set IMPLICIT mode", cs->name, (long) delta, (long) tol);
+					return(FALSE_m13);
+				}
+				pthread_mutex_lock_m13(&wi->pool_mutex);  // event BEFORE the post-gap samples publish
+				if (cs->n_events >= 8) {
+					pthread_mutex_unlock_m13(&wi->pool_mutex);
+					G_set_error_m13(E_GEN_m13, "channel \"%s\": boundary event queue overflow (pathological gap rate)", cs->name);
+					return(FALSE_m13);
+				}
+				cs->events[cs->n_events].at_in_idx = cs->ingest_idx;
+				cs->events[cs->n_events].at_out_idx = cs->out_ingest_idx;
+				cs->events[cs->n_events].new_time = t;
+				++cs->n_events;
+				WRT_pool_enqueue_locked_m13(wi, ws->n_chans, w);
+				pthread_mutex_unlock_m13(&wi->pool_mutex);
+				cs->dist_anchor_time = t;
+				cs->dist_anchor_in_idx = in_count;
+			}
+		}
+
+		// ingest with backpressure (ring sized for seconds; telemetry warns long before this stalls)
+		done = 0;
+		waited = 0;
+		if (cs->chain_active == TRUE_m13) {
+			rd = (sf8 *) cs->ring.data;
+			while (done < n_packets) {
+				free_space = cs->ring.len - (cs->ingest_idx - ACQUIRE_LOAD_m13(cs->retain_from));
+				chunk = ((n_packets - done) < free_space) ? (n_packets - done) : free_space;
+				if (chunk == 0) {
+					if (++waited > 20000) {  // ~10 s
+						G_set_error_m13(E_GEN_m13, "channel \"%s\": chain ring stalled (workers not keeping up)", cs->name);
+						return(FALSE_m13);
+					}
+					pthread_mutex_lock_m13(&wi->pool_mutex);  // ensure a worker is coming (idempotent)
+					WRT_pool_enqueue_locked_m13(wi, ws->n_chans, w);
+					pthread_mutex_unlock_m13(&wi->pool_mutex);
+					nap_m13("500 us");
+					continue;
+				}
+				for (i = 0; i < chunk; ++i)
+					rd[(cs->ingest_idx + i) % cs->ring.len] = (sf8) *((si4 *) (base + ((done + i) * packet_bytes) + ((si8) slot * (si8) sizeof(si4))));
+				RELEASE_STORE_m13(cs->ingest_idx, cs->ingest_idx + chunk);  // publish: cells before cursor
+				done += chunk;
+			}
+			if ((cs->ingest_idx - cs->serviced_in_idx) >= cs->visit_thresh) {
+				pthread_mutex_lock_m13(&wi->pool_mutex);
+				WRT_pool_enqueue_locked_m13(wi, ws->n_chans, w);
+				pthread_mutex_unlock_m13(&wi->pool_mutex);
+			}
+		} else {
+			od = (si4 *) cs->out_ring.data;
+			while (done < n_packets) {
+				free_space = cs->out_ring.len - (cs->out_ingest_idx - ACQUIRE_LOAD_m13(cs->encoded_idx));
+				chunk = ((n_packets - done) < free_space) ? (n_packets - done) : free_space;
+				if (chunk == 0) {
+					if (++waited > 20000) {
+						G_set_error_m13(E_GEN_m13, "channel \"%s\": output ring stalled (workers not keeping up)", cs->name);
+						return(FALSE_m13);
+					}
+					pthread_mutex_lock_m13(&wi->pool_mutex);  // ensure a worker is coming (idempotent)
+					WRT_pool_enqueue_locked_m13(wi, ws->n_chans, w);
+					pthread_mutex_unlock_m13(&wi->pool_mutex);
+					nap_m13("500 us");
+					continue;
+				}
+				for (i = 0; i < chunk; ++i)
+					od[(cs->out_ingest_idx + i) % cs->out_ring.len] = *((si4 *) (base + ((done + i) * packet_bytes) + ((si8) slot * (si8) sizeof(si4))));
+				cs->has_data = TRUE_m13;
+				RELEASE_STORE_m13(cs->out_ingest_idx, cs->out_ingest_idx + chunk);
+				done += chunk;
+			}
+			if ((cs->out_ingest_idx - ACQUIRE_LOAD_m13(cs->encoded_idx)) >= cs->visit_thresh) {
+				pthread_mutex_lock_m13(&wi->pool_mutex);
+				WRT_pool_enqueue_locked_m13(wi, ws->n_chans, w);
+				pthread_mutex_unlock_m13(&wi->pool_mutex);
+			}
+		}
+	}
+
+	return(TRUE_m13);
+}
+
+static tern	WRT_pool_drain_m13(WRT_SESS_m13 *ws)
+{
+	si4		i;
+	WRT_INT_m13	*wi;
+	WRT_CHAN_m13	*cs;
+
+	if (WRT_pool_quiesce_m13(ws) == FALSE_m13)
+		return(FALSE_m13);
+	wi = (WRT_INT_m13 *) ws->chan_state_int;
+	if (wi->pool_active == FALSE_m13)
+		return(TRUE_m13);
+	for (i = 0; i < ws->n_chans; ++i) {
+		cs = wi->chans + i;
+		while (cs->n_events || (cs->chain_active == TRUE_m13 && cs->serviced_in_idx < cs->ingest_idx))
+			if (WRT_pool_visit_m13(ws, i) == FALSE_m13)
+				return(FALSE_m13);
+	}
+
+	return(TRUE_m13);
+}
+
+// pool_mutex HELD. Enqueue if idle & (unserviced work or events).
+static void	WRT_pool_enqueue_locked_m13(WRT_INT_m13 *wi, si4 n_chans, si4 chan_idx)
+{
+	WRT_CHAN_m13	*cs;
+
+	cs = wi->chans + chan_idx;
+	if (cs->pool_state != WRT_POOL_IDLE_m13)
+		return;
+	cs->pool_state = WRT_POOL_QUEUED_m13;
+	wi->pool_q[(wi->pool_q_head + wi->pool_q_count) % n_chans] = chan_idx;
+	++wi->pool_q_count;
+
+	return;
+}
+
+// racy-read pending check (conservative callers only: requeue decision & resume sweep)
+static tern	WRT_pool_pending_m13(WRT_CHAN_m13 *cs)
+{
+	if (cs->n_events)
+		return(TRUE_m13);
+	if (cs->chain_active == TRUE_m13) {
+		if ((ACQUIRE_LOAD_m13(cs->ingest_idx) - cs->serviced_in_idx) > 0)
+			return(TRUE_m13);
+	} else {
+		if ((ACQUIRE_LOAD_m13(cs->out_ingest_idx) - cs->encoded_idx) >= (si8) cs->block_samples)
+			return(TRUE_m13);
+	}
+
+	return(FALSE_m13);
+}
+
+// barrier: workers finish their current visits & idle; the queue drains. Caller runs single-threaded
+// logic, then WRT_pool_resume_m13(). (The distributor must not be mid-ingest: control ops & ingest
+// are the same thread in DHN_Acq's model, or externally serialized.)
+static tern	WRT_pool_quiesce_m13(WRT_SESS_m13 *ws)
+{
+	WRT_INT_m13	*wi;
+
+	wi = (WRT_INT_m13 *) ws->chan_state_int;
+	if (wi->pool_active == FALSE_m13)
+		return(TRUE_m13);
+	pthread_mutex_lock_m13(&wi->pool_mutex);
+	wi->pool_paused = TRUE_m13;
+	while (wi->pool_n_running) {  // paused workers cannot POP, so wait on runners only - the queue is
+		pthread_mutex_unlock_m13(&wi->pool_mutex);	// drained here (resume re-sweeps pending channels)
+		nap_m13("500 us");
+		pthread_mutex_lock_m13(&wi->pool_mutex);
+	}
+	while (wi->pool_q_count) {  // un-queue: states back to IDLE (their pending work re-queues at resume)
+		wi->chans[wi->pool_q[wi->pool_q_head]].pool_state = WRT_POOL_IDLE_m13;
+		wi->pool_q_head = (wi->pool_q_head + 1) % ((WRT_SESS_m13 *) ws)->n_chans;
+		--wi->pool_q_count;
+	}
+	pthread_mutex_unlock_m13(&wi->pool_mutex);
+	if (wi->pool_error == TRUE_m13)
+		return(FALSE_m13);
+
+	return(TRUE_m13);
+}
+
+static void	WRT_pool_resume_m13(WRT_SESS_m13 *ws)
+{
+	si4		i;
+	WRT_INT_m13	*wi;
+
+	wi = (WRT_INT_m13 *) ws->chan_state_int;
+	if (wi->pool_active == FALSE_m13)
+		return;
+	pthread_mutex_lock_m13(&wi->pool_mutex);
+	wi->pool_paused = FALSE_m13;
+	for (i = 0; i < ws->n_chans; ++i)
+		if (WRT_pool_pending_m13(wi->chans + i) == TRUE_m13)
+			WRT_pool_enqueue_locked_m13(wi, ws->n_chans, i);
+	pthread_mutex_unlock_m13(&wi->pool_mutex);
+
+	return;
+}
+
+static tern	WRT_pool_start_m13(WRT_SESS_m13 *ws)
+{
+	si4		i;
+	WRT_INT_m13	*wi;
+
+	wi = (WRT_INT_m13 *) ws->chan_state_int;
+	wi->pool_n_workers = ws->options.encode_workers;
+	wi->pool_target_workers = wi->pool_n_workers;
+	wi->pool_workers_cap = globals_m13->tables->HW_params.logical_cores;  // resize ceiling: more workers than cores buys nothing
+	if (wi->pool_workers_cap < wi->pool_n_workers)
+		wi->pool_workers_cap = wi->pool_n_workers;
+	if (*ws->options.worker_affinity)
+		strncpy_m13(wi->worker_affinity_str, ws->options.worker_affinity, sizeof(wi->worker_affinity_str) - 1);
+	else  // EXPLICIT full mask: workers must never inherit the spawning thread's affinity (D31d)
+		sprintf_m13(wi->worker_affinity_str, "0-%d", wi->pool_workers_cap - 1);
+	wi->pool_q = (si4 *) calloc((size_t) ws->n_chans, sizeof(si4));
+	wi->pool_jobs = (PROC_JOB_m13 *) calloc((size_t) wi->pool_workers_cap, sizeof(PROC_JOB_m13));  // FIXED capacity: live workers hold pointers into this array (no realloc)
+	if (wi->pool_q == NULL || wi->pool_jobs == NULL) {
+		G_set_error_m13(E_ALLOC_m13, NULL);
+		return(FALSE_m13);
+	}
+	// D33 stagger: per-worker one-physical affinities (allocation failure is non-fatal - shared mask)
+	wi->worker_aff_strs = (si1 (*)[16]) calloc((size_t) wi->pool_workers_cap, sizeof(*wi->worker_aff_strs));
+	WRT_stagger_workers_m13(wi);
+	pthread_mutex_init_m13(&wi->pool_mutex, NULL);
+	wi->pool_stop = wi->pool_paused = wi->pool_error = wi->roll_request = FALSE_m13;
+	wi->pool_q_head = wi->pool_q_count = wi->pool_n_running = 0;
+	for (i = 0; i < ws->n_chans; ++i) {  // visit quantum: ~100 ms of input (chain) / a block (direct)
+		WRT_CHAN_m13	*cs = wi->chans + i;
+		cs->visit_thresh = (cs->chain_active == TRUE_m13) ? ((si8) (cs->in_fs / (sf8) 10.0) + 1) : (si8) cs->target_block_samples;
+		cs->visit_thresh += (cs->visit_thresh * (si8) i) / ((si8) ws->n_chans * 2);  // D29: spread enqueue times too (+0..50% by index; heuristic only - no output effect)
+		cs->pool_state = WRT_POOL_IDLE_m13;
+		cs->serviced_in_idx = 0;
+		cs->n_events = 0;
+		cs->dist_anchored = FALSE_m13;
+	}
+	for (i = 0; i < wi->pool_n_workers; ++i) {
+		// PROC jobs: named & registered, HIGH priority applied AT SPAWN (Matt: lib distributes the
+		// most useful default policy; the app can re-tune by thread id). HIGH not MAX: the
+		// acquisition catcher outranks the encoders - a lost packet is unrecoverable, a late
+		// block is just latency.
+		wi->pool_jobs[i].name = "WRT_pool_worker";
+		wi->pool_jobs[i].function = WRT_pool_worker_m13;
+		wi->pool_jobs[i].function_arg = (void *) ws;
+		wi->pool_jobs[i].priority = PROC_HIGH_PRIORITY_m13;
+		wi->pool_jobs[i].threaded = TRUE_m13;
+		wi->pool_jobs[i].detached = FALSE_m13;
+		// D31d: explicit - never inherit; D33: this worker's own physical core when topology is known
+		wi->pool_jobs[i].affinity_str = (wi->worker_aff_strs != NULL && wi->worker_aff_strs[i][0]) ? wi->worker_aff_strs[i] : wi->worker_affinity_str;
+		if (PROC_job_launch_m13(wi->pool_jobs + i) == FALSE_m13) {
+			G_set_error_m13(E_GEN_m13, "could not launch pool worker %d", i);
+			return(FALSE_m13);
+		}
+	}
+	wi->pool_active = TRUE_m13;
+
+	return(TRUE_m13);
+}
+
+static void	WRT_pool_stop_m13(WRT_SESS_m13 *ws)
+{
+	WRT_INT_m13	*wi;
+
+	wi = (WRT_INT_m13 *) ws->chan_state_int;
+	if (wi->pool_active == FALSE_m13)
+		return;
+	pthread_mutex_lock_m13(&wi->pool_mutex);
+	wi->pool_stop = TRUE_m13;
+	pthread_mutex_unlock_m13(&wi->pool_mutex);
+	PROC_jobs_wait_m13(wi->pool_jobs, wi->pool_n_workers);
+	pthread_mutex_destroy_m13(&wi->pool_mutex);
+	free((void *) wi->pool_q);
+	free((void *) wi->pool_jobs);
+	free((void *) wi->worker_aff_strs);  // D33 stagger strings (NULL-safe)
+	wi->pool_q = NULL;
+	wi->pool_jobs = NULL;
+	wi->worker_aff_strs = NULL;
+	wi->pool_active = FALSE_m13;
+
+	return;
+}
+
+// the worker's per-channel visit: service to the cursors, honoring boundary events in order
+static tern	WRT_pool_visit_m13(WRT_SESS_m13 *ws, si4 chan_idx)
+{
+	tern		have_ev;
+	si8		target, bound, ev_at, ev_out, ev_time;
+	WRT_INT_m13	*wi;
+	WRT_CHAN_m13	*cs;
+
+	wi = (WRT_INT_m13 *) ws->chan_state_int;
+	cs = wi->chans + chan_idx;
+	while (1) {
+		// ORDER MATTERS: load the cursor FIRST, the event mailbox SECOND. The distributor pushes a
+		// boundary event BEFORE publishing post-boundary samples, so a cursor that includes them
+		// GUARANTEES the event is visible below (the mutex acquire orders it) - reading the mailbox
+		// first admits a window where the worker services across an unseen boundary.
+		if (cs->chain_active == TRUE_m13)
+			target = ACQUIRE_LOAD_m13(cs->ingest_idx);
+		else
+			target = ACQUIRE_LOAD_m13(cs->out_ingest_idx);
+		if (wrt_prof_on > 0) {
+			si8	pt0 = G_current_uutc_m13();
+			pthread_mutex_lock_m13(&wi->pool_mutex);
+			__sync_fetch_and_add(&wrt_prof_mutex_us, G_current_uutc_m13() - pt0);
+		} else {
+			pthread_mutex_lock_m13(&wi->pool_mutex);
+		}
+		have_ev = (cs->n_events > 0) ? TRUE_m13 : FALSE_m13;
+		if (have_ev == TRUE_m13) {
+			ev_at = cs->events[0].at_in_idx;
+			ev_out = cs->events[0].at_out_idx;
+			ev_time = cs->events[0].new_time;
+		}
+		pthread_mutex_unlock_m13(&wi->pool_mutex);
+
+		if (cs->chain_active == TRUE_m13) {
+			bound = (have_ev == TRUE_m13 && ev_at < target) ? ev_at : target;
+			if (bound > cs->serviced_in_idx) {
+				si8	ct0 = (wrt_prof_on > 0) ? G_current_uutc_m13() : 0;
+				if (WRT_chain_service_m13(ws, chan_idx, bound) == FALSE_m13)
+					return(FALSE_m13);
+				if (wrt_prof_on > 0)
+					__sync_fetch_and_add(&wrt_prof_chain_us, G_current_uutc_m13() - ct0);
+				cs->serviced_in_idx = bound;
+			}
+			if (have_ev == TRUE_m13 && cs->serviced_in_idx >= ev_at) {
+				// boundary reached: flush the closing continuity & re-anchor for the next
+				if (WRT_chain_flush_m13(ws, chan_idx, ev_at) == FALSE_m13)
+					return(FALSE_m13);
+				if (WRT_emit_pending_m13(ws, chan_idx, TRUE_m13) == FALSE_m13)
+					return(FALSE_m13);
+				cs->pending_discont = TRUE_m13;
+				cs->dec_phase_reset = TRUE_m13;
+				cs->reset_at_idx = ev_at;
+				cs->anchor_time = ev_time;
+				cs->anchor_out_idx = cs->out_ingest_idx;
+				cs->in_anchor_idx = ev_at;
+				cs->block_samples = (cs->options.initial_block_samples && cs->options.initial_block_samples < cs->target_block_samples) ? cs->options.initial_block_samples : cs->target_block_samples;  // D12 re-arm
+				pthread_mutex_lock_m13(&wi->pool_mutex);
+				--cs->n_events;
+				memmove((void *) cs->events, (void *) (cs->events + 1), (size_t) cs->n_events * sizeof(cs->events[0]));
+				pthread_mutex_unlock_m13(&wi->pool_mutex);
+				continue;  // service the new continuity
+			}
+			RELEASE_STORE_m13(cs->retain_from, WRT_chain_retain_m13(cs));
+		} else {  // direct: emit is the whole visit
+			bound = (have_ev == TRUE_m13 && ev_out < target) ? ev_out : target;
+			cs->avail_out_idx = bound;
+			while ((cs->avail_out_idx - cs->encoded_idx) >= (si8) cs->block_samples)
+				if (WRT_emit_block_m13(ws, chan_idx) == FALSE_m13)
+					return(FALSE_m13);
+			if (have_ev == TRUE_m13 && bound == ev_out) {
+				if (WRT_emit_pending_m13(ws, chan_idx, TRUE_m13) == FALSE_m13)  // partial final (avail bound == the event)
+					return(FALSE_m13);
+				cs->pending_discont = TRUE_m13;
+				cs->anchor_time = ev_time;
+				cs->anchor_out_idx = ev_out;
+				cs->block_samples = (cs->options.initial_block_samples && cs->options.initial_block_samples < cs->target_block_samples) ? cs->options.initial_block_samples : cs->target_block_samples;  // D12 re-arm
+				pthread_mutex_lock_m13(&wi->pool_mutex);
+				--cs->n_events;
+				memmove((void *) cs->events, (void *) (cs->events + 1), (size_t) cs->n_events * sizeof(cs->events[0]));
+				pthread_mutex_unlock_m13(&wi->pool_mutex);
+				continue;
+			}
+		}
+		break;
+	}
+
+	// AUTO segmenting: request only - the distributor executes the roll barriered (all channels)
+	if (ws->options.segmenting_mode == WRT_SEG_AUTO_m13 && ws->options.auto_segment_hours > (sf8) 0.0)
+		if (cs->seg_first_time != TIME_NO_ENTRY_m13 && (cs->seg_end_time - cs->seg_first_time) >= (si8) (ws->options.auto_segment_hours * (sf8) 3600e6))
+			wi->roll_request = TRUE_m13;
+
+	return(TRUE_m13);
+}
+
+static pthread_rval_m13	WRT_pool_worker_m13(void *arg)
+{
+	tern		ok;
+	si4		chan_idx, n_chans;
+	WRT_SESS_m13	*ws;
+	WRT_INT_m13	*wi;
+	WRT_CHAN_m13	*cs;
+
+	ws = (WRT_SESS_m13 *) ((PROC_JOB_m13 *) arg)->function_arg;  // PROC job convention: the JOB struct arrives; the input rides function_arg
+	wi = (WRT_INT_m13 *) ws->chan_state_int;
+	n_chans = ws->n_chans;
+	while (1) {
+		pthread_mutex_lock_m13(&wi->pool_mutex);
+		if (wi->pool_stop == TRUE_m13) {
+			pthread_mutex_unlock_m13(&wi->pool_mutex);
+			break;
+		}
+		if ((si4) ((PROC_JOB_m13 *) arg - wi->pool_jobs) >= wi->pool_target_workers) {  // D31b resize: shrink exits by index, current visit already complete
+			pthread_mutex_unlock_m13(&wi->pool_mutex);
+			break;
+		}
+		if (wi->pool_paused == TRUE_m13 || wi->pool_q_count == 0) {
+			pthread_mutex_unlock_m13(&wi->pool_mutex);
+			nap_m13("500 us");  // nap-poll (codebase idiom; no missed-wakeup class)
+			continue;
+		}
+		chan_idx = wi->pool_q[wi->pool_q_head];
+		wi->pool_q_head = (wi->pool_q_head + 1) % n_chans;
+		--wi->pool_q_count;
+		cs = wi->chans + chan_idx;
+		cs->pool_state = WRT_POOL_RUNNING_m13;
+		++wi->pool_n_running;
+		pthread_mutex_unlock_m13(&wi->pool_mutex);
+
+		{	// D27: per-visit cost (EWMA + decaying peak - the throttle budgets on bursts)
+			si8	t0 = G_current_uutc_m13();
+			sf8	cost;
+
+			if (wrt_prof_on < 0)  // SCAFFOLD init (benign race: all writers store the same value)
+				wrt_prof_on = (getenv("WRT_VISIT_PROF") != NULL) ? 1 : 0;
+			ok = WRT_pool_visit_m13(ws, chan_idx);
+			cost = (sf8) (G_current_uutc_m13() - t0);
+			cs->visit_cost_ewma_us = (cs->visit_count == 0) ? cost : ((cs->visit_cost_ewma_us * (sf8) 0.95) + (cost * (sf8) 0.05));
+			cs->visit_cost_peak_us *= (sf8) 0.999;
+			if (cost > cs->visit_cost_peak_us)
+				cs->visit_cost_peak_us = cost;
+			++cs->visit_count;
+			if (wrt_prof_on > 0) {	// SCAFFOLD aggregates + periodic dump
+				si8	v = __sync_add_and_fetch(&wrt_prof_visits, (si8) 1);
+				__sync_fetch_and_add(&wrt_prof_visit_us, (si8) cost);
+				if ((v % 512) == 0) {
+					si8	vis = wrt_prof_visit_us, mtx = wrt_prof_mutex_us, chn = wrt_prof_chain_us;
+					si8	enc = wrt_prof_encode_us, wrt = wrt_prof_write_us, em = wrt_prof_emits;
+					fprintf(stderr, "[prof] visits %ld  avg %.0f us  (mutex %.0f, chain %.0f, encode %.0f, write %.0f, other %.0f)  emits %ld (enc %.1f ms, wr %.1f ms per emit)\n",
+						(long) v, (sf8) vis / (sf8) v, (sf8) mtx / (sf8) v, (sf8) chn / (sf8) v,
+						(sf8) enc / (sf8) v, (sf8) wrt / (sf8) v,
+						(sf8) (vis - mtx - chn - enc - wrt) / (sf8) v, (long) em,
+						em ? (sf8) enc / ((sf8) em * (sf8) 1e3) : (sf8) 0.0, em ? (sf8) wrt / ((sf8) em * (sf8) 1e3) : (sf8) 0.0);
+				}
+			}
+		}
+
+		pthread_mutex_lock_m13(&wi->pool_mutex);
+		--wi->pool_n_running;
+		cs->pool_state = WRT_POOL_IDLE_m13;
+		if (ok == FALSE_m13)
+			wi->pool_error = TRUE_m13;  // error stored by the failing call; distributor surfaces it
+		else if (wi->pool_paused == FALSE_m13 && WRT_pool_pending_m13(cs) == TRUE_m13)
+			WRT_pool_enqueue_locked_m13(wi, n_chans, chan_idx);
+		pthread_mutex_unlock_m13(&wi->pool_mutex);
+	}
+
+	return((pthread_rval_m13) 0);
+}
+
+static tern	WRT_record_ctl_m13(WRT_SESS_m13 *ws, struct REC_WRITE_m13 *req_tagged)
+{
+	REC_WRITE_m13	*req = (REC_WRITE_m13 *) req_tagged;
+	// D4: append a record to the SESSION-level record files via the generic medrec writer
+	// (REC_write_m13() - Matt's class pattern). Encryption level defaults to the session option
+	// when the request leaves it 0. Control-thread operation: pool mode drains first (the record
+	// lands between blocks, at a consistent point in every channel's stream).
+	tern	ret;
+
+	if (ws == NULL || req == NULL) {
+		G_set_error_m13(E_GEN_m13, "bad arguments");
+		return(FALSE_m13);
+	}
+	if (ws->writing_started == FALSE_m13) {
+		G_set_error_m13(E_GEN_m13, "no session files yet: records can be written once writing has started");
+		return(FALSE_m13);
+	}
+	if (ws->sess->rec_data_fps == NULL || ws->sess->rec_inds_fps == NULL) {
+		G_set_error_m13(E_GEN_m13, "session records are not enabled (options.session_records)");
+		return(FALSE_m13);
+	}
+	if (WRT_pool_drain_m13(ws) == FALSE_m13)
+		return(FALSE_m13);
+	if (req->encryption_level == 0 && ws->options.record_encryption_level > 0)
+		req->encryption_level = ws->options.record_encryption_level;
+	ret = REC_write_m13(ws->sess->rec_data_fps, ws->sess->rec_inds_fps, req);
+	WRT_pool_resume_m13(ws);
+
+	return(ret);
+}
+
+tern	WRT_record_m13(WRT_SESS_m13 *ws, struct REC_WRITE_m13 *req_tagged)
+{
+	tern	ret;
+
+	if (ws == NULL || req_tagged == NULL) {
+		G_set_error_m13(E_GEN_m13, "bad arguments");
+		return(FALSE_m13);
+	}
+
+	WRT_control_lock_m13(ws);
+	ret = WRT_record_ctl_m13(ws, req_tagged);
+	WRT_control_unlock_m13(ws);
+
+	return(ret);
+}
+
+
+
+tern	WRT_samples_sf8_m13(WRT_SESS_m13 *ws, si4 chan_idx, sf8 *samps, si8 n_samps, si8 start_time)
+{
+	// D13: physical-units input, quantized by amplitude_units_conversion_factor (stored = units / factor;
+	// factor NO_ENTRY => 1.0). Auto-ranging (choosing a factor from the data) is a binding-level nicety.
+	si4		*si4_buf;
+	si8		i;
+	sf8		factor, val;
+	tern		ret;
+	WRT_CHAN_m13	*cs;
+
+	if (ws == NULL || samps == NULL || n_samps < 1 || chan_idx < 0 || chan_idx >= ws->n_chans) {
+		G_set_error_m13(E_GEN_m13, "bad arguments");
+		return(FALSE_m13);
+	}
+	cs = WRT_INT_m13(ws)->chans + chan_idx;
+	factor = cs->metadata.time_series_section_2.amplitude_units_conversion_factor;
+	if (factor == (sf8) TS_METADATA_AMPLITUDE_UNITS_CONVERSION_FACTOR_NO_ENTRY_m13)
+		factor = (sf8) 1.0;
+	si4_buf = (si4 *) malloc((size_t) n_samps * sizeof(si4));
+	if (si4_buf == NULL) {
+		G_set_error_m13(E_ALLOC_m13, NULL);
+		return(FALSE_m13);
+	}
+	for (i = 0; i < n_samps; ++i) {
+		val = samps[i] / factor;
+		si4_buf[i] = (si4) ((val < (sf8) 0.0) ? (val - (sf8) 0.5) : (val + (sf8) 0.5));
+	}
+	ret = WRT_samples_m13(ws, chan_idx, si4_buf, n_samps, start_time);
+	free(si4_buf);
+
+	return(ret);
+}
+
+
+tern	WRT_session_sf8_m13(const si1 *sess_path, sf8 **samples, si4 n_chans, si8 n_samps, sf8 sampling_frequency,
+			      si1 **chan_names, METADATA_m13 *md, WRT_OPTIONS_m13 *opt)
+{
+	// D13: the Python/MATLAB-native path - float arrays in NATIVE UNITS (Matt, 2026-08-10: MED's
+	// default scale is microvolts & microseconds; the units fields exist so other scales - picoseconds
+	// etc. - remain expressible). If the template supplies no amplitude conversion factor, AUTO-RANGE:
+	// factor = tidy decade >= max|value| / 2^30 (half-range headroom) - sub-unit resolution is
+	// PRESERVED IN THE FILE (reconstruction: units = stored * factor). NOTE the read-side contract:
+	// default readers CONVERT_TO_NATIVE_UNITS in the si4 buffer (skipped when factor == 1.0), i.e.
+	// they get INTEGER native units; full resolution comes back via sf8/matrix reads.
+	si4			i;
+	si8			j;
+	sf8			max_abs, v, raw_factor, factor;
+	METADATA_m13		md_l;
+	WRT_OPTIONS_m13	opt_l;
+	WRT_SESS_m13	*ws;
+
+	if (samples == NULL || n_chans < 1 || n_samps < 1) {
+		G_set_error_m13(E_GEN_m13, "bad arguments");
+		return(FALSE_m13);
+	}
+	if (md != NULL)
+		md_l = *md;
+	else
+		WRT_metadata_defaults_m13(&md_l);
+	if (opt != NULL) {
+		opt_l = *opt;
+	} else {
+		WRT_options_defaults_m13(&opt_l);
+		opt_l.time_mode = WRT_TIME_OUTC_m13;
+		opt_l.session_start_time = 0;
+	}
+	if (sampling_frequency > (sf8) 0.0)
+		md_l.time_series_section_2.sampling_frequency = sampling_frequency;
+
+	if (md_l.time_series_section_2.amplitude_units_conversion_factor == (sf8) TS_METADATA_AMPLITUDE_UNITS_CONVERSION_FACTOR_NO_ENTRY_m13) {
+		max_abs = (sf8) 0.0;
+		for (i = 0; i < n_chans; ++i) {
+			for (j = 0; j < n_samps; ++j) {
+				v = samples[i][j];
+				if (v < (sf8) 0.0)
+					v = -v;
+				if (v > max_abs)
+					max_abs = v;
+			}
+		}
+		factor = (sf8) 1.0;
+		if (max_abs > (sf8) 0.0) {
+			raw_factor = max_abs / (sf8) 1073741824.0;  // 2^30
+			factor = pow((sf8) 10.0, ceil(log10(raw_factor)));  // tidy decade >= raw
+		}
+		md_l.time_series_section_2.amplitude_units_conversion_factor = factor;
+	}
+
+	ws = WRT_create_session_m13(sess_path, &md_l, &opt_l);
+	if (ws == NULL)
+		return(FALSE_m13);
+	for (i = 0; i < n_chans; ++i) {
+		if (WRT_add_ts_channel_m13(ws, (chan_names != NULL) ? chan_names[i] : NULL, NULL, NULL) < 0) {
+			WRT_close_session_m13(ws);
+			return(FALSE_m13);
+		}
+	}
+	for (i = 0; i < n_chans; ++i) {
+		if (WRT_samples_sf8_m13(ws, i, samples[i], n_samps, TIME_NO_ENTRY_m13) == FALSE_m13) {
+			WRT_close_session_m13(ws);
+			return(FALSE_m13);
+		}
+	}
+
+	return(WRT_close_session_m13(ws));
+}
+
+
+tern	WRT_set_antialias_filter_m13(WRT_SESS_m13 *ws, si4 chan_idx, tern on)
+{
+	// D24: some labs use the SHARPNESS of stimulation artifacts as a trigger & want antialiasing OFF
+	// during those stretches of a decimated recording (aliasing accepted - their data, their call).
+	// Decimating channels only: the antialias filter exists for decimation. Same boundary procedure.
+	si4		i, lo, hi;
+	WRT_INT_m13	*wi;
+	WRT_CHAN_m13	*cs;
+
+	if (ws == NULL) {
+		G_set_error_m13(E_GEN_m13, "NULL write session");
+		return(FALSE_m13);
+	}
+	if (ws->writing_started == FALSE_m13) {
+		if (chan_idx == CHANNEL_NUMBER_ALL_CHANNELS_m13)
+			ws->options.antialias_filter = on;
+		if (ws->chan_state_int != NULL) {
+			wi = (WRT_INT_m13 *) ws->chan_state_int;
+			lo = (chan_idx == CHANNEL_NUMBER_ALL_CHANNELS_m13) ? 0 : chan_idx;
+			hi = (chan_idx == CHANNEL_NUMBER_ALL_CHANNELS_m13) ? ws->n_chans - 1 : chan_idx;
+			for (i = lo; i <= hi && i < ws->n_chans; ++i)
+				wi->chans[i].options.antialias_filter = on;
+		}
+		return(TRUE_m13);
+	}
+	wi = (WRT_INT_m13 *) ws->chan_state_int;
+	lo = (chan_idx == CHANNEL_NUMBER_ALL_CHANNELS_m13) ? 0 : chan_idx;
+	hi = (chan_idx == CHANNEL_NUMBER_ALL_CHANNELS_m13) ? ws->n_chans - 1 : chan_idx;
+	if (lo < 0 || hi >= ws->n_chans) {
+		G_set_error_m13(E_GEN_m13, "bad channel index");
+		return(FALSE_m13);
+	}
+	if (WRT_pool_drain_m13(ws) == FALSE_m13)  // D26: single-threaded op; drain finishes pending visits & boundary events first
+		return(FALSE_m13);
+	for (i = lo; i <= hi; ++i) {
+		cs = wi->chans + i;
+		if (cs->decimating == FALSE_m13) {
+			if (chan_idx != CHANNEL_NUMBER_ALL_CHANNELS_m13) {  // explicit request on a non-decimating channel: error; ALL: skip quietly
+				G_set_error_m13(E_GEN_m13, "channel \"%s\": the antialias filter applies to decimating channels", cs->name);
+				return(FALSE_m13);
+			}
+			continue;
+		}
+		if ((cs->aa_active == TRUE_m13) == (on == TRUE_m13))
+			continue;
+		if (WRT_toggle_boundary_m13(ws, i) == FALSE_m13)
+			return(FALSE_m13);
+		if (on == TRUE_m13) {
+			cs->aa_headed = FALSE_m13;  // head restart (filtps pre-built at config - D24)
+			cs->aa_fed_idx = cs->aa_finished_idx = cs->ingest_idx;
+			cs->aa_active = TRUE_m13;
+		} else {
+			cs->aa_active = FALSE_m13;  // tail already drained by the boundary
+		}
+	}
+	WRT_pool_resume_m13(ws);
+
+	return(TRUE_m13);
+}
+
+
+tern	WRT_set_block_callback_m13(WRT_SESS_m13 *ws, MED_write_block_callback_m13 fn, void *user_data)
+{
+	// PLAN (D11c): store fn/user_data in handle internals; write path invokes after each block's
+	// index/aggregate/write step, on the writing thread (deep apps wanting async fan-out do it in
+	// their callback). NULL fn clears.
+
+	G_set_error_m13(E_GEN_m13, "WRT_set_block_callback_m13() is not yet implemented (design phase)");
+	return(FALSE_m13);
+}
+
+
+static tern	WRT_set_codec_ctl_m13(WRT_SESS_m13 *ws, si4 chan_idx, ui4 codec)
+{
+	// D28: mid-recording codec switch - the throttle ladder's VDS->PRED2 rung (& back on recovery).
+	// The toggle-boundary machinery closes the current block SHORT so no block mixes codecs; the
+	// switch is recorded per block by the block header algorithm bits (self-describing - readers
+	// need nothing). Pool mode drains first (control-thread op, same as the filter toggles).
+	si4		i, lo, hi;
+	CPS_m13		*cps;
+	WRT_INT_m13	*wi;
+	WRT_CHAN_m13	*cs;
+
+	if (ws == NULL) {
+		G_set_error_m13(E_GEN_m13, "NULL write session");
+		return(FALSE_m13);
+	}
+	if ((codec & CPS_DF_ALGORITHM_MASK_m13) != codec || codec == 0) {
+		G_set_error_m13(E_GEN_m13, "not a codec directive (pass a CPS_DF_*_ALGORITHM_m13 value)");
+		return(FALSE_m13);
+	}
+	if (ws->writing_started == FALSE_m13) {  // pre-write: it is just the option
+		if (chan_idx == CHANNEL_NUMBER_ALL_CHANNELS_m13)
+			ws->options.codec = codec;
+		if (ws->chan_state_int != NULL) {
+			wi = (WRT_INT_m13 *) ws->chan_state_int;
+			lo = (chan_idx == CHANNEL_NUMBER_ALL_CHANNELS_m13) ? 0 : chan_idx;
+			hi = (chan_idx == CHANNEL_NUMBER_ALL_CHANNELS_m13) ? ws->n_chans - 1 : chan_idx;
+			for (i = lo; i <= hi && i < ws->n_chans; ++i)
+				wi->chans[i].options.codec = codec;
+		}
+		return(TRUE_m13);
+	}
+	wi = (WRT_INT_m13 *) ws->chan_state_int;
+	lo = (chan_idx == CHANNEL_NUMBER_ALL_CHANNELS_m13) ? 0 : chan_idx;
+	hi = (chan_idx == CHANNEL_NUMBER_ALL_CHANNELS_m13) ? ws->n_chans - 1 : chan_idx;
+	if (lo < 0 || hi >= ws->n_chans) {
+		G_set_error_m13(E_GEN_m13, "bad channel index");
+		return(FALSE_m13);
+	}
+	if (WRT_pool_drain_m13(ws) == FALSE_m13)
+		return(FALSE_m13);
+	for (i = lo; i <= hi; ++i) {
+		cs = wi->chans + i;
+		if (cs->options.codec == codec)
+			continue;  // already there
+		if (WRT_toggle_boundary_m13(ws, i) == FALSE_m13)  // close the current block short: no mixed-codec blocks
+			return(FALSE_m13);
+		cs->options.codec = codec;
+		cps = ws->sess->ts_chans[i]->segs[0]->ts_data_fps->params.cps;
+		cps->direcs.flags = (cps->direcs.flags & ~CPS_DF_ALGORITHM_MASK_m13) | codec;
+		// family bookkeeping: a flat RED-native CPS moving to the PRED family retires its flat
+		// buffers FIRST - the PRED 2D's row 0 becomes the RED side thereafter (the dual-side
+		// convention), so keeping them would just leak
+		if ((codec & (CPS_DF_PRED1_ALGORITHM_m13 | CPS_DF_PRED2_ALGORITHM_m13 | CPS_DF_VDS_ALGORITHM_m13 | CPS_DF_SRRED_ALGORITHM_m13)) && cps->params.PRED_base_count == NULL && cps->params.count != NULL) {
+			free_m13(cps->params.count);		cps->params.count = NULL;
+			free_m13(cps->params.sorted_count);	cps->params.sorted_count = NULL;
+			free_m13(cps->params.symbol_map);	cps->params.symbol_map = NULL;
+			free_m13(cps->params.cumulative_count);	cps->params.cumulative_count = NULL;
+			free_m13(cps->params.minimum_range);	cps->params.minimum_range = NULL;
+		}
+		if (CMP_fit_CPS_scratch_m13(cps, CMP_COMPRESSION_MODE_m13, cs->target_block_samples) == FALSE_m13) {  // the new family's buffers (idempotent; encode does not re-fit)
+			G_set_error_m13(E_ALLOC_m13, "could not fit scratch for the new codec");
+			return(FALSE_m13);
+		}
+		// hold the side the new family expects: the RED2/PRED2 encoders assume their own side is
+		// CURRENT for the whole encode (differentiate's estimate swap restores to the entry state,
+		// & a native CPS makes that a no-op). A dual-side CPS running the WRONG side writes flat
+		// counts over the 2D pointer table (the D28 lesson - garbage row pointers, SIGBUS next block).
+		if (cps->params.PRED_base_count != NULL)
+			CMP_swap_RED_PRED_m13(cps, (codec & (CPS_DF_RED1_ALGORITHM_m13 | CPS_DF_RED2_ALGORITHM_m13 | CPS_DF_SSE_ALGORITHM_m13)) ? CMP_PRED_TO_RED_m13 : CMP_RED_TO_PRED_m13);
+	}
+	WRT_pool_resume_m13(ws);
+
+	return(TRUE_m13);
+}
+
+
+tern	WRT_set_codec_m13(WRT_SESS_m13 *ws, si4 chan_idx, ui4 codec)
+{
+	tern	ret;
+
+	if (ws == NULL) {
+		G_set_error_m13(E_GEN_m13, "NULL write session");
+		return(FALSE_m13);
+	}
+	WRT_control_lock_m13(ws);
+	ret = WRT_set_codec_ctl_m13(ws, chan_idx, codec);
+	WRT_control_unlock_m13(ws);
+
+	return(ret);
+}
+
+
+static tern	WRT_set_encode_workers_ctl_m13(WRT_SESS_m13 *ws, si4 n_workers)
+{
+	// D31b: live pool resize - the CPU-reclamation actuator (fused with the display rung: pausing
+	// the display idles its reserved cores; hand them to the pool). GROW launches fresh PROC jobs
+	// into vacated/unused slots of the fixed-capacity jobs array (live workers hold pointers into
+	// it - never realloc). SHRINK sets the target; workers with index >= target exit at their next
+	// loop top (current visit always completes), & the exited jobs are joined here. Safe live:
+	// no drain required - the ready-queue & cursors are untouched by worker count.
+	si4		i, old_n;
+	WRT_INT_m13	*wi;
+
+	if (ws == NULL) {
+		G_set_error_m13(E_GEN_m13, "NULL write session");
+		return(FALSE_m13);
+	}
+	wi = (WRT_INT_m13 *) ws->chan_state_int;
+	if (wi == NULL || wi->pool_active == FALSE_m13) {  // pre-start (or caller mode): config only
+		if (n_workers < 0) {
+			G_set_error_m13(E_GEN_m13, "bad worker count");
+			return(FALSE_m13);
+		}
+		ws->options.encode_workers = n_workers;
+		return(TRUE_m13);
+	}
+	if (n_workers < 1 || n_workers > wi->pool_workers_cap) {  // live pool: cannot drop to caller mode or exceed capacity
+		G_set_error_m13(E_GEN_m13, "worker count must be in [1, %d] on a live pool", wi->pool_workers_cap);
+		return(FALSE_m13);
+	}
+	old_n = wi->pool_n_workers;
+	if (n_workers == old_n)
+		return(TRUE_m13);
+
+	if (n_workers < old_n) {  // shrink: exits happen at loop tops; join the vacated slots
+		pthread_mutex_lock_m13(&wi->pool_mutex);
+		wi->pool_target_workers = n_workers;
+		pthread_mutex_unlock_m13(&wi->pool_mutex);
+		PROC_jobs_wait_m13(wi->pool_jobs + n_workers, old_n - n_workers);
+	} else {  // grow: fresh jobs into slots [old_n, n_workers)
+		pthread_mutex_lock_m13(&wi->pool_mutex);
+		wi->pool_target_workers = n_workers;
+		pthread_mutex_unlock_m13(&wi->pool_mutex);
+		for (i = old_n; i < n_workers; ++i) {
+			memset((void *) (wi->pool_jobs + i), 0, sizeof(PROC_JOB_m13));
+			wi->pool_jobs[i].name = "WRT_pool_worker";
+			wi->pool_jobs[i].function = WRT_pool_worker_m13;
+			wi->pool_jobs[i].function_arg = (void *) ws;
+			wi->pool_jobs[i].priority = PROC_HIGH_PRIORITY_m13;
+			wi->pool_jobs[i].threaded = TRUE_m13;
+			wi->pool_jobs[i].detached = FALSE_m13;
+			// D31d: explicit - never inherit; D33: the slot's own physical core when topology is known
+			wi->pool_jobs[i].affinity_str = (wi->worker_aff_strs != NULL && wi->worker_aff_strs[i][0]) ? wi->worker_aff_strs[i] : wi->worker_affinity_str;
+			if (PROC_job_launch_m13(wi->pool_jobs + i) == FALSE_m13) {
+				G_set_error_m13(E_GEN_m13, "could not launch pool worker %d", i);
+				pthread_mutex_lock_m13(&wi->pool_mutex);
+				wi->pool_target_workers = i;  // partial growth: settle at what launched
+				pthread_mutex_unlock_m13(&wi->pool_mutex);
+				wi->pool_n_workers = ws->options.encode_workers = i;
+				return(FALSE_m13);
+			}
+		}
+	}
+	wi->pool_n_workers = ws->options.encode_workers = n_workers;
+
+	return(TRUE_m13);
+}
+
+
+tern	WRT_set_encode_workers_m13(WRT_SESS_m13 *ws, si4 n_workers)
+{
+	tern	ret;
+
+	if (ws == NULL) {
+		G_set_error_m13(E_GEN_m13, "NULL write session");
+		return(FALSE_m13);
+	}
+	WRT_control_lock_m13(ws);
+	ret = WRT_set_encode_workers_ctl_m13(ws, n_workers);
+	WRT_control_unlock_m13(ws);
+
+	return(ret);
+}
+
+
+tern	WRT_set_line_noise_filter_m13(WRT_SESS_m13 *ws, si4 chan_idx, tern on)
+{
+	// D24: on/off during recording. OFF: LNF tail-drains at a short-block boundary, goes dormant,
+	// the directive clears (new blocks unflagged, deposits stop). ON: head restart at the boundary,
+	// directive set. Control-thread operation (touches block boundaries): quiesce writers first.
+	si4		i, lo, hi;
+	CPS_m13		*cps;
+	WRT_INT_m13	*wi;
+	WRT_CHAN_m13	*cs;
+
+	if (ws == NULL) {
+		G_set_error_m13(E_GEN_m13, "NULL write session");
+		return(FALSE_m13);
+	}
+	if (ws->writing_started == FALSE_m13) {  // pre-write: it is just the option
+		if (chan_idx == CHANNEL_NUMBER_ALL_CHANNELS_m13)
+			ws->options.line_noise_filter = on;
+		if (ws->chan_state_int != NULL) {
+			wi = (WRT_INT_m13 *) ws->chan_state_int;
+			lo = (chan_idx == CHANNEL_NUMBER_ALL_CHANNELS_m13) ? 0 : chan_idx;
+			hi = (chan_idx == CHANNEL_NUMBER_ALL_CHANNELS_m13) ? ws->n_chans - 1 : chan_idx;
+			for (i = lo; i <= hi && i < ws->n_chans; ++i)
+				wi->chans[i].options.line_noise_filter = on;
+		}
+		return(TRUE_m13);
+	}
+	wi = (WRT_INT_m13 *) ws->chan_state_int;
+	lo = (chan_idx == CHANNEL_NUMBER_ALL_CHANNELS_m13) ? 0 : chan_idx;
+	hi = (chan_idx == CHANNEL_NUMBER_ALL_CHANNELS_m13) ? ws->n_chans - 1 : chan_idx;
+	if (lo < 0 || hi >= ws->n_chans) {
+		G_set_error_m13(E_GEN_m13, "bad channel index");
+		return(FALSE_m13);
+	}
+	if (WRT_pool_drain_m13(ws) == FALSE_m13)  // D26: single-threaded op; drain finishes pending visits & boundary events first
+		return(FALSE_m13);
+	for (i = lo; i <= hi; ++i) {
+		cs = wi->chans + i;
+		if ((cs->lnf_active == TRUE_m13) == (on == TRUE_m13))
+			continue;  // already in the requested state
+		if (WRT_toggle_boundary_m13(ws, i) == FALSE_m13)
+			return(FALSE_m13);
+		cps = ws->sess->ts_chans[i]->segs[0]->ts_data_fps->params.cps;
+		if (on == TRUE_m13) {
+			if (cs->lnf_y == NULL) {  // lazy configuration (LNF was off at start)
+				cs->lnf_line_freq = cs->metadata.time_series_section_2.power_line_frequency;
+				if (cs->lnf_line_freq == (sf8) RATE_NO_ENTRY_m13 || cs->lnf_line_freq <= (sf8) 0.0) {
+					G_set_error_m13(E_GEN_m13, "channel \"%s\": the line noise filter needs power_line_frequency in the metadata", cs->name);
+					return(FALSE_m13);
+				}
+				cs->lnf_margin = (si8) (cs->in_fs + (sf8) 0.5);
+				cs->lnf_hop = cs->lnf_margin;
+				cs->lnf_first_span = cs->lnf_next_span = cs->lnf_hop;  // D29 stagger re-applied below
+				cs->lnf_y = (sf8 *) malloc((size_t) (3 * cs->lnf_margin + 16) * sizeof(sf8));
+				cs->lnf_fy = (sf8 *) malloc((size_t) (3 * cs->lnf_margin + 16) * sizeof(sf8));
+				cs->lnf_save = (sf8 *) malloc((size_t) cs->lnf_margin * sizeof(sf8));
+				if (cs->lnf_y == NULL || cs->lnf_fy == NULL || cs->lnf_save == NULL) {
+					G_set_error_m13(E_ALLOC_m13, NULL);
+					return(FALSE_m13);
+				}
+			}
+			if (WRT_engage_chain_m13(cs) == FALSE_m13)  // si4-direct channel: chain starts here
+				return(FALSE_m13);
+			cs->lnf_save_len = 0;  // head state
+			cs->lnf_start_idx = cs->lnf_finished_idx = cs->ingest_idx;
+			cs->lnf_score_byte = CMP_NS_NO_ENTRY_m13;
+			cs->lnf_active = TRUE_m13;
+			cps->direcs.flags |= CPS_DF_LINE_NOISE_FILTERED_m13;
+		} else {
+			cs->lnf_active = FALSE_m13;  // tail already drained by the boundary
+			cs->lnf_score_byte = CMP_NS_NO_ENTRY_m13;
+			cps->direcs.flags &= ~CPS_DF_LINE_NOISE_FILTERED_m13;
+			if (cs->decimating == FALSE_m13 && cs->aa_active == FALSE_m13)
+				cs->chain_active = FALSE_m13;  // si4-direct resumes (ring kept for a later toggle-on)
+		}
+	}
+
+	WRT_pool_resume_m13(ws);
+	return(TRUE_m13);
+}
+
+
+tern	WRT_set_VDS_goal_attempts_m13(WRT_SESS_m13 *ws, si4 chan_idx, si4 attempts)
+{
+	// D28: cap VDS anchor-refinement rounds live - the CHEAP throttle half-step (keeps VDS, bounds
+	// its cost) before a full PRED2 switch. 0 restores the library default. Read per block by the
+	// encoder, so a drain barrier is all the synchronization needed.
+	si4		i, lo, hi;
+	CPS_m13		*cps;
+
+	if (ws == NULL) {
+		G_set_error_m13(E_GEN_m13, "NULL write session");
+		return(FALSE_m13);
+	}
+	if (ws->writing_started == FALSE_m13)
+		return(TRUE_m13);  // nothing live to cap (per-channel option carries no default override pre-write)
+	lo = (chan_idx == CHANNEL_NUMBER_ALL_CHANNELS_m13) ? 0 : chan_idx;
+	hi = (chan_idx == CHANNEL_NUMBER_ALL_CHANNELS_m13) ? ws->n_chans - 1 : chan_idx;
+	if (lo < 0 || hi >= ws->n_chans) {
+		G_set_error_m13(E_GEN_m13, "bad channel index");
+		return(FALSE_m13);
+	}
+	if (WRT_pool_drain_m13(ws) == FALSE_m13)
+		return(FALSE_m13);
+	for (i = lo; i <= hi; ++i) {
+		cps = ws->sess->ts_chans[i]->segs[0]->ts_data_fps->params.cps;
+		if (attempts > 0)
+			cps->params.VDS_goal_attempts = attempts;
+		else
+			cps->params.VDS_goal_attempts = CPS_PARAMS_VDS_GOAL_ATTEMPTS_DEFAULT_m13;
+	}
+	WRT_pool_resume_m13(ws);
+
+	return(TRUE_m13);
+}
+
+
+tern	WRT_spread_block_phases_m13(WRT_SESS_m13 *ws)
+{
+	// PLAN (D12 convenience, optional): group channels by steady-state block size; within each group of
+	// N, set channel k's initial_block_samples = round(full * k/N), decimation-aware in the input
+	// domain (the DHN_Acq MED_setup() computation). Refuse after writing has started.
+
+	G_set_error_m13(E_GEN_m13, "WRT_spread_block_phases_m13() is not yet implemented (design phase)");
+	return(FALSE_m13);
+}
+
+
+// D33 (2026-08-17): one-worker-one-PHYSICAL-core staggering. The shared-mask pool let the scheduler
+// place workers freely; measured under the 512-channel stress load, transient co-residency (two
+// workers time-sharing one boosted P-core logical, peak 62% busy) drove die-spot peaks of 96-100C
+// (TjMax) at only ~5 cores of aggregate work - tripping the throttle machinery on a passively
+// cooled box. Giving each worker its OWN physical core removes worker-vs-worker preemption during
+// block emits, keeps each worker's chain/CPS state warm in its physical's cache (no migrations),
+// & spreads heat structurally. E-cores are assigned FIRST: measured, they absorb the same steady
+// work ~10C cooler at peak than boosting P-cores, & the P-cores stay in reserve for latency bursts
+// (rolls, scans, display reclaim). A worker's affinity is its physical's LOGICALS (both SMT
+// siblings) - "this physical is yours", the kernel picks the lane; runtime load balancing is the
+// ready-queue's job (work flows to whoever pulls), so no busy-checks belong here. Unknown topology
+// (physical_core_ids[0] < 0: macOS/Windows, sysfs failure) leaves every entry empty & the jobs
+// fall back to the shared encode-set mask - exactly the prior behavior.
+// TODO (Matt): temp-RANKED start order (coolest P-physicals first) needs an app->lib plumb - the
+// app reads hwmon; the library places workers. WRT_OPTIONS candidate.
+static void	WRT_stagger_workers_m13(WRT_INT_m13 *wi)
+{
+	tern		pass_E;
+	si4		i, j, a, b, n_log, n_phys, phys, n_cpus, len;
+	si4		logicals[HW_MAX_LOGICAL_CORES_m13], phys_order[HW_MAX_LOGICAL_CORES_m13];
+	si4		*pmap;
+	si1		*types, *sp;
+	const si1	*p;
+
+
+	if (wi->worker_aff_strs == NULL)  // allocation failed at pool start: shared-mask fallback
+		return;
+
+	HW_get_core_info_m13();  // idempotent
+	pmap = globals_m13->tables->HW_params.physical_core_ids;
+	types = globals_m13->tables->HW_params.core_types;
+	n_cpus = globals_m13->tables->HW_params.logical_cores;
+	if (n_cpus > HW_MAX_LOGICAL_CORES_m13 || pmap[0] < 0)
+		return;  // unknown topology: shared-mask fallback
+
+	// parse the encode-set string ("4-31", "2,5-7", ...) into an ascending logical list
+	n_log = 0;
+	p = wi->worker_affinity_str;
+	while (*p) {
+		a = (si4) strtol(p, (si1 **) &p, 10);
+		b = a;
+		if (*p == '-') {
+			++p;
+			b = (si4) strtol(p, (si1 **) &p, 10);
+		}
+		for (i = a; i <= b && n_log < HW_MAX_LOGICAL_CORES_m13; ++i)
+			if (i >= 0 && i < n_cpus)
+				logicals[n_log++] = i;
+		if (*p == ',')
+			++p;
+		else
+			break;
+	}
+	if (n_log == 0)
+		return;
+
+	// physical order: E-cores first (steady load runs cooler there), then P; numeric within class
+	// (an empty core_types map - uniform part - yields no 'E' logicals & everything lands in pass 2)
+	n_phys = 0;
+	for (pass_E = TRUE_m13; ; pass_E = FALSE_m13) {
+		for (i = 0; i < n_log; ++i) {
+			phys = pmap[logicals[i]];
+			if (phys < 0)
+				continue;
+			if ((types[logicals[i]] == 'E') != (pass_E == TRUE_m13))
+				continue;
+			for (j = 0; j < n_phys; ++j)
+				if (phys_order[j] == phys)
+					break;
+			if (j == n_phys)
+				phys_order[n_phys++] = phys;
+		}
+		if (pass_E == FALSE_m13)
+			break;
+	}
+	if (n_phys == 0)
+		return;
+
+	// worker slot i owns physical phys_order[i % n_phys]: affinity = that physical's logicals in the set
+	// (slots beyond n_phys wrap - only reachable when the caller asks for more workers than physicals)
+	for (i = 0; i < wi->pool_workers_cap; ++i) {
+		phys = phys_order[i % n_phys];
+		sp = wi->worker_aff_strs[i];
+		len = 0;
+		for (j = 0; j < n_log; ++j)
+			if (pmap[logicals[j]] == phys && len < (si4) sizeof(wi->worker_aff_strs[0]) - 5)
+				len += sprintf(sp + len, (len ? ",%d" : "%d"), logicals[j]);
+	}
+
+	return;
+}
+
+tern	WRT_telemetry_m13(WRT_SESS_m13 *ws, si4 chan_idx, WRT_TELEM_m13 *t)
+{
+	// D27: snapshot a channel's live state (racy reads by design - see the header note). Callable
+	// from any thread at any time; never blocks the pipeline.
+	si8		ingest, serviced, out_ingest, encoded, retain;
+	WRT_INT_m13	*wi;
+	WRT_CHAN_m13	*cs;
+
+	if (ws == NULL || t == NULL || chan_idx < 0 || chan_idx >= ws->n_chans) {
+		G_set_error_m13(E_GEN_m13, "bad arguments");
+		return(FALSE_m13);
+	}
+	memset((void *) t, 0, sizeof(WRT_TELEM_m13));
+	if (ws->writing_started == FALSE_m13)
+		return(TRUE_m13);
+	wi = WRT_INT_m13(ws);
+	cs = wi->chans + chan_idx;
+
+	out_ingest = ACQUIRE_LOAD_m13(cs->out_ingest_idx);
+	encoded = ACQUIRE_LOAD_m13(cs->encoded_idx);
+	t->pending_out = out_ingest - encoded;
+	t->out_ring_fill = (cs->out_ring.len > 0) ? ((sf8) t->pending_out / (sf8) cs->out_ring.len) : (sf8) 0.0;
+	if (cs->chain_active == TRUE_m13) {
+		ingest = ACQUIRE_LOAD_m13(cs->ingest_idx);
+		serviced = cs->serviced_in_idx;  // racy: worker-owned
+		retain = ACQUIRE_LOAD_m13(cs->retain_from);
+		t->pending_in = ingest - serviced;
+		if (t->pending_in < 0)
+			t->pending_in = 0;
+		t->in_ring_fill = (cs->ring.len > 0) ? ((sf8) (ingest - retain) / (sf8) cs->ring.len) : (sf8) 0.0;
+		t->encode_lag_secs = ((sf8) t->pending_in / cs->in_fs) + ((sf8) t->pending_out / cs->fs);
+	} else {
+		t->encode_lag_secs = (sf8) t->pending_out / cs->fs;
+	}
+	t->visit_cost_ewma_us = cs->visit_cost_ewma_us;
+	t->visit_cost_peak_us = cs->visit_cost_peak_us;
+	t->visits = cs->visit_count;
+	t->events_pending = cs->n_events;  // racy: control-thread snapshots need no lock
+	// display tap: most recent ENCODED block's score, captured at encode into channel state (racy
+	// ui1 read); params.noise_scores staging is memset after packing, so it cannot be read there
+	if (cs->last_line_noise_byte != CMP_NS_NO_ENTRY_m13)
+		t->line_noise_score = (sf8) cs->last_line_noise_byte / (sf8) CMP_NS_MAX_m13;
+	else
+		t->line_noise_score = (sf8) NAN;
+
+	return(TRUE_m13);
+}
+
+
+// D24 toggle boundary: full chain drain + short block (no block mixes filter states; the per-block
+// flag stays truthful); D12 stagger re-arm (boundary empties staging - lockstep-refill argument);
+// decimator phase carry PERSISTS - indices stay locked to time through the toggle
+static tern	WRT_toggle_boundary_m13(WRT_SESS_m13 *ws, si4 chan_idx)
+{
+	WRT_CHAN_m13	*cs;
+
+	cs = ((WRT_INT_m13 *) ws->chan_state_int)->chans + chan_idx;
+	if (WRT_chain_flush_m13(ws, chan_idx, (si8) -1) == FALSE_m13)
+		return(FALSE_m13);
+	if (WRT_emit_pending_m13(ws, chan_idx, TRUE_m13) == FALSE_m13)
+		return(FALSE_m13);
+	cs->block_samples = (cs->options.initial_block_samples && cs->options.initial_block_samples < cs->target_block_samples) ? cs->options.initial_block_samples : cs->target_block_samples;
+
+	return(TRUE_m13);
+}
+
+
+tern	WRT_video_m13(WRT_SESS_m13 *ws, si4 vid_chan_idx, si1 **file_paths, si4 n_files, si8 *file_start_times)
+{
+	// D25: adopt native video files (CHRONOLOGICAL - the caller's order is the contract) into the
+	// current segment. Per file: container walk -> keyframe index entries; copy under the canonical
+	// name <seg>_n%04d.<native ext>; optional AES-256-CTR encryption; MED universal header FOOTER;
+	// PCRC. file_start_times NULL => contiguous (derived from walk durations); UUTC-mode times are
+	// true uutc (the RTO is subtracted). A file the walker cannot parse is adopted OPAQUELY
+	// (renamed + footer + pcrc, no index entries) with a warning.
+	//
+	// v1 footer times are the FILE's OWN span (known at adoption); NAT2MED writes global
+	// session/segment facts instead - revisit with Matt if the convention matters to readers.
+	const si1	*ext;
+	si1		num_str[FILE_NUMBERING_DIGITS_m13 + 1], dst_path[PATH_BYTES_m13], command[(PATH_BYTES_m13 * 2) + 32];
+	si4		i, f;
+	si8		file_start, file_end, dur_usecs, file_bytes, clip_frames, clip_bytes, gap_frames, file_max_clip_bytes;
+	sf8		clip_dur;
+	VID_WALK_m13	*walk;
+	WRT_INT_m13	*wi;
+	WRT_VID_m13	*vs;
+	FPS_m13		*inds_fps, *meta_fps;
+	UH_m13		vuh;
+
+	if (ws == NULL || file_paths == NULL || n_files < 1 || vid_chan_idx < 0 || vid_chan_idx >= ws->n_vid_chans) {
+		G_set_error_m13(E_GEN_m13, "bad arguments");
+		return(FALSE_m13);
+	}
+	if (ws->writing_started == FALSE_m13) {
+		pthread_mutex_lock_m13(&ws->start_mutex);
+		if (ws->writing_started == FALSE_m13) {
+			if (WRT_start_writing_m13(ws) == FALSE_m13) {
+				pthread_mutex_unlock_m13(&ws->start_mutex);
+				return(FALSE_m13);
+			}
+		}
+		pthread_mutex_unlock_m13(&ws->start_mutex);
+	}
+	wi = WRT_INT_m13(ws);
+	vs = wi->vids + vid_chan_idx;
+	inds_fps = vs->seg->vid_inds_fps;
+	meta_fps = vs->seg->metadata_fps;
+
+	for (i = 0; i < n_files; ++i) {
+		walk = VID_walk_m13(file_paths[i]);
+		file_bytes = G_file_length_m13(NULL, file_paths[i]);
+
+		// this file's start time (oUTC)
+		if (file_start_times != NULL)
+			file_start = file_start_times[i];  // oUTC universally
+		else
+			file_start = (vs->first_file_adopted == TRUE_m13) ? vs->next_start_otc : wi->session_start_otc;
+		if (walk != NULL && walk->frame_rate > (sf8) 0.0)
+			dur_usecs = (si8) ((((sf8) (walk->n_frames + walk->n_dropped_frames)) / walk->frame_rate) * (sf8) 1e6 + (sf8) 0.5);
+		else
+			dur_usecs = 0;
+		file_end = file_start + ((dur_usecs > 0) ? dur_usecs - 1 : 0);
+		if (vs->first_file_adopted == FALSE_m13)
+			vs->first_otc = file_start;
+
+		// index entries (skipped for an opaque adoption)
+		file_max_clip_bytes = 0;
+		if (walk != NULL) {
+			if (walk->n_keyframes > 0) {
+				// discontinuity: the SESSION's first video data by definition; later files by gap
+				if (vs->first_file_adopted == FALSE_m13) {
+					walk->keyframes[0].discontinuity = TRUE_m13;
+				} else if (walk->frame_rate > (sf8) 0.0) {
+					gap_frames = (si8) ((((sf8) (file_start - vs->next_start_otc)) / (sf8) 1e6) * walk->frame_rate + (sf8) 0.5);
+					if (gap_frames > VID_DISCONTINUITY_FRAME_THRESHOLD_m13)
+						walk->keyframes[0].discontinuity = TRUE_m13;
+				}
+			}
+			for (f = 0; f < walk->n_keyframes; ++f) {
+				VID_keyframe_to_index_m13(&walk->keyframes[f], file_start, vs->seg_frames, vs->file_num + 1, inds_fps->vid_inds);
+				FPS_write_m13(inds_fps, FPS_APPEND_m13, INDEX_BYTES_m13, 1);
+
+				// clip (GOP) & contiguous-run statistics (the NAT2MED accounting)
+				if (f + 1 < walk->n_keyframes) {
+					clip_frames = walk->keyframes[f + 1].frame_num - walk->keyframes[f].frame_num;
+					clip_bytes = walk->keyframes[f + 1].file_offset - walk->keyframes[f].file_offset;
+				} else {
+					clip_frames = walk->n_frames - walk->keyframes[f].frame_num;
+					clip_bytes = file_bytes - walk->keyframes[f].file_offset;
+				}
+				clip_dur = (walk->frame_rate > (sf8) 0.0) ? (sf8) clip_frames / walk->frame_rate : (sf8) 0.0;
+				if (clip_frames > vs->max_clip_frames) vs->max_clip_frames = clip_frames;
+				if (clip_bytes > vs->max_clip_bytes) vs->max_clip_bytes = clip_bytes;
+				if (clip_bytes > file_max_clip_bytes) file_max_clip_bytes = clip_bytes;
+				if (clip_dur > vs->max_clip_dur) vs->max_clip_dur = clip_dur;
+				if (walk->keyframes[f].discontinuity == TRUE_m13) {
+					++vs->n_discont;
+					vs->run_clips = vs->run_frames = vs->run_bytes = 0;
+				}
+				++vs->run_clips;
+				vs->run_frames += clip_frames;
+				vs->run_bytes += clip_bytes;
+				if (vs->run_clips > vs->max_contig_clips) vs->max_contig_clips = vs->run_clips;
+				if (vs->run_frames > vs->max_contig_frames) vs->max_contig_frames = vs->run_frames;
+				if (vs->run_bytes > vs->max_contig_bytes) vs->max_contig_bytes = vs->run_bytes;
+			}
+			if (vs->frame_rate == (sf8) RATE_NO_ENTRY_m13) {  // stream characteristics from the first parseable file
+				vs->frame_rate = walk->frame_rate;
+				vs->h_pixels = walk->horizontal_pixels;
+				vs->v_pixels = walk->vertical_pixels;
+				vs->has_audio = walk->has_audio;
+				sprintf_m13(vs->video_format, "%s/%s", (walk->container == VID_WALK_CONTAINER_BMFF_m13) ? "MP4" : "AVI", walk->codec);
+				vs->codec_config_bytes = walk->codec_config_bytes;
+				if (walk->codec_config_bytes)
+					memcpy(vs->codec_config, walk->codec_config, (size_t) walk->codec_config_bytes);
+			}
+		} else {
+			G_warning_message_m13("%s(): could not parse \"%s\" => adopted opaquely (no index entries)\n", __FUNCTION__, file_paths[i]);
+		}
+
+		// copy under the canonical name (native extension preserved - players still play the file)
+		ext = strrchr(file_paths[i], '.');
+		ext = (ext != NULL) ? ext + 1 : "";
+		STR_fixed_width_int_m13(num_str, FILE_NUMBERING_DIGITS_m13, (si8) vs->file_num + 1);
+		sprintf_m13(dst_path, "%s/%s_n%s.%s", vs->seg->path, vs->seg->name, num_str, ext);
+		mkdir_m13(vs->seg->path);
+#if defined MACOS_m13 || defined LINUX_m13
+		sprintf_m13(command, "cp \"%s\" \"%s\"", file_paths[i], dst_path);
+#endif
+#ifdef WINDOWS_m13
+		sprintf_m13(command, "copy \"%s\" \"%s\"", file_paths[i], dst_path);
+#endif
+		if (system_m13(NULL, command, (si4) TRUE_m13, DEFAULT_BEHAVIOR_m13)) {
+			if (walk != NULL)
+				VID_walk_free_m13(&walk);
+			G_set_error_m13(E_GEN_m13, "could not copy \"%s\"", file_paths[i]);
+			return(FALSE_m13);
+		}
+
+		// encrypt (optional) & append the universal header FOOTER, then pcrc (the NAT2MED recipe:
+		// [native container][UH][pcrc]; encryption covers the container bytes ONLY - identity,
+		// parity & repair need no keys; nonce = file_UID; random access via the byte offset)
+		{
+			ui1			*enc_buf, *enc_key;
+			si1			enc_level;
+			si8			enc_offset, enc_bytes;
+			FILE_m13		*vfp;
+			PROC_GLOBS_m13		*pg;
+			PASSWORD_DATA_m13	*pwd;
+
+			memcpy(&vuh, meta_fps->uh, UH_BYTES_m13);  // inherit identity (UIDs, names, MED version, crypto schema)
+			vuh.type_code = VID_DATA_TYPE_CODE_m13;
+			G_generate_UID_m13(&vuh.file_UID);  // before encryption: the file UID is the CTR nonce
+			vuh.provenance_UID = vuh.file_UID;
+			vuh.video_data_file_number = vs->file_num + 1;
+			vuh.n_entries = (walk != NULL) ? walk->n_keyframes : 0;  // entries are CLIPS (keyframes) - parallels .tdat's blocks (Matt, 2026-08-11)
+			vuh.maximum_entry_size = (ui4) file_max_clip_bytes;  // largest clip in THIS file - parallels .tdat's largest block
+			vuh.session_start_time = wi->session_start_otc;
+			vuh.file_start_time = file_start;  // v1: the file's own span (see function comment)
+			vuh.file_end_time = file_end;
+			vuh.live = FALSE_m13;  // settled
+			vuh.metadata_section_2_encryption = vuh.metadata_section_3_encryption = vuh.time_series_data_encryption = vuh.video_data_encryption = NO_ENCRYPTION_m13;
+			vuh.maximum_record_encryption_level = ENCRYPTION_LEVEL_NO_ENTRY_m13;
+			vuh.body_CRC = CRC_NO_ENTRY_m13;  // container integrity is the pcrc's job
+
+			vfp = fopen_m13(dst_path, "r+");
+			if (vfp == NULL) {
+				if (walk != NULL)
+					VID_walk_free_m13(&walk);
+				G_set_error_m13(E_FOPEN_m13, "could not open \"%s\" to append the universal header", dst_path);
+				return(FALSE_m13);
+			}
+			enc_level = ws->options.video_data_encryption_level;
+			if (enc_level > NO_ENCRYPTION_m13) {
+				pg = G_proc_globs_m13(meta_fps);
+				pwd = &pg->password_data;
+				if (pwd->access_level < enc_level) {
+					G_warning_message_m13("%s(): insufficient access to encrypt video data at level %hhd => \"%s\" left unencrypted\n", __FUNCTION__, enc_level, dst_path);
+				} else {
+					enc_key = (enc_level == LEVEL_2_ENCRYPTION_m13) ? pwd->level_2_encryption_key_256 : pwd->level_1_encryption_key_256;
+					enc_buf = (ui1 *) malloc((size_t) WRT_VID_ENCRYPT_CHUNK_BYTES_m13);
+					for (enc_offset = 0; enc_offset < file_bytes; enc_offset += enc_bytes) {
+						enc_bytes = file_bytes - enc_offset;
+						if (enc_bytes > WRT_VID_ENCRYPT_CHUNK_BYTES_m13)
+							enc_bytes = WRT_VID_ENCRYPT_CHUNK_BYTES_m13;
+						fseek_m13(vfp, enc_offset, SEEK_SET);
+						if (fread_m13(enc_buf, sizeof(ui1), (size_t) enc_bytes, vfp) != enc_bytes)
+							break;
+						AES_ctr_crypt_256_m13(enc_buf, enc_offset, enc_bytes, vuh.file_UID, NULL, enc_key);
+						fseek_m13(vfp, enc_offset, SEEK_SET);
+						if (fwrite_m13(enc_buf, sizeof(ui1), (size_t) enc_bytes, vfp) != enc_bytes)
+							break;
+					}
+					free(enc_buf);
+					if (enc_offset < file_bytes)
+						G_warning_message_m13("%s(): error encrypting \"%s\" (io failure at offset %ld)\n", __FUNCTION__, dst_path, (long) enc_offset);
+					else
+						vuh.video_data_encryption = enc_level;  // positive: currently encrypted
+				}
+			}
+			vuh.header_CRC = CRC_calculate_m13((ui1 *) &vuh + UH_HEADER_CRC_START_OFFSET_m13, UH_BYTES_m13 - UH_HEADER_CRC_START_OFFSET_m13);
+			fseek_m13(vfp, 0, SEEK_END);
+			if (file_bytes & 7) {  // pad container to the next 8-byte boundary so the UH (& the file) stay 8-aligned (general library pattern; outside the encryption span; containers self-delimit, players ignore trailing bytes)
+				ui1	pad[8] = {PAD_BYTE_VALUE_m13, PAD_BYTE_VALUE_m13, PAD_BYTE_VALUE_m13, PAD_BYTE_VALUE_m13, PAD_BYTE_VALUE_m13, PAD_BYTE_VALUE_m13, PAD_BYTE_VALUE_m13, PAD_BYTE_VALUE_m13};
+				fwrite_m13(pad, sizeof(ui1), (size_t) (8 - (file_bytes & 7)), vfp);
+			}
+			if (fwrite_m13(&vuh, sizeof(ui1), UH_BYTES_m13, vfp) != UH_BYTES_m13)
+				G_warning_message_m13("%s(): could not append universal header to \"%s\"\n", __FUNCTION__, dst_path);
+			fclose_m13(&vfp);
+		}
+		if (PCRC_write_m13(dst_path, 0) == FALSE_m13)  // self-checking immediately; the parity build refreshes it
+			G_warning_message_m13("%s(): could not write pcrc for \"%s\"\n", __FUNCTION__, dst_path);
+
+		// advance cursors
+		++vs->file_num;
+		if (walk != NULL) {
+			vs->seg_frames += walk->n_frames;
+			vs->seg_keyframes += walk->n_keyframes;
+			VID_walk_free_m13(&walk);
+		}
+		vs->next_start_otc = file_start + dur_usecs;
+		vs->end_otc = file_end;
+		vs->last_file_bytes = file_bytes;
+		vs->first_file_adopted = TRUE_m13;
+	}
+
+	return(TRUE_m13);
+}
+
+
 // MARK: X25519 ELLIPTIC CURVE DIFFIE-HELLMAN  (XEC)
 //*************************************//
 
@@ -56548,101 +63053,8 @@ tern	XEC_unseal_m13(ui1 *plaintext_block, const ui1 *sealed_box, const ui1 *reci
 // MARK: STANDARD LIBRARY FUNCTIONS  (no prefix)
 //**********************************************//
 
-// not a standard function, but closely related
-
 
 // FLOCK_HELD_SLOTS_m13 & FLOCK_HELD_READS_m13 (thread-local read-lock bookkeeping) defined in medlib_m13.h
-
-
-// not a standard function, but closely related
-
-
-// not a standard function, but closely related
-
-
-struct timespec	*nap_timespec_m13(const si1 *nap_str, struct timespec *nap)
-{
-	si1	*c;
-	si8	num, ns;
-
-
-	// string format: <number>[<space>]<unit letter(s)>
-	// e.g. to sleep for 1 millisecond:
-	// "1 millisecond" == "1millisecond" == "1 ms" == "1ms" == "1 m" == "1m"
-
-	if (STR_is_empty_m13(nap_str) == TRUE_m13) {
-		G_set_error_m13(E_GEN_m13, "NULL input string");
-		return(NULL);
-	}
-
-	// skip any leading spaces; number must follow (a non-digit would parse to a negative count)
-	c = (si1 *) nap_str - 1;
-	while (*++c == ' ');
-	if (*c < '0' || *c > '9') {
-		G_set_error_m13(E_GEN_m13, "\"%s\" is not a valid input string", nap_str);
-		return(NULL);
-	}
-	if (nap == NULL) {  // caller takes ownership
-		nap = (struct timespec *) malloc_m13(sizeof(struct timespec));
-		if (nap == NULL)
-			return(NULL);
-	}
-
-	num = *c++ - '0';
-	while (*c >= '0' && *c <= '9' && *c) {
-		num *= 10;
-		num += *c++ - '0';
-	}
-
-	// optional space(s)
-	while (*c == ' ')
-		++c;
-
-	// units: ns, us (or microseconds), ms (or milliseconds), sec, min, hours
-	// sub-second units accumulate in ns (si8) & are split below: tv_nsec may be 4 bytes (e.g. Windows UCRT
-	// declares it as long), so large totals must be split into tv_sec BEFORE storing, not after
-	nap->tv_sec = nap->tv_nsec = 0;
-	ns = 0;
-	switch(*c) {
-		case 'h':  // hours
-			nap->tv_sec = num * (ui8) 3600;
-			break;
-		case 'm':  // microseconds, milliseconds (default), or minutes
-			if( *(c + 1) == 'i') {
-				if (*(c + 2) == 'c') {  // microseconds
-					ns = num * (si8) 1e3;
-					break;
-				}
-				if (*(c + 2) == 'n') {  // minutes
-					nap->tv_sec = num * (ui8) 60;
-					break;
-				}
-			}
-			// milliseconds
-			ns = num * (si8) 1e6;
-			break;
-		case 'n':  // nanoseconds
-			ns = num;
-			break;
-		case 's':  // seconds
-			nap->tv_sec = num;
-			break;
-		case 'u':  // microseconds
-			ns = num * (si8) 1e3;
-			break;
-		default:
-			G_set_error_m13(E_GEN_m13, "\"%s\" is not a valid input string", nap_str);
-			return(NULL);
-	}
-
-	// sub-second unit: split into whole seconds + remainder (nanosleep() requires tv_nsec in [0, 999999999])
-	if (ns) {
-		nap->tv_sec = ns / (si8) 1e9;
-		nap->tv_nsec = ns % (si8) 1e9;
-	}
-
-	return(nap);
-}
 
 
 // Seedable, platform-independent PRNG state - true thread-local (was a shared proc_globs copy, which raced across threads
@@ -56652,21 +63064,12 @@ struct timespec	*nap_timespec_m13(const si1 *nap_str, struct timespec *nap)
 static thread_local_m13 volatile ui4	med_rand_w = 0, med_rand_z = 0;
 
 
-// not a standard function, but closely related
-
-
-// not a standard function, but closely related
-
-
 static tern	rm_path_m13(const si1 *path, tern recursive);  // the work; rm_m13() is just the option parser
 
 
-// not a standard function, but closely related
-
-
-// not a standard function, but closely related
-
-
+// (atomic unit: each std-alloc function & its AT_-debug variant share one signature-selecting
+//  guard & one body - the pair is a single unit, filed at the std name; applies to every
+//  AT_DEBUG_m13 dual-signature function in this section)
 #ifndef AT_DEBUG_m13
 void	aligned_free_m13(void *ptr)
 #else
@@ -56788,6 +63191,7 @@ void	*aligned_alloc_m13(si8 alignment, si8 n_bytes)  // (alignment == -1): align
 }
 
 
+// not a standard function, but closely related
 #ifdef AT_DEBUG_m13
 void	**AT_calloc_2D_m13(const si1 *function, si4 line, size_t dim1, size_t dim2, si8 el_size)
 #else
@@ -56914,6 +63318,7 @@ void	*calloc_m13(size_t n_members, si8 el_size)  // (el_size negative): level he
 }
 
 
+// not a standard function, but closely related
 #ifdef AT_DEBUG_m13
 void	**AT_malloc_2D_m13(const si1 *function, si4 line, size_t dim1, si8 dim2_bytes)
 #else
@@ -57032,6 +63437,7 @@ void	*malloc_m13(si8 n_bytes)  // (n_bytes negative): level header flag
 }
 
 
+// not a standard function, but closely related
 #ifdef AT_DEBUG_m13
 void	**AT_realloc_2D_m13(const si1 *function, si4 line, void **ptr, size_t curr_dim1, size_t new_dim1, size_t curr_dim2_bytes, si8 new_dim2_bytes)
 #else
@@ -57246,6 +63652,7 @@ void	**recalloc_2D_m13(void **ptr, size_t curr_dim1, size_t new_dim1, size_t cur
 }
 
 
+// not a standard function, but closely related
 #ifdef AT_DEBUG_m13
 void	*AT_recalloc_m13(const si1 *function, si4 line, void *ptr, size_t curr_members, size_t new_members, si8 el_size)
 #else
@@ -58783,6 +65190,7 @@ size_t	fread_m13(void *ptr, si8 el_size, size_t n_elements, void *fp, ...)  // (
 }
 
 
+// not a standard function, but closely related
 #ifndef AT_DEBUG_m13
 void	free_2D_m13(void **ptr, size_t dim1)
 #else
@@ -59251,6 +65659,24 @@ void	*freopen_m13(const si1 *path, const si1 *mode_str, void *fp)
 			
 	return_m13(fp);
 }
+
+
+#ifdef FS_DEBUG_m13
+// FS_DEBUG_m13 (see targets_m13.h, parallel to FT/AT debug modes): DRY-RUN file system tracing -
+// rm_m13() & mv_m13() log every call to stderr & perform NOTHING. For diagnosing destructive path
+// bugs safely (found the 2026-08 G_path_parts_m13 aliased-input deletion). Debug builds only:
+// nothing is ever removed or moved, so normal operation (temp cleanup, renames) will misbehave -
+// this mode is for tracing, not for use.
+static void	FS_trace_m13(const si1 *op, const si1 *p1, const si1 *p2)
+{
+	if (p2 == NULL)
+		fprintf(stderr, "FS_TRACE %s \"%s\"\n", op, p1);
+	else
+		fprintf(stderr, "FS_TRACE %s \"%s\" -> \"%s\"\n", op, p1, p2);
+	fflush(stderr);
+	return;
+}
+#endif  // FS_DEBUG_m13
 
 
 si4	fscanf_m13(void *fp, const si1 *fmt, ...)
@@ -61001,96 +67427,6 @@ tern	mlock_m13(void *addr, si8 len)  // (len < 0): len = -len, lock regardless o
 }
 
 
-// Guarded table allocation (2026-08-09 hardening #2): page-aligned data region with PROT_NONE guard
-// pages either side, sealed PROT_READ after filling. For COMPUTED read-forever tables (CRC_tables,
-// CMP_log_table) - the static const masters already live in .rodata & need nothing. A wild write into a
-// sealed table (or a linear overrun crossing a guard) faults AT THE CORRUPTING STORE - the diagnostic a
-// debugger gives, in production, for free (one mprotect per table per process; reads untouched).
-// The (ptr, bytes) pair passed to seal/free must match the alloc call - sizes are compile-time constants
-// at every current call site. free RESTORES read/write before releasing (the allocator writes bookkeeping
-// into freed blocks).
-// page size for the guarded-table helpers: LOCK-FREE by design. The natural source (HW_params via
-// HW_get_memory_info_m13()) takes tables->mutex - which both table-init callers HOLD while allocating -
-// & aligned_alloc_m13(-1, ...) reaches the same lock for the same reason. Direct syscall, static cache
-// (concurrent first calls write the same value: benign).
-static ui8	G_guarded_table_page_size_m13(void)
-{
-	static ui8	pg = 0;
-
-	if (pg == 0) {
-		#if defined MACOS_m13 || defined LINUX_m13
-		pg = (ui8) sysconf(_SC_PAGESIZE);
-		#endif
-		#ifdef WINDOWS_m13
-		SYSTEM_INFO	sys_info;
-
-		GetSystemInfo(&sys_info);
-		pg = (ui8) sys_info.dwPageSize;
-		#endif
-	}
-
-	return(pg);
-}
-
-
-void	*G_guarded_table_alloc_m13(size_t bytes)
-{
-	ui1	*base;
-	ui8	pg, total;
-
-#ifdef FT_DEBUG_m13
-	G_push_function_m13();
-#endif
-
-	pg = G_guarded_table_page_size_m13();
-	total = (((((ui8) bytes) + pg - 1) / pg) + 2) * pg;  // data pages + 2 guards
-	base = (ui1 *) aligned_alloc_m13((si8) pg, (si8) total);  // explicit alignment: the -1 (page) path would take tables->mutex (see above)
-	if (base == NULL)
-		return_m13(NULL);
-	mprotect_m13(base, (size_t) pg, PROT_NONE);  // leading guard
-	mprotect_m13(base + total - pg, (size_t) pg, PROT_NONE);  // trailing guard
-
-	return_m13(base + pg);
-}
-
-
-tern	G_guarded_table_seal_m13(void *table, size_t bytes)
-{
-	ui8	pg;
-
-#ifdef FT_DEBUG_m13
-	G_push_function_m13();
-#endif
-
-	pg = G_guarded_table_page_size_m13();
-	if (mprotect_m13(table, (size_t) ((((ui8) bytes + pg - 1) / pg) * pg), PROT_READ))
-		return_m13(FALSE_m13);
-
-	return_m13(TRUE_m13);
-}
-
-
-tern	G_guarded_table_free_m13(void *table, size_t bytes)
-{
-	ui1	*base;
-	ui8	pg, total;
-
-#ifdef FT_DEBUG_m13
-	G_push_function_m13();
-#endif
-
-	if (table == NULL)
-		return_m13(TRUE_m13);
-	pg = G_guarded_table_page_size_m13();
-	total = (((((ui8) bytes) + pg - 1) / pg) + 2) * pg;
-	base = ((ui1 *) table) - pg;
-	mprotect_m13(base, (size_t) total, PROT_READ | PROT_WRITE);  // guards & seal off: allocator must be able to write
-	aligned_free_m13(base);
-
-	return_m13(TRUE_m13);
-}
-
-
 si4	mprotect_m13(void *address, size_t len, si4 protection)
 {
 	si4	r_val, err;
@@ -61305,6 +67641,10 @@ tern	mv_m13(const si1 *path, const si1 *new_path)
 		#ifdef WINDOWS_m13  // UNVERIFIED (system calls to be checked on Windows)
 		sprintf_m13(command, "move \\/y %s %s", path, new_path);
 		#endif
+		#ifdef FS_DEBUG_m13
+		FS_trace_m13("mv(glob)", path, new_path);
+		return_m13(TRUE_m13);
+		#endif
 		if (system_pipe_m13(NULL, 0, command, SP_DEFAULT_m13)) {
 			G_set_error_m13(E_GEN_m13, "could not move \"%s\" to \"%s\"", path, new_path);
 			return_m13(FALSE_m13);
@@ -61317,6 +67657,11 @@ tern	mv_m13(const si1 *path, const si1 *new_path)
 	path = (const si1 *) tmp_path;
 	G_full_path_m13(new_path, tmp_new_path);
 	new_path = (const si1 *) tmp_new_path;
+
+	#ifdef FS_DEBUG_m13
+	FS_trace_m13("mv", path, new_path);
+	return_m13(TRUE_m13);
+	#endif
 
 	// source
 	fe_src = G_exists_m13(path);
@@ -61514,6 +67859,92 @@ void	nap_m13(const si1 *nap_str)
 	nanosleep_m13(&nap);
 
 	return;
+}
+
+
+// not a standard function, but closely related
+struct timespec	*nap_timespec_m13(const si1 *nap_str, struct timespec *nap)
+{
+	si1	*c;
+	si8	num, ns;
+
+
+	// string format: <number>[<space>]<unit letter(s)>
+	// e.g. to sleep for 1 millisecond:
+	// "1 millisecond" == "1millisecond" == "1 ms" == "1ms" == "1 m" == "1m"
+
+	if (STR_is_empty_m13(nap_str) == TRUE_m13) {
+		G_set_error_m13(E_GEN_m13, "NULL input string");
+		return(NULL);
+	}
+
+	// skip any leading spaces; number must follow (a non-digit would parse to a negative count)
+	c = (si1 *) nap_str - 1;
+	while (*++c == ' ');
+	if (*c < '0' || *c > '9') {
+		G_set_error_m13(E_GEN_m13, "\"%s\" is not a valid input string", nap_str);
+		return(NULL);
+	}
+	if (nap == NULL) {  // caller takes ownership
+		nap = (struct timespec *) malloc_m13(sizeof(struct timespec));
+		if (nap == NULL)
+			return(NULL);
+	}
+
+	num = *c++ - '0';
+	while (*c >= '0' && *c <= '9' && *c) {
+		num *= 10;
+		num += *c++ - '0';
+	}
+
+	// optional space(s)
+	while (*c == ' ')
+		++c;
+
+	// units: ns, us (or microseconds), ms (or milliseconds), sec, min, hours
+	// sub-second units accumulate in ns (si8) & are split below: tv_nsec may be 4 bytes (e.g. Windows UCRT
+	// declares it as long), so large totals must be split into tv_sec BEFORE storing, not after
+	nap->tv_sec = nap->tv_nsec = 0;
+	ns = 0;
+	switch(*c) {
+		case 'h':  // hours
+			nap->tv_sec = num * (ui8) 3600;
+			break;
+		case 'm':  // microseconds, milliseconds (default), or minutes
+			if( *(c + 1) == 'i') {
+				if (*(c + 2) == 'c') {  // microseconds
+					ns = num * (si8) 1e3;
+					break;
+				}
+				if (*(c + 2) == 'n') {  // minutes
+					nap->tv_sec = num * (ui8) 60;
+					break;
+				}
+			}
+			// milliseconds
+			ns = num * (si8) 1e6;
+			break;
+		case 'n':  // nanoseconds
+			ns = num;
+			break;
+		case 's':  // seconds
+			nap->tv_sec = num;
+			break;
+		case 'u':  // microseconds
+			ns = num * (si8) 1e3;
+			break;
+		default:
+			G_set_error_m13(E_GEN_m13, "\"%s\" is not a valid input string", nap_str);
+			return(NULL);
+	}
+
+	// sub-second unit: split into whole seconds + remainder (nanosleep() requires tv_nsec in [0, 999999999])
+	if (ns) {
+		nap->tv_sec = ns / (si8) 1e9;
+		nap->tv_nsec = ns % (si8) 1e9;
+	}
+
+	return(nap);
 }
 
 
@@ -62104,6 +68535,11 @@ static tern	rm_path_m13(const si1 *path, tern recursive)
 	G_full_path_m13(path, tmp_path);
 	path = (const si1 *) tmp_path;
 
+	#ifdef FS_DEBUG_m13
+	FS_trace_m13(recursive == TRUE_m13 ? "rm -R" : "rm", path, NULL);
+	return(TRUE_m13);
+	#endif
+
 	if (STR_contains_regex_m13(path) == TRUE_m13) {
 		tern	ret = TRUE_m13;
 
@@ -62580,6 +69016,7 @@ si4	snprintf_m13(si1 *target, si4 target_field_bytes, const si1 *fmt, ...)
 }
 
 
+// not a standard function, but closely related
 #ifdef WINDOWS_m13
 static tern	SP_drain_pipe_m13(HANDLE pipe_h, si1 **buf_p, si8 *buf_len_p, DWORD *bytes_in_p, tern realloc_ok, si4 size_inc, tern *progress_p)
 {
@@ -62627,6 +69064,7 @@ static tern	SP_drain_pipe_m13(HANDLE pipe_h, si1 **buf_p, si8 *buf_len_p, DWORD 
 }
 
 
+// not a standard function, but closely related
 si4	system_pipe_m13(si1 **buffer_ptr, si8 buf_len, const si1 *command, ui4 flags, ...)  // varargs(BEHAVIOR_PASSED_m13 set): ui4 behavior)
 {											    // varargs(SP_SEPARATE_STREAMS_m13 set): si1 **e_buffer_ptr, si8 e_buf_len
 									     		    // note if both passed, behavior is first argument
@@ -64791,5 +71229,3 @@ si4	vsprintf_m13(si1 *target, const si1 *fmt, va_list args)
 
 	return(r_val);
 }
-
-
